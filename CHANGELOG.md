@@ -65,6 +65,13 @@
 
 ### Security
 
+- **Public shares no longer 500 on large inline images, and never treat a `data:` URI as a file path.** A
+  conversation containing a `MEDIA:data:image/…` token over about 4 KB failed share creation with a
+  filename-too-long error, because the share builder tried to resolve the blob on disk. `data:` tokens now never touch
+  the filesystem: a raster image (PNG, JPEG, GIF, WebP) that passes the MIME allowlist, length and decoded-size caps,
+  strict base64 and a magic-byte check is re-emitted as a canonical `<img>`; anything else becomes the "attachment
+  omitted" placeholder. The local-file resolver also catches over-long or NUL-bearing paths instead of raising.
+  (#7961, fixes #7949)
 - **The update check and workspace git no longer open credential prompts or trust checkout-controlled helpers.**
   Unattended `git fetch`/`pull` from the update check, and the workspace git panel's operations, now run with a
   scrubbed environment (`clean_git_env`: inherited `GIT_ASKPASS`, `GIT_SSH`, `GIT_CONFIG_*` and similar are removed)
