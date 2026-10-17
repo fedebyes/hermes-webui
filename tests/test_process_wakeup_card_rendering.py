@@ -61,6 +61,7 @@ function t(key, ...args){
   return out;
 }
 
+if(src.indexOf('function _parseAsyncDelegation') !== -1) eval(extractFunc('_parseAsyncDelegation'));
 eval(extractFunc('_parseProcessWakeupBody'));
 eval(extractFunc('_processWakeupInfo'));
 eval(extractFunc('_processWakeupCardHtml'));

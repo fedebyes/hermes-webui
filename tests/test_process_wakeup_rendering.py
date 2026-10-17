@@ -72,6 +72,7 @@ let _visWithIdxCacheSrc = null;
 const heightStart = src.indexOf('const MESSAGE_RENDER_WINDOW_DEFAULT');
 const heightEnd = src.indexOf('let _messageVirtualMeasurementSeenKeys', heightStart);
 if(heightStart !== -1 && heightEnd !== -1) eval(src.slice(heightStart, heightEnd));
+if(src.indexOf('function _wakeupOpenerAtStart') !== -1) eval(extractFunc('_wakeupOpenerAtStart'));
 if(src.indexOf('function _isProcessWakeupMessage') !== -1) eval(extractFunc('_isProcessWakeupMessage'));
 eval(extractFunc('_stripWorkspaceDisplayPrefix'));
 eval(extractFunc('_stripAttachedFilesMarkerForDisplay'));
