@@ -84,17 +84,16 @@ def test_live_endpoint_counts_an_open_child_row(test_server, tmp_path, monkeypat
     con.close()
 
     monkeypatch.setattr(routes, "_active_state_db_path", lambda: db)
-    routes._live_subagents_cache["at"] = 0.0
-    routes._live_subagents_cache["payload"] = None
+    routes._live_subagents_cache.clear()
 
-    assert routes._live_subagent_counts(now) == {"parent-x": 1}
+    assert routes._live_subagent_counts(now, db) == {"parent-x": 1}
 
     # A finished child must not count, even though it belongs to the same parent.
     con = sqlite3.connect(db)
     con.execute("UPDATE sessions SET ended_at=? WHERE id='child-live'", (now,))
     con.commit()
     con.close()
-    assert routes._live_subagent_counts(now) == {}
+    assert routes._live_subagent_counts(now, db) == {}
 
 
 def test_live_endpoint_ignores_a_stale_crashed_row(test_server, tmp_path, monkeypatch):
@@ -133,4 +132,4 @@ def test_live_endpoint_ignores_a_stale_crashed_row(test_server, tmp_path, monkey
     con.close()
 
     monkeypatch.setattr(routes, "_active_state_db_path", lambda: db)
-    assert routes._live_subagent_counts(now) == {}
+    assert routes._live_subagent_counts(now, db) == {}

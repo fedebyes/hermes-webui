@@ -14707,24 +14707,28 @@ def _handle_plugins(handler, parsed) -> bool:
 
 _LIVE_SUBAGENTS_CACHE_TTL_SECONDS = 3.0
 # A subagent child still counts as live while it is silent for less than this.
-# The run lifecycle (ended_at IS NULL) is the primary signal; the window only
-# bounds rows a crashed run left open.
-_LIVE_SUBAGENTS_GRACE_SECONDS = 900.0
-_live_subagents_cache: dict = {"at": 0.0, "payload": None}
+# `ended_at IS NULL` is the authoritative signal; this window only bounds rows a
+# crashed run left open (a run that dies without `agent_close` keeps NULL
+# forever). It is a false-negative source for a genuinely live child stuck in a
+# long tool call, so it is kept generous rather than tight — 44 of ~790 real
+# runs exceed 15 minutes end to end. Degradation is acceptable here (a badge
+# missing for a while) but a stuck badge is not.
+_LIVE_SUBAGENTS_GRACE_SECONDS = 7200.0
+# Keyed by state.db path: the path is per-request (active profile), so a single
+# slot would serve profile A's counts to a profile B request inside the TTL.
+_live_subagents_cache: dict = {}
 _live_subagents_lock = threading.Lock()
 
 
-def _live_subagent_counts(now: float | None = None) -> dict:
+def _live_subagent_counts(now: float | None = None, db_path=None) -> dict:
     """Return ``{parent_session_id: live_child_count}`` from the agent state.db.
 
     "Live" is the delegate runner's own run/lifecycle: a child session is
     created with ``source='subagent'`` and ``ended_at IS NULL``, and the runner
     stamps ``ended_at``/``end_reason='agent_close'`` when the run finishes
     (verified end-to-end against a real fan-out — the children carry NULL for
-    the whole run and close on exit). A crashed child would keep NULL forever,
-    so the predicate is bounded by recency: a row only counts while it was
-    started recently OR wrote a message recently. That keeps a leaked row from
-    inflating the badge without inventing a heartbeat the runner never sends.
+    the whole run and close on exit). The recency bound only keeps a crashed
+    row (NULL forever, never closed) from inflating the badge.
 
     Read-only, single aggregate query on the ``source`` index. Any failure
     degrades to an empty map: the sidebar badge is decoration and must never
@@ -14734,7 +14738,7 @@ def _live_subagent_counts(now: float | None = None) -> dict:
     try:
         from api.agent_sessions import open_state_db_readonly
 
-        db_path = _active_state_db_path()
+        db_path = db_path if db_path is not None else _active_state_db_path()
         if not db_path.exists():
             return {}
         window_start = now - _LIVE_SUBAGENTS_GRACE_SECONDS
@@ -14770,17 +14774,24 @@ def _live_subagent_counts(now: float | None = None) -> dict:
 def _handle_live_subagents(handler, parsed) -> bool:
     """GET /api/subagents/live — cheap map of parent session → live child count.
 
-    The sidebar selector repaints often, so the aggregate is cached briefly and
-    the response stays a tiny map. ``staleness_seconds`` is reported so a client
-    can tell how old the number it is rendering is.
+    The selector repaints often, so the aggregate is cached briefly per state.db
+    (the path follows the active profile, so the key must too). The response
+    carries ``generated_at`` so a client can tell how old the number it renders
+    is, and the payload is built outside the lock: holding it during the socket
+    write would serialize every badge request behind one response.
     """
     now = time.time()
-    with _live_subagents_lock:
-        cached = _live_subagents_cache.get("payload")
-        if cached is not None and (now - float(_live_subagents_cache.get("at") or 0)) < _LIVE_SUBAGENTS_CACHE_TTL_SECONDS:
-            return j(handler, cached)
     try:
-        counts = _live_subagent_counts(now)
+        db_path = _active_state_db_path()
+        cache_key = str(db_path)
+    except Exception:
+        db_path, cache_key = None, ""
+    with _live_subagents_lock:
+        entry = _live_subagents_cache.get(cache_key)
+        if entry and (now - float(entry.get("at") or 0)) < _LIVE_SUBAGENTS_CACHE_TTL_SECONDS:
+            return j(handler, entry["payload"])
+    try:
+        counts = _live_subagent_counts(now, db_path)
     except Exception as exc:
         logger.debug("live subagent handler degraded: %s", exc)
         counts = {}
@@ -14794,9 +14805,10 @@ def _handle_live_subagents(handler, parsed) -> bool:
         "read_only": True,
     }
     with _live_subagents_lock:
-        _live_subagents_cache["at"] = now
-        _live_subagents_cache["payload"] = payload
+        # Bounded: one entry per profile the server has served this process.
+        _live_subagents_cache[cache_key] = {"at": now, "payload": payload}
     return j(handler, payload)
+
 
 _SHELL_ERROR_HTML = """<!doctype html>
 <html lang=\"en\">

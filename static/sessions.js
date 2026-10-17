@@ -7405,6 +7405,14 @@ async function refreshLiveSubagentCounts(){
   }
 }
 
+async function _refreshSidebarWithLiveCounts(){
+  // Await the counts before the repaint: firing both unawaited would render the
+  // previous map and leave the badge one full poll interval (~30s) behind, which
+  // on first paint means no badge at all until a later tick.
+  await refreshLiveSubagentCounts();
+  void _refreshSidebarForBackgroundChurn();
+}
+
 function startStreamingPoll(){
   if(_streamingPollTimer) return;
   _streamingPollTimer = setInterval(() => {
@@ -7413,15 +7421,11 @@ function startStreamingPoll(){
     // brings the list current the moment the tab is shown again, so no update is
     // lost — the background tab just stops burning network + DOM churn.
     if(typeof document !== 'undefined' && document.hidden) return;
-    void refreshLiveSubagentCounts();
-    void _refreshSidebarForBackgroundChurn();
+    void _refreshSidebarWithLiveCounts();
   }, _streamingPollMs);
   if(typeof document !== 'undefined' && !_streamingPollVisibilityHandler){
     _streamingPollVisibilityHandler = () => {
-      if(!document.hidden){
-        void refreshLiveSubagentCounts();
-        void _refreshSidebarForBackgroundChurn();
-      }
+      if(!document.hidden) void _refreshSidebarWithLiveCounts();
     };
     document.addEventListener('visibilitychange', _streamingPollVisibilityHandler);
   }
@@ -9477,8 +9481,10 @@ function _applyLiveSubagentCounts(rows){
   for(const row of rows||[]){
     if(!row) continue;
     const sid=row.session_id;
-    const live=counts&&sid?Number(counts[sid]):0;
-    if(Number.isFinite(live)&&live>0) row._live_subagent_count=live;
+    // Strict numeric check, no coercion: a string or boolean from a malformed
+    // payload must not paint a count the renderer's own typeof gate would accept.
+    const raw=counts&&sid?counts[sid]:undefined;
+    if(typeof raw==='number'&&Number.isFinite(raw)&&raw>0) row._live_subagent_count=raw;
     else delete row._live_subagent_count;
   }
   return rows;

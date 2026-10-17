@@ -46,9 +46,36 @@ def _live_badge_block() -> str:
 
 
 def _run_render(rows):
-    """Execute the extracted fragment against a minimal fake DOM."""
+    """Execute the extracted fragment against a minimal fake DOM.
+
+    The i18n table is the REAL `static/i18n.js`, loaded in the same node process:
+    a hand-rolled fake table is how the shipped "undefined subagents live"
+    tooltip (function-valued entry called with no argument) stayed green here
+    while being broken in every locale. Loading the real module means the
+    harness asserts what production actually renders.
+    """
     block = _live_badge_block()
     harness = f"""
+const fs = require('fs');
+const vm = require('vm');
+const i18nSrc = fs.readFileSync({json.dumps(str(REPO_ROOT / "static" / "i18n.js"))}, 'utf8');
+const sandbox = {{
+  navigator: {{ language: 'en' }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  document: {{ documentElement: {{}}, addEventListener() {{}} }},
+}};
+sandbox.window = sandbox;
+const ctx = vm.createContext(sandbox);
+vm.runInContext(i18nSrc + ';globalThis.__LOCALES = LOCALES;', ctx);
+const LOCALES = sandbox.__LOCALES;
+const t = (key, ...args) => {{
+  const val = LOCALES.en[key];
+  if (val === undefined) return key;
+  if (typeof val === 'function') return val(...args);
+  if (args.length) return String(val).replace(/\\{{(\\d+)\\}}/g, (m, i) => (i === '0' ? String(args[0]) : m));
+  return val;
+}};
+
 class FakeEl {{
   constructor(tag) {{
     this.tagName = tag.toUpperCase();
@@ -60,16 +87,6 @@ class FakeEl {{
   appendChild(child) {{ this.children.push(child); return child; }}
 }}
 const document = {{ createElement: (tag) => new FakeEl(tag) }};
-function t(key, ...args) {{
-  const table = {{
-    session_live_subagents: (n) => `${{n}} live`,
-    session_live_subagents_tooltip: 'Subagents running now',
-  }};
-  const value = table[key];
-  if (value === undefined) return key;
-  if (typeof value === 'function') return value(...args);
-  return value.replace('{{0}}', String(args[0] === undefined ? '' : args[0]));
-}}
 
 const out = [];
 for (const s of {json.dumps(rows)}) {{
@@ -117,8 +134,13 @@ def test_row_with_live_children_renders_the_badge():
     assert len(out[0]) == 1, out
     badge = out[0][0]
     assert badge["className"] == "session-live-subagents-badge"
+    # The count must appear in the label — that is the whole point of the badge.
     assert badge["textContent"] == "3 live"
+    # And the tooltip must be real text, never a rendered `undefined` (the
+    # shipped bug: a function-valued locale entry called with no argument).
     assert badge["title"] == "Subagents running now"
+    assert "undefined" not in badge["title"]
+    assert "{" not in badge["textContent"] and "{" not in badge["title"]
 
 
 def test_row_without_live_children_renders_nothing():
@@ -160,6 +182,17 @@ def test_apply_ignores_empty_and_malformed_maps():
         assert "_live_subagent_count" not in rows[0], counts
 
 
+def test_apply_rejects_coercible_non_numbers():
+    """A string `"3"` or `true` must not become a badge count.
+
+    `Number()` coercion would turn both into a paintable number, defeating the
+    renderer's typeof gate two lines later in the row renderer.
+    """
+    for bogus in ("3", True, "abc", float("nan")):
+        rows = _run_apply([{"session_id": "a"}], {"a": bogus})
+        assert "_live_subagent_count" not in rows[0], bogus
+
+
 def test_render_pipeline_applies_live_counts():
     """The decorator must run inside the render path, or the badge never paints."""
     m = re.search(
@@ -191,21 +224,30 @@ def test_client_fetches_the_live_endpoint():
     assert "redirect401:false" in body
 
 
-def test_poll_refreshes_counts_before_rendering():
-    """Counts must be current when the list repaints, not one tick behind."""
-    m = re.search(r"^function startStreamingPoll\(\)\{.*?\n  \}\n", SESSIONS_JS, re.S | re.M)
-    assert m, "startStreamingPoll not found"
-    body = m.group(0)
-    assert body.count("refreshLiveSubagentCounts()") >= 2, (
-        "both the interval tick and the visibilitychange handler must refresh"
+def test_poll_awaits_counts_before_rendering():
+    """Counts must be current when the list repaints, not one tick behind.
+
+    Firing both as independent `void` calls renders the *previous* map and leaves
+    the badge up to a full poll interval (~30s) stale; on first load that means no
+    badge at all until a later tick. The refresh must therefore be awaited by the
+    helper the poll calls.
+    """
+    m = re.search(
+        r"^async function _refreshSidebarWithLiveCounts\(\)\{.*?^\}\n", SESSIONS_JS, re.S | re.M
     )
-    tick = body.index("refreshLiveSubagentCounts()")
-    # The repaint helper differs across bases (`_refreshSidebarForBackgroundChurn`
-    # or `renderSessionList`); the property that matters is that whichever it is,
-    # the counts are refreshed before the repaint they feed.
-    repaint = re.search(r"void (_refreshSidebarForBackgroundChurn|renderSessionList)\(", body)
-    assert repaint, "no sidebar repaint call found in the poll"
-    assert tick < repaint.start(), "refresh must precede the repaint it feeds"
+    assert m, "_refreshSidebarWithLiveCounts not found"
+    body = m.group(0)
+    assert re.search(r"await refreshLiveSubagentCounts\(\)", body), (
+        "the counts fetch must be awaited before the repaint"
+    )
+    repaint = re.search(r"(?<!await )_refreshSidebarForBackgroundChurn\(", body)
+    assert repaint, "the helper must trigger the sidebar repaint"
+    assert body.index("await refreshLiveSubagentCounts()") < repaint.start()
+
+    poll = re.search(r"^function startStreamingPoll\(\)\{.*?\n\}\n", SESSIONS_JS, re.S | re.M)
+    assert poll, "startStreamingPoll not found"
+    # Both entry points (interval tick + visibilitychange) go through the helper.
+    assert poll.group(0).count("_refreshSidebarWithLiveCounts()") >= 2
 
 
 # ── style ───────────────────────────────────────────────────────────────────
@@ -251,6 +293,48 @@ def test_every_locale_defines_both_live_keys():
     assert not missing, f"locales missing live-subagent keys: {missing}"
 
 
+def test_every_locale_label_interpolates_the_count():
+    """The badge label must be a `{0}` string in every locale.
+
+    A bare label ('Live', '実行中') silently drops the count, so the badge stops
+    saying *how many* children are live — its entire purpose.
+    """
+    locales = re.findall(r"^  (?:'([A-Za-z-]+)'|([a-z]{2})): \{\s*$", I18N_JS, re.M)
+    names = [a or b for a, b in locales]
+    bad = []
+    for loc in names:
+        m = re.search(r"session_live_subagents: ('[^']*')", _locale_block(loc))
+        assert m, f"locale {loc} has no plain-string label"
+        if "{0}" not in m.group(1):
+            bad.append((loc, m.group(1)))
+    assert not bad, f"labels without a {{0}} count placeholder: {bad}"
+
+
+def test_every_locale_tooltip_is_a_plain_string():
+    """`t()` is called with no argument for the tooltip.
+
+    A function-valued entry would be invoked with `undefined` and render
+    literally "undefined subagents live" — the bug this test exists to catch.
+    """
+    locales = re.findall(r"^  (?:'([A-Za-z-]+)'|([a-z]{2})): \{\s*$", I18N_JS, re.M)
+    names = [a or b for a, b in locales]
+    bad = []
+    for loc in names:
+        m = re.search(r"session_live_subagents_tooltip: (.*),\n", _locale_block(loc))
+        assert m, f"locale {loc} has no tooltip entry"
+        value = m.group(1).strip()
+        if not (value.startswith("'") and value.endswith("'")):
+            bad.append((loc, value))
+    assert not bad, f"tooltips must be plain strings, found: {bad}"
+
+
+def test_the_rendered_tooltip_never_contains_undefined():
+    """End-to-end guard on the real i18n module for the language we can assert."""
+    out = _run_render([{"session_id": "a", "_live_subagent_count": 2}])
+    assert "undefined" not in out[0][0]["textContent"]
+    assert "undefined" not in out[0][0]["title"]
+
+
 # ── endpoint ────────────────────────────────────────────────────────────────
 
 
@@ -282,14 +366,13 @@ def _routes_module():
 
 
 def _reset_cache(routes):
-    routes._live_subagents_cache["at"] = 0.0
-    routes._live_subagents_cache["payload"] = None
+    routes._live_subagents_cache.clear()
 
 
 def test_endpoint_returns_the_parent_to_count_map(monkeypatch):
     routes = _routes_module()
     monkeypatch.setattr(
-        routes, "_live_subagent_counts", lambda now=None: {"parent1": 3, "parent2": 1}
+        routes, "_live_subagent_counts", lambda now=None, db_path=None: {"parent1": 3, "parent2": 1}
     )
     _reset_cache(routes)
     handler = _FakeHandler()
@@ -305,7 +388,7 @@ def test_endpoint_degrades_to_an_empty_map_on_failure(monkeypatch):
     """The badge is decoration: a broken probe must not 500 the sidebar."""
     routes = _routes_module()
 
-    def boom(now=None):
+    def boom(now=None, db_path=None):
         raise RuntimeError("state.db unavailable")
 
     monkeypatch.setattr(routes, "_live_subagent_counts", boom)
@@ -320,17 +403,43 @@ def test_endpoint_serves_from_cache_inside_the_ttl(monkeypatch):
     routes = _routes_module()
     calls = {"n": 0}
 
-    def counting(now=None):
+    def counting(now=None, db_path=None):
         calls["n"] += 1
         return {"p": calls["n"]}
 
     monkeypatch.setattr(routes, "_live_subagent_counts", counting)
-    _reset_cache(routes)
+    routes._live_subagents_cache.clear()
     first, second = _FakeHandler(), _FakeHandler()
     routes._handle_live_subagents(first, None)
     routes._handle_live_subagents(second, None)
     assert calls["n"] == 1, "the second call inside the TTL must not re-probe"
     assert first.json_body()["generated_at"] == second.json_body()["generated_at"]
+
+
+def test_cache_is_keyed_by_state_db_so_profiles_never_share_counts(monkeypatch, tmp_path):
+    """The state.db path follows the active profile, so a single cache slot would
+    serve profile A's counts (and its parent session ids) to a profile B request
+    inside the TTL — wrong data plus cross-profile exposure."""
+    routes = _routes_module()
+    db_a, db_b = tmp_path / "a" / "state.db", tmp_path / "b" / "state.db"
+    db_a.parent.mkdir()
+    db_b.parent.mkdir()
+    monkeypatch.setattr(
+        routes,
+        "_live_subagent_counts",
+        lambda now=None, db_path=None: {"session-of-" + str(db_path.parent.name): 1},
+    )
+    routes._live_subagents_cache.clear()
+
+    monkeypatch.setattr(routes, "_active_state_db_path", lambda: db_a)
+    routes._handle_live_subagents(h := _FakeHandler(), None)
+    assert h.json_body()["counts"] == {"session-of-a": 1}
+
+    monkeypatch.setattr(routes, "_active_state_db_path", lambda: db_b)
+    routes._handle_live_subagents(h2 := _FakeHandler(), None)
+    assert h2.json_body()["counts"] == {"session-of-b": 1}, (
+        "a profile-B request inside the TTL must not be served profile A's counts"
+    )
 
 
 def test_endpoint_is_registered_on_get():
