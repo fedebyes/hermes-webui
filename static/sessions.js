@@ -7395,24 +7395,27 @@ function _refreshSessionListAfterSidebarResume(reason){
 async function refreshLiveSubagentCounts(){
   // Cheap and non-blocking: the endpoint is cached ~3s server-side and failure
   // just means "no badge" — it must never disturb the sidebar or surface a toast.
+  // Returns true only when the map was actually replaced, so the caller knows
+  // whether a second repaint could show anything new.
   try{
     const res=await api('/api/subagents/live',{retries:0,timeoutToast:false,redirect401:false,timeoutMs:3000});
     const counts=(res&&res.counts&&typeof res.counts==='object')?res.counts:{};
     _liveSubagentCounts=counts;
+    return true;
   }catch(e){
     // Leave the previous map in place on a transient error rather than
     // flickering every badge off; the next tick reconciles.
+    return false;
   }
 }
 
-async function _refreshSidebarWithLiveCounts(){
-  // Await the counts before the repaint so the badge is current on first paint,
-  // but never let a slow probe gate the session list: the repaint is the primary
-  // work and the badge is decoration. A short explicit timeout plus Promise.race
-  // means a wedged state.db read costs 3s at worst, not api()'s 30s default.
-  const fetchCounts = refreshLiveSubagentCounts();
-  await Promise.race([fetchCounts, new Promise(r => setTimeout(r, 3000))]);
+function _refreshSidebarThenLiveCounts(){
+  // Repaint first: `_refreshSidebarForBackgroundChurn` is what defers under
+  // interaction and keeps Firefox free of scroll jumps, so it stays a direct
+  // call at every producer site. Counts follow, and the sidebar repaints once
+  // more only if the map actually changed — the badge never gates the sidebar.
   void _refreshSidebarForBackgroundChurn();
+  void refreshLiveSubagentCounts().then(ok => { if(ok) void _refreshSidebarForBackgroundChurn(); });
 }
 
 function startStreamingPoll(){
@@ -7423,17 +7426,21 @@ function startStreamingPoll(){
     // brings the list current the moment the tab is shown again, so no update is
     // lost — the background tab just stops burning network + DOM churn.
     if(typeof document !== 'undefined' && document.hidden) return;
-    void _refreshSidebarWithLiveCounts();
+    // The Firefox scroll-stability contract pins this direct call in the poll:
+    // `_refreshSidebarForBackgroundChurn` is what defers behind interaction, so
+    // it is never hidden behind a wrapper. Counts follow and repaint on arrival.
+    void _refreshSidebarForBackgroundChurn();
+    void refreshLiveSubagentCounts().then(ok => { if(ok) void _refreshSidebarForBackgroundChurn(); });
   }, _streamingPollMs);
   if(typeof document !== 'undefined' && !_streamingPollVisibilityHandler){
     _streamingPollVisibilityHandler = () => {
-      if(!document.hidden) void _refreshSidebarWithLiveCounts();
+      if(!document.hidden) _refreshSidebarThenLiveCounts();
     };
     document.addEventListener('visibilitychange', _streamingPollVisibilityHandler);
   }
   // First paint: without this a freshly loaded page waits a full interval (~30s)
   // before any badge appears, even with a child already live.
-  void _refreshSidebarWithLiveCounts();
+  _refreshSidebarThenLiveCounts();
 }
 
 function stopStreamingPoll(){

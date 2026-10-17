@@ -224,32 +224,40 @@ def test_client_fetches_the_live_endpoint():
     assert "redirect401:false" in body
 
 
-def test_poll_awaits_counts_before_rendering():
-    """Counts must be current when the list repaints, not one tick behind.
+def test_poll_repaints_first_and_badges_after():
+    """The sidebar repaint must never be gated on the badge probe.
 
-    Firing both as independent `void` calls renders the *previous* map and leaves
-    the badge up to a full poll interval (~30s) stale; on first load that means no
-    badge at all until a later tick. The refresh must therefore be awaited by the
-    helper the poll calls.
+    `_refreshSidebarForBackgroundChurn` is what defers behind interaction (the
+    Firefox scroll-stability contract pins its direct call in the poll), so it
+    fires first and unconditionally; the counts fetch follows and triggers a
+    second repaint only when the map actually changed.
     """
-    m = re.search(
-        r"^async function _refreshSidebarWithLiveCounts\(\)\{.*?^\}\n", SESSIONS_JS, re.S | re.M
-    )
-    assert m, "_refreshSidebarWithLiveCounts not found"
-    body = m.group(0)
-    assert re.search(r"await Promise\.race\(", body), (
-        "the counts fetch must be bounded so it can never gate the repaint"
-    )
-    assert "3000" in body, "the badge fetch needs an explicit short timeout"
-    assert body.index("Promise.race") < body.index("_refreshSidebarForBackgroundChurn(")
-
     poll = re.search(r"^function startStreamingPoll\(\)\{.*?\n\}\n", SESSIONS_JS, re.S | re.M)
     assert poll, "startStreamingPoll not found"
-    poll_body = poll.group(0)
-    # Interval tick, visibilitychange, AND one immediate first paint.
-    assert poll_body.count("_refreshSidebarWithLiveCounts()") >= 3, (
-        "interval tick, visibilitychange and the first paint must all refresh"
+    body = poll.group(0)
+    repaint = body.index("_refreshSidebarForBackgroundChurn()")
+    fetch = body.index("refreshLiveSubagentCounts()")
+    assert repaint < fetch, "the sidebar repaint must not be gated on the badge fetch"
+    # A second repaint after the fetch is what actually shows the badge.
+    assert body.count("_refreshSidebarForBackgroundChurn()") >= 2, (
+        "the sidebar must repaint again once the counts land"
     )
+    # Interval tick + visibilitychange + one immediate first paint: every entry
+    # point refreshes the counts (the last one via the compound helper).
+    assert body.count("refreshLiveSubagentCounts()") + body.count("_refreshSidebarThenLiveCounts()") >= 3
+
+
+def test_badge_fetch_has_its_own_short_timeout():
+    """The probe must not inherit api()'s 30s default: it is decoration."""
+    m = re.search(
+        r"^async function refreshLiveSubagentCounts\(\)\{.*?^\}\n", SESSIONS_JS, re.S | re.M
+    )
+    assert m, "refreshLiveSubagentCounts not found"
+    assert "timeoutMs:3000" in m.group(0), (
+        "the badge fetch needs an explicit short timeout, not the 30s default"
+    )
+    # It must report whether it changed the map, so the caller repaints only then.
+    assert "return false" in m.group(0) and "return true" in m.group(0)
 
 
 # ── style ───────────────────────────────────────────────────────────────────
