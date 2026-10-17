@@ -5038,6 +5038,10 @@ const SHOW_ALL_PROFILES_STORAGE_KEY = 'hermes-show-all-profiles';
 let _showAllProfiles = false;  // false = filter to active profile only
 let _profileSwitchOpeningExistingSession = false;  // true while cross-profile sidebar click switches profile before loadSession()
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
+// parent session_id -> number of live delegate children (GET /api/subagents/live).
+// Replaced wholesale on each successful poll so a finished run's count vanishes
+// on the next render instead of lingering until a page reload.
+let _liveSubagentCounts = {};
 let _archivedWebuiCount = 0;      // archived WebUI sessions not fetched until requested
 let _archivedCliCount = 0;        // archived non-WebUI sessions not fetched until requested
 let _archivedRowsLoadedLimit = SESSION_ARCHIVED_PAGE_SIZE;
@@ -7388,6 +7392,19 @@ function _refreshSessionListAfterSidebarResume(reason){
   void refreshSessionList(reason, {force:true});
 }
 
+async function refreshLiveSubagentCounts(){
+  // Cheap and non-blocking: the endpoint is cached ~3s server-side and failure
+  // just means "no badge" — it must never disturb the sidebar or surface a toast.
+  try{
+    const res=await api('/api/subagents/live',{retries:0,timeoutToast:false,redirect401:false});
+    const counts=(res&&res.counts&&typeof res.counts==='object')?res.counts:{};
+    _liveSubagentCounts=counts;
+  }catch(e){
+    // Leave the previous map in place on a transient error rather than
+    // flickering every badge off; the next tick reconciles.
+  }
+}
+
 function startStreamingPoll(){
   if(_streamingPollTimer) return;
   _streamingPollTimer = setInterval(() => {
@@ -7396,11 +7413,15 @@ function startStreamingPoll(){
     // brings the list current the moment the tab is shown again, so no update is
     // lost — the background tab just stops burning network + DOM churn.
     if(typeof document !== 'undefined' && document.hidden) return;
+    void refreshLiveSubagentCounts();
     void _refreshSidebarForBackgroundChurn();
   }, _streamingPollMs);
   if(typeof document !== 'undefined' && !_streamingPollVisibilityHandler){
     _streamingPollVisibilityHandler = () => {
-      if(!document.hidden) void _refreshSidebarForBackgroundChurn();
+      if(!document.hidden){
+        void refreshLiveSubagentCounts();
+        void _refreshSidebarForBackgroundChurn();
+      }
     };
     document.addEventListener('visibilitychange', _streamingPollVisibilityHandler);
   }
@@ -9447,9 +9468,29 @@ function _scopedSidebarReferenceRows(isCli, projectIdFor){
   });
 }
 
+function _applyLiveSubagentCounts(rows){
+  // Live subagent counts are a point-in-time map, not row state: they come
+  // from GET /api/subagents/live and are re-applied on every render so a count
+  // can never outlive the run it described. Rows are copied before decoration
+  // by the callers below, but assign defensively either way.
+  const counts=(_liveSubagentCounts&&typeof _liveSubagentCounts==='object')?_liveSubagentCounts:null;
+  for(const row of rows||[]){
+    if(!row) continue;
+    const sid=row.session_id;
+    const live=counts&&sid?Number(counts[sid]):0;
+    if(Number.isFinite(live)&&live>0) row._live_subagent_count=live;
+    else delete row._live_subagent_count;
+  }
+  return rows;
+}
+
 function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){
   const referenceRows=Array.isArray(referenceSessionsRaw)?referenceSessionsRaw:sessionsRaw;
-  return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows);
+  const rows=_attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows);
+  // Guarded call: browser tests extract this function alone and eval it without
+  // the decorator defined, so an unguarded reference here breaks their harness
+  // rather than the feature.
+  return typeof _applyLiveSubagentCounts==='function'?_applyLiveSubagentCounts(rows):rows;
 }
 
 // Apply the renderer's complete source/reference/lineage projection to an
@@ -10243,6 +10284,21 @@ function renderSessionListFromCache(){
       const doneMs=Number(s.done_at)*1000;
       doneEl.title=t('session_done_tooltip', _formatRelativeSessionTime(doneMs));
       titleRow.appendChild(doneEl);
+    }
+    // Live subagent marker: `_live_subagent_count` is the number of delegate
+    // children the runner still has open for this conversation, read from
+    // GET /api/subagents/live (state.db `source='subagent' AND ended_at IS NULL`).
+    // It is a point-in-time fact, never cached into the session row itself —
+    // the map is refreshed on its own cadence and a stale row would otherwise
+    // keep a dead count on screen. Inlined for the same slice-extraction reason
+    // as the done badge above.
+    if(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0){
+      const liveEl=document.createElement('span');
+      liveEl.className='session-live-subagents-badge';
+      const liveLabel=t('session_live_subagents', s._live_subagent_count);
+      liveEl.textContent=liveLabel;
+      liveEl.title=t('session_live_subagents_tooltip');
+      titleRow.appendChild(liveEl);
     }
     if(childCount>0){
       const childCountEl=document.createElement('span');

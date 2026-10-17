@@ -5921,6 +5921,14 @@ main.main > #mainPlugin{display:none;}
 .session-item.done .session-title{font-weight:400;}
 .session-done-badge{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:color-mix(in srgb,var(--success,#22c55e) 16%,transparent);color:var(--success,#22c55e);margin-left:6px;flex-shrink:0;user-select:none;cursor:default;letter-spacing:.02em;}
 .session-item.active .session-done-badge{background:color-mix(in srgb,var(--success,#22c55e) 26%,transparent);}
+/* Live delegate children: same pill geometry as the done badge (they share the
+   title row), but on the info accent so "3 running" is never mistaken for
+   "done". A subtle pulse is the only motion in the sidebar row, so it reads as
+   activity rather than as decoration. */
+.session-live-subagents-badge{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:color-mix(in srgb,var(--accent,#63b3ed) 16%,transparent);color:var(--accent,#63b3ed);margin-left:6px;flex-shrink:0;user-select:none;cursor:default;letter-spacing:.02em;animation:session-live-pulse 2s ease-in-out infinite;}
+.session-item.active .session-live-subagents-badge{background:color-mix(in srgb,var(--accent,#63b3ed) 26%,transparent);}
+@keyframes session-live-pulse{0%,100%{opacity:1;}50%{opacity:.62;}}
+@media (prefers-reduced-motion:reduce){.session-live-subagents-badge{animation:none;}}
 
 /* ── Subagent session tree (#494) ── */
 .session-lineage-count{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:rgba(148,163,184,.14);color:var(--muted);margin-left:6px;flex-shrink:0;user-select:none;cursor:default;}

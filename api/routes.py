@@ -14705,6 +14705,99 @@ def _handle_plugins(handler, parsed) -> bool:
         )
 
 
+_LIVE_SUBAGENTS_CACHE_TTL_SECONDS = 3.0
+# A subagent child still counts as live while it is silent for less than this.
+# The run lifecycle (ended_at IS NULL) is the primary signal; the window only
+# bounds rows a crashed run left open.
+_LIVE_SUBAGENTS_GRACE_SECONDS = 900.0
+_live_subagents_cache: dict = {"at": 0.0, "payload": None}
+_live_subagents_lock = threading.Lock()
+
+
+def _live_subagent_counts(now: float | None = None) -> dict:
+    """Return ``{parent_session_id: live_child_count}`` from the agent state.db.
+
+    "Live" is the delegate runner's own run/lifecycle: a child session is
+    created with ``source='subagent'`` and ``ended_at IS NULL``, and the runner
+    stamps ``ended_at``/``end_reason='agent_close'`` when the run finishes
+    (verified end-to-end against a real fan-out — the children carry NULL for
+    the whole run and close on exit). A crashed child would keep NULL forever,
+    so the predicate is bounded by recency: a row only counts while it was
+    started recently OR wrote a message recently. That keeps a leaked row from
+    inflating the badge without inventing a heartbeat the runner never sends.
+
+    Read-only, single aggregate query on the ``source`` index. Any failure
+    degrades to an empty map: the sidebar badge is decoration and must never
+    be able to break the session list.
+    """
+    now = time.time() if now is None else now
+    try:
+        from api.agent_sessions import open_state_db_readonly
+
+        db_path = _active_state_db_path()
+        if not db_path.exists():
+            return {}
+        window_start = now - _LIVE_SUBAGENTS_GRACE_SECONDS
+        with closing(open_state_db_readonly(db_path)) as conn:
+            rows = conn.execute(
+                """
+                SELECT s.parent_session_id AS parent_id, COUNT(*) AS live_count
+                FROM sessions s
+                WHERE s.source = 'subagent'
+                  AND s.parent_session_id IS NOT NULL
+                  AND s.ended_at IS NULL
+                  AND (
+                        s.started_at >= ?
+                     OR COALESCE((
+                            SELECT MAX(m.timestamp) FROM messages m
+                            WHERE m.session_id = s.id
+                        ), 0) >= ?
+                  )
+                GROUP BY s.parent_session_id
+                """,
+                (window_start, window_start),
+            ).fetchall()
+    except Exception as exc:
+        logger.debug("live subagent probe failed: %s", exc)
+        return {}
+    return {
+        str(row[0]): int(row[1])
+        for row in rows
+        if row[0] and row[1]
+    }
+
+
+def _handle_live_subagents(handler, parsed) -> bool:
+    """GET /api/subagents/live — cheap map of parent session → live child count.
+
+    The sidebar selector repaints often, so the aggregate is cached briefly and
+    the response stays a tiny map. ``staleness_seconds`` is reported so a client
+    can tell how old the number it is rendering is.
+    """
+    now = time.time()
+    with _live_subagents_lock:
+        cached = _live_subagents_cache.get("payload")
+        if cached is not None and (now - float(_live_subagents_cache.get("at") or 0)) < _LIVE_SUBAGENTS_CACHE_TTL_SECONDS:
+            return j(handler, cached)
+    try:
+        counts = _live_subagent_counts(now)
+    except Exception as exc:
+        logger.debug("live subagent handler degraded: %s", exc)
+        counts = {}
+    payload = {
+        "counts": counts,
+        "total": sum(counts.values()),
+        "generated_at": now,
+        # How long a child may be silent before the badge stops counting it.
+        "grace_seconds": _LIVE_SUBAGENTS_GRACE_SECONDS,
+        "cached_for_seconds": _LIVE_SUBAGENTS_CACHE_TTL_SECONDS,
+        "read_only": True,
+    }
+    with _live_subagents_lock:
+        _live_subagents_cache["at"] = now
+        _live_subagents_cache["payload"] = payload
+    return j(handler, payload)
+
 _SHELL_ERROR_HTML = """<!doctype html>
 <html lang=\"en\">
 <head>
@@ -16051,6 +16144,9 @@ def handle_get(handler, parsed) -> bool:
         from api.profiles import profile_env_for_active_request_readonly
         with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
+
+    if parsed.path == "/api/subagents/live":
+        return _handle_live_subagents(handler, parsed)
 
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
     if parsed.path == "/api/plugins":
