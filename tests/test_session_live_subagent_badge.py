@@ -200,8 +200,12 @@ def test_poll_refreshes_counts_before_rendering():
         "both the interval tick and the visibilitychange handler must refresh"
     )
     tick = body.index("refreshLiveSubagentCounts()")
-    render = body.index("renderSessionList({deferWhileInteracting:true})")
-    assert tick < render, "refresh must precede the repaint it feeds"
+    # The repaint helper differs across bases (`_refreshSidebarForBackgroundChurn`
+    # or `renderSessionList`); the property that matters is that whichever it is,
+    # the counts are refreshed before the repaint they feed.
+    repaint = re.search(r"void (_refreshSidebarForBackgroundChurn|renderSessionList)\(", body)
+    assert repaint, "no sidebar repaint call found in the poll"
+    assert tick < repaint.start(), "refresh must precede the repaint it feeds"
 
 
 # ── style ───────────────────────────────────────────────────────────────────
