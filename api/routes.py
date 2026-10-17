@@ -14785,11 +14785,17 @@ def _handle_live_subagents(handler, parsed) -> bool:
         db_path = _active_state_db_path()
         cache_key = str(db_path)
     except Exception:
+        # Shared "" slot only ever serves requests whose path resolution failed;
+        # the probe re-resolves and returns {} for them, so nothing leaks across
+        # profiles.
         db_path, cache_key = None, ""
     with _live_subagents_lock:
         entry = _live_subagents_cache.get(cache_key)
-        if entry and (now - float(entry.get("at") or 0)) < _LIVE_SUBAGENTS_CACHE_TTL_SECONDS:
-            return j(handler, entry["payload"])
+        hit = entry["payload"] if entry and (now - float(entry.get("at") or 0)) < _LIVE_SUBAGENTS_CACHE_TTL_SECONDS else None
+    if hit is not None:
+        # Serialize outside the lock: holding it through the socket write would
+        # make one slow client stall every other badge request.
+        return j(handler, hit)
     try:
         counts = _live_subagent_counts(now, db_path)
     except Exception as exc:

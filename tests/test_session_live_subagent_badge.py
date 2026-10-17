@@ -183,12 +183,12 @@ def test_apply_ignores_empty_and_malformed_maps():
 
 
 def test_apply_rejects_coercible_non_numbers():
-    """A string `"3"` or `true` must not become a badge count.
+    """A string `"3"`, `true`, or a fraction must not become a badge count.
 
-    `Number()` coercion would turn both into a paintable number, defeating the
-    renderer's typeof gate two lines later in the row renderer.
+    `Number()` coercion would turn the first two into a paintable number, and a
+    fraction would render "1.5 live" — the counts are child counts, so integers only.
     """
-    for bogus in ("3", True, "abc", float("nan")):
+    for bogus in ("3", True, "abc", float("nan"), 1.5, 0):
         rows = _run_apply([{"session_id": "a"}], {"a": bogus})
         assert "_live_subagent_count" not in rows[0], bogus
 
@@ -237,17 +237,19 @@ def test_poll_awaits_counts_before_rendering():
     )
     assert m, "_refreshSidebarWithLiveCounts not found"
     body = m.group(0)
-    assert re.search(r"await refreshLiveSubagentCounts\(\)", body), (
-        "the counts fetch must be awaited before the repaint"
+    assert re.search(r"await Promise\.race\(", body), (
+        "the counts fetch must be bounded so it can never gate the repaint"
     )
-    repaint = re.search(r"(?<!await )_refreshSidebarForBackgroundChurn\(", body)
-    assert repaint, "the helper must trigger the sidebar repaint"
-    assert body.index("await refreshLiveSubagentCounts()") < repaint.start()
+    assert "3000" in body, "the badge fetch needs an explicit short timeout"
+    assert body.index("Promise.race") < body.index("_refreshSidebarForBackgroundChurn(")
 
     poll = re.search(r"^function startStreamingPoll\(\)\{.*?\n\}\n", SESSIONS_JS, re.S | re.M)
     assert poll, "startStreamingPoll not found"
-    # Both entry points (interval tick + visibilitychange) go through the helper.
-    assert poll.group(0).count("_refreshSidebarWithLiveCounts()") >= 2
+    poll_body = poll.group(0)
+    # Interval tick, visibilitychange, AND one immediate first paint.
+    assert poll_body.count("_refreshSidebarWithLiveCounts()") >= 3, (
+        "interval tick, visibilitychange and the first paint must all refresh"
+    )
 
 
 # ── style ───────────────────────────────────────────────────────────────────

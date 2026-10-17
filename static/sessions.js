@@ -7396,7 +7396,7 @@ async function refreshLiveSubagentCounts(){
   // Cheap and non-blocking: the endpoint is cached ~3s server-side and failure
   // just means "no badge" — it must never disturb the sidebar or surface a toast.
   try{
-    const res=await api('/api/subagents/live',{retries:0,timeoutToast:false,redirect401:false});
+    const res=await api('/api/subagents/live',{retries:0,timeoutToast:false,redirect401:false,timeoutMs:3000});
     const counts=(res&&res.counts&&typeof res.counts==='object')?res.counts:{};
     _liveSubagentCounts=counts;
   }catch(e){
@@ -7406,10 +7406,12 @@ async function refreshLiveSubagentCounts(){
 }
 
 async function _refreshSidebarWithLiveCounts(){
-  // Await the counts before the repaint: firing both unawaited would render the
-  // previous map and leave the badge one full poll interval (~30s) behind, which
-  // on first paint means no badge at all until a later tick.
-  await refreshLiveSubagentCounts();
+  // Await the counts before the repaint so the badge is current on first paint,
+  // but never let a slow probe gate the session list: the repaint is the primary
+  // work and the badge is decoration. A short explicit timeout plus Promise.race
+  // means a wedged state.db read costs 3s at worst, not api()'s 30s default.
+  const fetchCounts = refreshLiveSubagentCounts();
+  await Promise.race([fetchCounts, new Promise(r => setTimeout(r, 3000))]);
   void _refreshSidebarForBackgroundChurn();
 }
 
@@ -7429,6 +7431,9 @@ function startStreamingPoll(){
     };
     document.addEventListener('visibilitychange', _streamingPollVisibilityHandler);
   }
+  // First paint: without this a freshly loaded page waits a full interval (~30s)
+  // before any badge appears, even with a child already live.
+  void _refreshSidebarWithLiveCounts();
 }
 
 function stopStreamingPoll(){
@@ -9484,7 +9489,7 @@ function _applyLiveSubagentCounts(rows){
     // Strict numeric check, no coercion: a string or boolean from a malformed
     // payload must not paint a count the renderer's own typeof gate would accept.
     const raw=counts&&sid?counts[sid]:undefined;
-    if(typeof raw==='number'&&Number.isFinite(raw)&&raw>0) row._live_subagent_count=raw;
+    if(typeof raw==='number'&&Number.isInteger(raw)&&raw>0) row._live_subagent_count=raw;
     else delete row._live_subagent_count;
   }
   return rows;
