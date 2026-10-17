@@ -721,7 +721,7 @@ function _messageIsRenderable(m){
   // Internal delegation handoffs remain in S.messages for model/recovery state,
   // but never acquire a transcript row (including attachment-only rows).
   if(m._source==='delegation_wakeup') return false;
-  if(m._source === 'process_wakeup') return !!(msgContent(m)||m.attachments?.length);
+  if(_isProcessWakeupMessage(m)) return !!(msgContent(m)||m.attachments?.length);
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
   const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
@@ -963,7 +963,7 @@ function _syncMessageVirtualHeightCache(visWithIdx){
 function _messageVirtualRoleForEntry(entry){
   const m=entry&&entry.m;
   if(!m) return 'default';
-  if(m._source === 'process_wakeup') return 'process_wakeup';
+  if(_isProcessWakeupMessage(m)) return 'process_wakeup';
   if(m.role==='user') return 'user';
   if(m.role==='assistant'){
     if((Array.isArray(m.tool_calls)&&m.tool_calls.length>0)||
@@ -19637,6 +19637,47 @@ function _maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualW
   return true;
 }
 
+// Async-delegation envelopes (delegate_task): a finished subagent's or
+// fan-out unit's consolidated report, wrapped by
+// tools/process_registry_notifications.py. The header block each envelope
+// carries -- dispatch time, original goal, provided context, toolsets,
+// role/model, and the prose telling the agent it may have moved on -- is
+// plumbing written for the agent that must act or re-dispatch, not for the
+// reader. This keeps the delegation id, the per-task outcome counts and the
+// result bodies; the message itself is untouched in the store, and every
+// shape it does not recognise still falls back to the raw notice.
+function _parseAsyncDelegation(text){
+  const m=String(text||'').match(/^\[ASYNC DELEGATION ([^\]]*)\]\n([\s\S]*)$/);
+  if(!m) return null;
+  const decl=m[1];
+  const full=m[2];
+  const kind=decl.indexOf('TASK FAILED')===0?'failed':(decl.indexOf('BATCH COMPLETE')===0?'batch':'complete');
+  const id=decl.replace(/^(?:BATCH COMPLETE|COMPLETE|TASK FAILED) — /,'').split(',')[0].trim();
+  // Per-task blocks are headed by a pinned "--- <icon> TASK i/n" line: count
+  // those rather than trusting the prose above them.
+  const taskRe=/^--- [^\n]*?TASK (\d+)\/(\d+)[^\n]*$/gm;
+  let h, ok=0, total=0, firstTaskAt=-1;
+  while((h=taskRe.exec(full))!==null){
+    if(firstTaskAt<0) firstTaskAt=h.index;
+    if(Number(h[2])>total) total=Number(h[2]);
+    if(h[0].indexOf('✓')!==-1) ok++;
+  }
+  const marker='--- RESULT ---';
+  let body=full;
+  if(full.indexOf(marker)!==-1){
+    body=full.slice(full.indexOf(marker)+marker.length).replace(/^\n/,'');
+  }else if(firstTaskAt>=0){
+    body=full.slice(firstTaskAt);
+  }
+  if(!total) total=1;
+  if(kind==='complete'&&!ok&&/^\s*Status: (?:completed|success)\b/m.test(full)) ok=1;
+  if(kind==='failed'){
+    ok=0;
+    const n=decl.match(/task (\d+)\/(\d+)/);
+    if(n) total=Number(n[2])||total;
+  }
+  return {delegationId:id,okCount:ok,total:total,output:body};
+}
 // #6345: parse the synthetic wakeup body back into display fields. Mirrors the
 // two structured api/background_process.format_wakeup_prompt shapes (pinned by
 // tests/test_background_process_wakeup_format.py); other event kinds return
@@ -19652,7 +19693,56 @@ function _parseProcessWakeupBody(text){
   if(m) return {type:'completion',taskId:m[1],exitCode:m[2],command:m[3],output:m[4],pattern:null};
   m=s.match(/^\[IMPORTANT: Background process ([^\n]*?) matched watch pattern "(.*)"\.\nCommand: ([^\n]*)\nMatched output:\n([\s\S]*)\]$/);
   if(m) return {type:'watch_match',taskId:m[1],pattern:m[2],command:m[3],output:m[4],exitCode:null};
+  const single=_parseAsyncDelegation(s);
+  if(single) return {type:'async_delegation',taskId:single.delegationId,delegationId:single.delegationId,okCount:single.okCount,total:single.total,output:single.output,exitCode:null,pattern:null,command:null};
+  // Grouped form: one batch header line, then one envelope per delegation,
+  // separated by a blank line (ProcessNotificationBatch.render). The header is
+  // agent instruction ("absorb it silently"), so it goes the way of the
+  // per-envelope preambles; counts and result bodies are aggregated.
+  m=s.match(/^\[IMPORTANT: \d+ background subagent delegations completed[^\]]*\]\n([\s\S]*)$/);
+  if(m){
+    const blocks=m[1].split(/\n\n(?=\[ASYNC DELEGATION )/);
+    let ok=0, total=0;
+    const bodies=[];
+    for(let i=0;i<blocks.length;i++){
+      // The header is followed by a blank line, so the first block arrives with
+      // leading whitespace the envelope regex anchors against.
+      const info=_parseAsyncDelegation(blocks[i].replace(/^\s+/,''));
+      if(!info) continue;
+      ok+=info.okCount;
+      total+=info.total;
+      if(String(info.output||'').replace(/\s/g,'')) bodies.push(info.output);
+    }
+    if(total){
+      return {type:'async_delegation',taskId:'',delegationId:'',okCount:ok,total:total,output:bodies.join('\n\n'),exitCode:null,pattern:null,command:null};
+    }
+  }
   return null;
+}
+// The display gate that decides whether a user row is a process-wakeup notice.
+// `_source: "process_wakeup"` is authoritative when present, but transcripts
+// saved before the server-side stamping fix (#7361/#7828) carry no stamp at
+// all: for those the envelope grammar itself confirms the row, or an old
+// session keeps rendering a multi-KB raw dump as an ordinary user bubble.
+// Bounded on purpose — this runs for every message on every render, so the
+// cheap reject reads a short slice and the body is never parsed here.
+function _isProcessWakeupMessage(m){
+  if(!m) return false;
+  if(m._source === 'process_wakeup') return true;
+  // Any other explicit source is authoritative: a webui or delegation row is
+  // never re-classified by its text.
+  if(m._source || m.role !== 'user') return false;
+  if(typeof m.content === 'string' && m.content.lastIndexOf('[', 1024) === -1) return false;
+  return _wakeupOpenerAtStart(_stripWorkspaceDisplayPrefix(msgContent(m)));
+}
+function _wakeupOpenerAtStart(s){
+  if(typeof s!=='string' || s.charCodeAt(0)!==91/* '[' */) return false;
+  const head=s.slice(0,256);
+  if(head.indexOf('[ASYNC DELEGATION ')===0) return true;
+  if(head.indexOf('[IMPORTANT: Background process ')===0) return true;
+  // Batch form: one header line naming k delegations, then the k envelopes.
+  return head.indexOf('[IMPORTANT: ')===0
+    && head.indexOf('background subagent delegations completed')!==-1;
 }
 // Server-stamped _wakeup_meta (authoritative when present) merged over the
 // client parse; the output section only ever comes from the parse because the
@@ -19671,6 +19761,12 @@ function _processWakeupInfo(m, text){
     command:String(pick('command','command')||''),
     exitCode:pick('exit_code','exitCode'),
     pattern:pick('pattern','pattern'),
+    // Async-delegation fields: the counts come from the parsed per-task
+    // headings, with the server-side names wired in so a stamped
+    // ``_wakeup_meta`` would win the same way it does for completions.
+    delegationId:String(pick('delegation_id','delegationId')||''),
+    okCount:pick('completed_count','okCount'),
+    total:pick('task_count','total'),
     output:parsed?parsed.output:null,
   };
 }
@@ -19683,6 +19779,14 @@ function _processWakeupCardHtml(info, rawText, extras){
   let chip;
   if(isWatch){
     chip=`<span class="process-wakeup-chip watch" title="${esc(t('process_wakeup_matched'))}">${li('eye',11)}<code title="${esc(String(info.pattern||''))}">${esc(String(info.pattern||''))}</code></span>`;
+  }else if(info.type==='async_delegation'){
+    // "ok/total" reads without a new locale string: the chip is the only
+    // number the reader needs at a glance (which of how many subagents came
+    // back), and the delegation id it points at is in the hover title.
+    const total=Number(info.total)||1;
+    const ok=Math.max(0,Math.min(total,Number(info.okCount)||0));
+    const allOk=ok>=total;
+    chip=`<span class="process-wakeup-chip ${allOk?'ok':'fail'}" title="${esc(String(info.delegationId||''))}">${allOk?li('check',11):li('x',11)}<span>${ok}/${total}</span></span>`;
   }else{
     const cls=exitOk?'ok':(exitKnown?'fail':'neutral');
     const icon=exitOk?li('check',11):(exitKnown?li('x',11):'');
@@ -20245,7 +20349,7 @@ function renderMessages(options){
         }
       }
     }
-    const isProcessWakeup=m&&m._source==='process_wakeup';
+    const isProcessWakeup=_isProcessWakeupMessage(m);
     const isUser=m.role==='user';
     // #7882 (gate round-7 CORE): a hidden delegation_wakeup row between two
     // answers deletes the user-turn boundary from the visible projection —
@@ -20360,6 +20464,7 @@ function renderMessages(options){
         noticeClass+=' process-wakeup-notice-card';
         const exitStr=wakeupInfo.exitCode==null?'':String(wakeupInfo.exitCode);
         if(wakeupInfo.type==='completion'&&/^-?\d+$/.test(exitStr)&&exitStr!=='0') noticeClass+=' process-wakeup-fail';
+        if(wakeupInfo.type==='async_delegation'&&(Number(wakeupInfo.okCount)||0)<(Number(wakeupInfo.total)||1)) noticeClass+=' process-wakeup-fail';
         noticeInnerHtml=_processWakeupCardHtml(wakeupInfo, processText, {timeHtml, filesHtml, footHtml:`<div class="msg-foot"><span class="msg-actions">${copyBtn}</span></div>`});
       }else{
         const processTextHtml=processText?`<pre class="process-wakeup-text">${esc(processText)}</pre>`:'';

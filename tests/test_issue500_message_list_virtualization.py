@@ -52,6 +52,24 @@ function extractFunc(name) {{
   }}
   return src.slice(start, i);
 }}
+// A function that classifies a row through _isProcessWakeupMessage cannot be
+// evaluated alone: the helper (and its own opener check) must exist first.
+// The dependency sources are RETURNED rather than eval'd here — `eval` inside a
+// function body keeps its declarations local (sloppy-mode direct eval), so
+// eval'ing them here would define nothing visible to the caller.
+function _wakeupDepSources(name) {{
+  const needs = (name === '_messageVirtualRoleForEntry' || name === '_messageIsRenderable');
+  if (!needs || src.indexOf('function _isProcessWakeupMessage') === -1) return [];
+  // Order matters for readability only (all are hoisted function declarations),
+  // but every one is required: _isProcessWakeupMessage strips the workspace
+  // display prefix before asking whether the row opens with a wakeup envelope.
+  return [
+    extractFunc('msgContent'),
+    extractFunc('_stripWorkspaceDisplayPrefix'),
+    extractFunc('_wakeupOpenerAtStart'),
+    extractFunc('_isProcessWakeupMessage'),
+  ];
+}}
 """
 
 
@@ -431,6 +449,7 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {
   default: 140,
 };
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+for (const _d of _wakeupDepSources('_messageVirtualRoleForEntry')) eval(_d);
 eval(extractFunc('_messageVirtualRoleForEntry'));
 let virtualized = true;
 let _messageVirtualHeightCache = [0, 220, 180, 120];
@@ -867,6 +886,7 @@ def test_message_virtual_role_for_entry_classifies_tool_calls():
     """Verify role classifier detects tool_calls, tool_use content, and _partial_tool_calls."""
     js = UI_JS_PATH.read_text(encoding="utf-8")
     source = _extract_func_script(js) + """
+for (const _d of _wakeupDepSources('_messageVirtualRoleForEntry')) eval(_d);
 eval(extractFunc('_messageVirtualRoleForEntry'));
 console.log(JSON.stringify({
   userRole: _messageVirtualRoleForEntry({m: {role: 'user'}}),
@@ -1022,6 +1042,7 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {
   default: 140,
 };
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+for (const _d of _wakeupDepSources('_messageVirtualRoleForEntry')) eval(_d);
 eval(extractFunc('_messageVirtualRoleForEntry'));
 
 // Three entries: user (120), tool_call (400), assistant (160) — all uncached (height=0)
