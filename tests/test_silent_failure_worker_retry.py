@@ -353,3 +353,106 @@ def test_retry_rejects_a_bare_replay_of_historical_rows(worker_scene):
     errors = _error_rows(scene)
     assert len(errors) == 1, "a replayed historical transcript must not settle"
     assert "No response from provider" in errors[0]["content"]
+
+
+# ── Blocker: the retry's own failure owns the card ───────────────────────────
+
+
+class _RaisingRetryAgent:
+    """Synthetic agent whose call raises, as a provider failure does.
+
+    The retry builds a *fresh* agent, so a per-instance counter cannot tell the
+    first attempt from the retry. The counter is class-level: the first
+    ``run_conversation`` returns the silent result, every one after raises.
+    """
+
+    instances = []
+    result_messages = []
+    raise_on_run = None
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.context_compressor = None
+        self.session_prompt_tokens = self.session_completion_tokens = 0
+        self.session_cache_read_tokens = self.session_cache_write_tokens = 0
+        self.session_estimated_cost_usd = None
+        self.reasoning_config = self.ephemeral_system_prompt = self._last_error = None
+        self.pending = []
+        self.pending_lock = threading.Lock()
+        self.runs = 0
+        _RaisingRetryAgent.instances.append(self)
+
+    def run_conversation(self, **_kwargs):
+        self.runs += 1
+        _RaisingRetryAgent.calls += 1
+        if _RaisingRetryAgent.calls >= 2 and _RaisingRetryAgent.raise_on_run is not None:
+            raise _RaisingRetryAgent.raise_on_run
+        return {"messages": [dict(row) for row in self.result_messages]}
+
+    def interrupt(self, _message):
+        return None
+
+    def steer(self, _text):
+        return True
+
+    def _drain_pending_steer(self):
+        return None
+
+
+def _run_with_raising_retry(scene, monkeypatch, exc, silent_rows):
+    _RaisingRetryAgent.instances = []
+    _RaisingRetryAgent.calls = 0
+    _RaisingRetryAgent.result_messages = silent_rows
+    _RaisingRetryAgent.raise_on_run = exc
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: _RaisingRetryAgent)
+    try:
+        scene.run()
+    finally:
+        _RaisingRetryAgent.raise_on_run = None
+    return _RaisingRetryAgent.instances
+
+
+def test_raised_rate_limit_on_the_retry_is_classified_as_rate_limit(
+    worker_scene, monkeypatch,
+):
+    """A retry that *raises* 429 must not be reported as a silent no-response."""
+    scene = worker_scene
+    agents = _run_with_raising_retry(
+        scene, monkeypatch,
+        RuntimeError("429 rate limit exceeded, please retry later"),
+        [_user_row()],
+    )
+
+    assert len(agents) == 2, "the retry builds a fresh agent: two instances"
+    assert _RaisingRetryAgent.calls == 2, "the retry must have run"
+    errors = _error_rows(scene)
+    assert len(errors) == 1
+    body = errors[0]["content"]
+    assert "No response from provider" not in body, (
+        "a raised retry error is not a silent turn"
+    )
+    assert "rate limit" in body.lower(), (
+        f"the retry's own cause must reach the card, got: {body[:200]}"
+    )
+
+
+def test_raised_quota_error_on_the_retry_is_classified_as_quota(
+    worker_scene, monkeypatch,
+):
+    """A retry that raises ``402 insufficient_quota`` classifies as quota."""
+    scene = worker_scene
+    _run_with_raising_retry(
+        scene, monkeypatch,
+        RuntimeError("402 insufficient_quota: your balance is exhausted"),
+        [_user_row()],
+    )
+
+    errors = _error_rows(scene)
+    assert len(errors) == 1
+    body = errors[0]["content"]
+    assert "No response from provider" not in body
+    assert "quota" in body.lower() or "balance" in body.lower() or "credit" in body.lower(), (
+        f"quota wording expected, got: {body[:200]}"
+    )
