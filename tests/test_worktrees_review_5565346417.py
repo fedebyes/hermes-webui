@@ -6,12 +6,51 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_worktrees_ownership_optional_queries import (  # noqa: F401
-    _git,
-    _import,
-    _stub_agent_setup,
-    git_env,
-)
+
+def _git(*args, cwd=None, check=True):
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
+    return result
+
+
+@pytest.fixture()
+def git_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "t")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "t@example.com")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "t")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "t@example.com")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig-none"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    return tmp_path
+
+
+def _import():
+    from api.worktrees import find_main_worktree_root
+
+    return find_main_worktree_root
+
+
+def _stub_agent_setup(monkeypatch, created_root):
+    import api.worktrees as worktrees
+
+    seen = {}
+
+    def fake(repo_root):
+        seen["repo_root"] = repo_root
+        tree = Path(repo_root) / ".worktrees" / "hermes-test"
+        tree.mkdir(parents=True, exist_ok=True)
+        created_root.append(tree)
+        return {"path": str(tree), "branch": "hermes-test", "repo_root": str(repo_root)}
+
+    monkeypatch.setattr(worktrees, "_setup_agent_worktree", fake)
+    return seen
 
 
 # --- Maintainer re-gate 5565346417: content-independent ownership ---------------
