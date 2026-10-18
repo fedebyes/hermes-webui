@@ -11,6 +11,7 @@ resolved root is the actual checkout, not the metadata dir.
 """
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -159,12 +160,13 @@ def test_non_git_directory_returns_none(git_env):
 
 
 def test_separate_git_dir_inside_unrelated_repo_is_not_mistaken_for_it(git_env):
-    """P1 on #8162: the fallback must verify the parent OWNS the common dir.
+    """P1 on #8162: the metadata's parent must not be taken for the checkout.
 
     A checkout can keep ``--separate-git-dir`` inside another repository's tree
     while the checkout itself lives elsewhere. The parent is a valid checkout,
     so a parent-only check returns it and starts the session in the wrong
-    project. The parent does not own this common dir, so the answer is None.
+    project. The checkout owns its own metadata, so the correct answer is the
+    checkout — never ``host``.
     """
     host = _init_repo(git_env / "host-repo")
     checkout = git_env / "elsewhere" / "checkout"
@@ -173,4 +175,96 @@ def test_separate_git_dir_inside_unrelated_repo_is_not_mistaken_for_it(git_env):
     _git("init", "-q", "-b", "main", f"--separate-git-dir={metadata}", cwd=checkout)
 
     find = _import()
-    assert find(checkout) is None
+    root = find(checkout)
+    assert root == checkout.resolve(), f"expected the checkout, got {root}"
+    assert root != host.resolve()
+
+
+# --- Reviewer follow-up: separate metadata literally named ".git" -------------
+#
+# ``git init --separate-git-dir=<storage>/.git`` makes the common dir's *basename*
+# ``.git`` while its parent is storage, not a checkout. A basename-only ownership
+# assumption returned ``storage`` and created session trees beneath it. These
+# cases assert the real allocation: which root reaches the Agent helper and where
+# the tree lands.
+
+
+def _separate_dotgit_fixture(base):
+    """A checkout whose metadata is ``<base>/storage-only/.git``."""
+    checkout = base / "actual-checkout"
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True, exist_ok=True)
+    storage.mkdir(parents=True, exist_ok=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "README.md").write_text("x\n", encoding="utf-8")
+    _git("add", "README.md", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    return checkout, storage
+
+
+def _stub_agent_setup(monkeypatch, created_root):
+    """Replace the Agent helper with one that records its argument.
+
+    The real helper is exercised by the maintainer's replay; here the contract
+    under test is *which root WebUI passes down* and where the tree is placed.
+    """
+    import api.worktrees as worktrees
+
+    seen = {}
+
+    def fake(repo_root):
+        seen["repo_root"] = repo_root
+        tree = Path(repo_root) / ".worktrees" / "hermes-test"
+        tree.mkdir(parents=True, exist_ok=True)
+        created_root.append(tree)
+        return {"path": str(tree), "branch": "hermes-test", "repo_root": str(repo_root)}
+
+    monkeypatch.setattr(worktrees, "_setup_agent_worktree", fake)
+    return seen
+
+
+def test_separate_git_dir_named_dotgit_direct_allocation(git_env, monkeypatch):
+    """Direct input: the Agent must get the checkout, never the storage dir."""
+    checkout, storage = _separate_dotgit_fixture(git_env)
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(checkout)
+
+    assert Path(seen["repo_root"]).resolve() == checkout.resolve()
+    assert Path(info["repo_root"]).resolve() == checkout.resolve()
+    assert Path(info["path"]).resolve().is_relative_to(checkout.resolve())
+    assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
+    assert (checkout / "README.md").exists()
+
+
+def test_separate_git_dir_named_dotgit_linked_allocation(git_env, monkeypatch):
+    """Linked input: still the checkout that owns the metadata."""
+    checkout, storage = _separate_dotgit_fixture(git_env)
+    linked = git_env / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(linked)
+
+    assert Path(seen["repo_root"]).resolve() == checkout.resolve()
+    assert Path(info["repo_root"]).resolve() == checkout.resolve()
+    assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
+
+
+def test_separate_git_dir_named_dotgit_resolver_direct(git_env):
+    """The resolver alone answers the checkout for both inputs."""
+    checkout, storage = _separate_dotgit_fixture(git_env)
+    linked = git_env / "linked-wt2"
+    _git("worktree", "add", "-q", "-b", "side2", str(linked), cwd=checkout)
+
+    find = _import()
+    assert find(checkout) == checkout.resolve()
+    assert find(linked) == checkout.resolve()
+    assert find(checkout) != storage.resolve()

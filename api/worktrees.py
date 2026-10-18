@@ -411,13 +411,47 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     if common_path is None:
         return None
 
-    # 1. A common dir shaped ``<main>/.git`` names its checkout directly.
+    # 1. The workspace's own gitfile is the strongest evidence available: a
+    #    ``<checkout>/.git`` holding ``gitdir: <this common dir>`` names the
+    #    checkout that owns the metadata, whatever the metadata directory is
+    #    called. This is checked before any ``name == '.git'`` shape test,
+    #    because ``--separate-git-dir=<storage>/.git`` produces a common dir
+    #    whose *basename* is ``.git`` while its parent is storage, not a
+    #    checkout (the reviewer's remaining blocker on #8162).
+    #    A *linked* worktree carries a gitfile too, but it owns an admin dir
+    #    under the common dir, not the common dir itself, so the workspace is
+    #    only searched when it is the repository's primary checkout. Otherwise
+    #    the search starts above the workspace's toplevel, which is what lets a
+    #    linked worktree unnest to its main checkout.
+    near = None if _is_linked_worktree(ws, common_path) else ws
+    owning = _checkout_owning_gitdir(common_path, near=near)
+    if owning is not None:
+        return owning
+
+    # 2. A common dir shaped ``<main>/.git`` names its checkout directly — but
+    #    only when the parent really is that checkout. Two traps to exclude:
+    #    a separate-git-dir storage dir named ``.git`` (its parent holds
+    #    metadata, not a checkout) and that same storage dir itself, which git
+    #    happily reports as a working tree because of the basename. The real
+    #    checkout in both cases carries a **gitfile** at ``<root>/.git``
+    #    pointing at this common dir, never a directory. Anything unproven
+    #    falls through to the conservative fallback rather than guessing.
     if common_path.name == ".git":
         root = common_path.parent
         if root.is_dir():
-            return _git_toplevel(root) or root.resolve()
+            git_entry = root / ".git"
+            is_gitfile = git_entry.is_file()
+            if not is_gitfile:
+                toplevel = _git_toplevel(root)
+                if toplevel is not None and toplevel == root.resolve():
+                    owned = _common_git_dir(root)
+                    try:
+                        if owned is not None and owned.resolve() == common_path.resolve():
+                            return toplevel
+                    except OSError:
+                        pass
 
-    # 2. separate-git-dir / submodule: the metadata dir is NOT a checkout, and
+    # 3. separate-git-dir / submodule: the metadata dir is NOT a checkout, and
     #    ``--show-toplevel`` run *in* the metadata answers with the cwd's repo
     #    (a separate-git-dir checkout sets no core.worktree), so it cannot be
     #    trusted. The reliable source is the gitfile that points at this
@@ -426,7 +460,7 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     if found is not None:
         return found
 
-    # 3. Resolve a separate-git-dir checkout through ``core.worktree`` when set
+    # 4. Resolve a separate-git-dir checkout through ``core.worktree`` when set
     #    (git uses it for the same purpose in other layouts).
     try:
         result = subprocess.run(
@@ -448,7 +482,7 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
         if wt.is_dir() and _git_toplevel(wt) is not None:
             return wt
 
-    # 4. Conservative fallback: unnest to the parent of the metadata dir only
+    # 5. Conservative fallback: unnest to the parent of the metadata dir only
     #    when that parent is itself a real checkout *that owns this common dir*.
     #    Being a checkout is not enough: a repository can keep its separate Git
     #    directory inside an unrelated repo's tree while the checkout lives
@@ -469,13 +503,85 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     return None
 
 
-def _checkout_owning_gitdir(common_path: Path) -> Path | None:
+def _is_linked_worktree(workspace: Path, common_path: Path) -> bool:
+    """True when *workspace* is a linked worktree of the repo at *common_path*.
+
+    Decided by git itself: the per-worktree admin dir of a linked worktree sits
+    under ``<common>/worktrees/<name>`` and ``--git-dir`` reports that path,
+    while a primary checkout reports the common dir (or ``<checkout>/.git``,
+    which resolves to it). Comparing the two paths avoids guessing from the
+    ``.git`` shape — the whole point of the #8162 fix.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+            cwd=str(workspace),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    out = result.stdout.strip()
+    if not out:
+        return False
+    try:
+        git_dir = Path(out).expanduser().resolve()
+        return git_dir != common_path.resolve()
+    except OSError:
+        return False
+
+
+def _gitfile_points_at(pointed: Path, common_target: Path) -> bool:
+    """True when the gitdir *pointed* belongs to the repo at *common_target*.
+
+    A checkout's gitfile points either straight at the common dir (plain
+    ``--separate-git-dir``) or at a per-worktree admin dir under it
+    (``<common>/worktrees/<name>``, which is how a *linked* worktree's gitfile
+    is written). The per-worktree case is confirmed through its own
+    ``commondir`` file, so a linked worktree of a separate-git-dir checkout
+    still resolves to the checkout that owns the metadata instead of storage.
+    """
+    try:
+        if pointed.resolve() == common_target:
+            return True
+    except OSError:
+        return False
+
+    commondir = pointed / "commondir"
+    if not commondir.is_file():
+        return False
+    try:
+        raw = commondir.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return False
+    if not raw:
+        return False
+    resolved = Path(raw)
+    if not resolved.is_absolute():
+        resolved = pointed / resolved
+    try:
+        return resolved.resolve() == common_target
+    except OSError:
+        return False
+
+
+def _checkout_owning_gitdir(common_path: Path, near: Path | None = None) -> Path | None:
     """Find a checkout whose ``.git`` gitfile points at *common_path*.
 
     ``git init --separate-git-dir=X`` leaves ``<checkout>/.git`` holding a single
-    line ``gitdir: X``. Searching the metadata dir's siblings (the usual layout:
-    ``<parent>/checkout`` + ``<parent>/metadata``) finds the real working tree
-    without guessing, and the resolved path is validated as a checkout. Submodule
+    line ``gitdir: X``. The most reliable candidate is the workspace itself and
+    its ancestors: a session started anywhere inside the real checkout carries
+    that gitfile on the path up to the root, so *near* is searched first.
+    Failing that, the metadata dir's siblings are scanned (the usual layout:
+    ``<parent>/checkout`` + ``<parent>/metadata``), which is what recovers a
+    *linked* worktree, whose gitfile lives outside the checkout. Every candidate
+    is validated by reading its gitfile, so storage directories (including one
+    literally named ``.git``) are never mistaken for checkouts. Submodule
     metadata (``<super>/.git/modules/<name>``) is matched the same way when the
     submodule is checked out under ``<super>/<name>``.
     """
@@ -483,11 +589,31 @@ def _checkout_owning_gitdir(common_path: Path) -> Path | None:
     parent = common_path.parent
     candidates = []
 
-    # Siblings of the metadata dir (separate-git-dir), then the superproject's
-    # own working tree (submodule: <super>/.git/modules/<name> -> <super>/<name>).
+    # The workspace ancestry first: for a direct separate-git-dir checkout this
+    # is the checkout itself, so the answer does not depend on how the metadata
+    # directory is named or where its siblings sit.
+    if near is not None:
+        try:
+            for ancestor in [near, *near.parents]:
+                if ancestor.is_dir():
+                    candidates.append(ancestor)
+        except OSError:
+            pass
+
+    # Siblings of the metadata dir (separate-git-dir), then its grandparent's
+    # children — a storage dir literally named ``.git`` puts the checkout one
+    # level further up (``<base>/checkout`` next to ``<base>/storage/.git``).
+    # Then the superproject's own working tree (submodule:
+    # ``<super>/.git/modules/<name>`` -> ``<super>/<name>``).
     if parent.is_dir():
         try:
             candidates.extend(sorted(p for p in parent.iterdir() if p.is_dir()))
+        except OSError:
+            pass
+    grandparent = parent.parent
+    if common_path.name == ".git" and grandparent.is_dir():
+        try:
+            candidates.extend(sorted(p for p in grandparent.iterdir() if p.is_dir()))
         except OSError:
             pass
     if parent.name == "modules":
@@ -509,15 +635,26 @@ def _checkout_owning_gitdir(common_path: Path) -> Path | None:
         pointed = Path(raw)
         if not pointed.is_absolute():
             pointed = (candidate / pointed)
+        if not _gitfile_points_at(pointed, target):
+            continue
+        # A gitfile that resolves to the common dir through a per-worktree
+        # admin dir (``<common>/worktrees/<name>``) belongs to a *linked*
+        # worktree, not to the primary checkout. Returning it would report the
+        # linked worktree as the main tree and defeat the unnesting this
+        # function exists for, so only a gitfile pointing straight at the
+        # common dir may answer.
         try:
-            if pointed.resolve() != target:
-                continue
+            direct = pointed.resolve() == target
         except OSError:
+            direct = False
+        if not direct:
             continue
         toplevel = _git_toplevel(candidate)
-        if toplevel is not None:
-            return toplevel
-        return candidate.resolve()
+        if toplevel is None:
+            continue
+        if toplevel != candidate.resolve():
+            continue
+        return toplevel
     return None
 
 
