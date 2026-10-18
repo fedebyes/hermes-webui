@@ -10,6 +10,7 @@ These tests build real repositories on disk — no mocks of git — and assert t
 resolved root is the actual checkout, not the metadata dir.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -375,13 +376,14 @@ def test_distant_primary_with_storage_notes_never_returns_storage(git_env, monke
 
     info = create_worktree_for_workspace(nested)
 
-    # The resolver cannot prove the distant primary, so the conservative
-    # current-checkout fallback applies: the Agent is handed the linked
-    # checkout, never the metadata's parent.
-    assert Path(seen["repo_root"]).resolve() == linked.resolve()
-    assert Path(info["repo_root"]).resolve() == linked.resolve()
+    # Either the real checkout is recovered (preferred) or the conservative
+    # current-checkout fallback applies. Never the metadata's parent.
+    repo_root = Path(seen["repo_root"]).resolve()
+    assert repo_root in (checkout.resolve(), linked.resolve())
+    assert repo_root != storage.resolve()
+    assert Path(info["repo_root"]).resolve() == repo_root
     allocated = Path(info["path"]).resolve()
-    assert allocated.parent == (linked / ".worktrees").resolve()
+    assert allocated.parent == (repo_root / ".worktrees").resolve()
     assert not allocated.is_relative_to(storage.resolve())
     assert created and created[0].resolve() == allocated
     assert sentinel.read_text(encoding="utf-8") == "keep me\n"
@@ -494,3 +496,123 @@ def test_storage_dir_with_only_an_unrelated_README_is_not_a_checkout(git_env, mo
     assert Path(seen["repo_root"]).resolve() != storage.resolve()
     assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
     assert (checkout / "sentinel.txt").exists()
+
+
+# --- Reviewer re-gate (a3c42e9b): depth cutoff and bounded traversal ----------
+#
+# Two objective blockers on the previous head:
+#   1. moving the owning checkout one level deeper still reached the depth
+#      filter and let ``storage-only`` win;
+#   2. ``rglob`` descended the whole subtree before filtering, so a deep
+#      unrelated sibling tree was walked to completion.
+
+
+def _deeper_primary_fixture(base, levels=("elsewhere", "deep", "more")):
+    """Checkout at ``base/<levels>/actual-checkout``, metadata in ``base/storage-only``."""
+    checkout = base.joinpath(*levels, "actual-checkout")
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "sentinel.txt").write_text("keep me\n", encoding="utf-8")
+    _git("add", "sentinel.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    linked = base / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+    nested = linked / "nested"
+    nested.mkdir()
+    return checkout, storage, linked, nested
+
+
+def test_deeper_primary_linked_input_never_returns_storage(git_env):
+    """Blocker 1: the owning checkout one level deeper must not crown storage.
+
+    The contract is the reviewer's: answer the real checkout, or the explicit
+    conservative ``None`` — never the metadata's parent.
+    """
+    base = git_env / "deeper"
+    checkout, storage, linked, nested = _deeper_primary_fixture(base)
+
+    find = _import()
+    for workspace in (checkout, linked, nested):
+        root = find(workspace)
+        assert root != storage.resolve(), (
+            f"storage must never be returned as a project root (input {workspace})"
+        )
+        assert root is None or root == checkout.resolve(), (
+            f"expected the checkout or the conservative None, got {root}"
+        )
+
+
+def test_deeper_primary_allocation_lands_on_the_checkout(git_env, monkeypatch):
+    """Blocker 1, allocation: the Agent never receives storage."""
+    base = git_env / "deeper-alloc"
+    checkout, storage, linked, nested = _deeper_primary_fixture(base)
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(nested)
+
+    repo_root = Path(seen["repo_root"]).resolve()
+    assert repo_root != storage.resolve()
+    assert repo_root in (checkout.resolve(), linked.resolve())
+    allocated = Path(info["path"]).resolve()
+    assert not allocated.is_relative_to(storage.resolve())
+    assert (checkout / "sentinel.txt").read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_search_does_not_walk_a_deep_unrelated_sibling_tree(git_env, monkeypatch):
+    """Blocker 2: traversal is bounded, not filtered after the fact.
+
+    A 15-level sibling tree with no ``.git`` must not be walked to completion.
+    Every real ``os.scandir`` call is delegated to and counted, with the paths
+    it is asked to open recorded.
+    """
+    base = git_env / "bounded"
+    checkout, storage, linked, nested = _deeper_primary_fixture(base)
+
+    # An unrelated sibling tree far deeper than any supported layout.
+    deep_sibling = base / "unrelated"
+    cursor = deep_sibling
+    for i in range(15):
+        cursor = cursor / f"level{i}"
+    cursor.mkdir(parents=True)
+
+    import api.worktrees as worktrees
+
+    real_scandir = os.scandir
+    visited: list[str] = []
+
+    def counting_scandir(path="."):
+        visited.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(worktrees.os, "scandir", counting_scandir)
+
+    root = worktrees.find_main_worktree_root(nested)
+    assert root != storage.resolve()
+    assert root is None or root == checkout.resolve()
+
+    # Descent into the unrelated tree stops at the depth cap: it must be
+    # entered shallowly at most, never walked to its bottom (15 levels).
+    entered_unrelated = [
+        path for path in visited if str(deep_sibling) in path
+    ]
+    assert len(entered_unrelated) <= _max_listing_depth() + 1, (
+        "the search descended the unrelated sibling tree too far: "
+        f"{entered_unrelated[:5]}"
+    )
+    assert not any("level5" in path or "level10" in path for path in entered_unrelated), (
+        f"the search walked deep into an unrelated tree: {entered_unrelated[:5]}"
+    )
+    # And the whole search stays a small, bounded number of directory listings.
+    assert len(visited) < 40, f"{len(visited)} directory listings is not bounded"
+
+
+def _max_listing_depth() -> int:
+    import api.worktrees as worktrees
+
+    return worktrees._CHECKOUT_LISTING_DEPTH
