@@ -2062,6 +2062,47 @@ def _current_turn_tool_activity(previous_context, result_messages) -> bool:
     return False
 
 
+def _result_carries_reasoning(previous_context, result_messages, result=None) -> bool:
+    """True when the current turn produced reasoning the stream did not emit.
+
+    A provider can hand reasoning back on the result (a top-level
+    ``reasoning_content``, or the same field on a row) without ever firing the
+    reasoning callback. That attempt did real work, so it must not be replayed
+    as if it were a silent turn.
+    """
+    if isinstance(result, dict):
+        top = result.get('reasoning_content')
+        if isinstance(top, str) and top.strip():
+            return True
+        if isinstance(top, (list, tuple)) and any(
+            isinstance(part, str) and part.strip() for part in top
+        ):
+            return True
+    messages = list(result_messages or [])
+    previous = list(previous_context or [])
+    if previous and _messages_have_prefix(messages, previous):
+        tail = messages[len(previous):]
+    else:
+        tail = messages
+    for row in tail:
+        if not isinstance(row, dict):
+            continue
+        for key in ('reasoning_content', 'reasoning', 'reasoning_text'):
+            value = row.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+            if isinstance(value, (list, tuple)) and any(
+                isinstance(part, str) and part.strip() for part in value
+            ):
+                return True
+        for segment in (row.get('reasoning_segments') or {}).values() if isinstance(
+            row.get('reasoning_segments'), dict,
+        ) else ():
+            if isinstance(segment, str) and segment.strip():
+                return True
+    return False
+
+
 def _turn_produced_reasoning(reasoning_segments, reasoning_buffer) -> bool:
     """Return True when the attempt emitted any non-blank reasoning text.
 
@@ -15104,6 +15145,10 @@ def _run_agent_streaming(
             _interim_reasoning_idx: list = []
             _unbound_reasoning_idx = [None]
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
+            # Visible interim output is work already shown to the user: a turn
+            # that produced it is not silent, even when no final answer arrived
+            # (review blocker on #8011).
+            _interim_assistant_seen = [False]
 
             # Throttle: emit metering events at most every 100 ms so the per-message
             # TPS label feels live during fast token streams without flooding SSE.
@@ -15311,6 +15356,7 @@ def _run_agent_streaming(
                 visible = str(text).strip()
                 if not visible:
                     return
+                _interim_assistant_seen[0] = True
                 # The interim message closes its step: bind the open segment to it
                 # so the next tool call cannot claim it (settlement matches by text).
                 # Agents without tool_start_callback keep positional settlement.
@@ -16925,9 +16971,21 @@ def _run_agent_streaming(
                                 _previous_context_messages, _all_result_messages,
                             )
                             or bool(_live_tool_calls)
+                            # Visible interim output is work already shown to
+                            # the user (review blocker on #8011).
+                            or _interim_assistant_seen[0]
                         ),
-                        reasoning_produced=_turn_produced_reasoning(
-                            _reasoning_segments, _reasoning_buffer,
+                        reasoning_produced=(
+                            _turn_produced_reasoning(
+                                _reasoning_segments, _reasoning_buffer,
+                            )
+                            # Reasoning that came back on the result rather than
+                            # through the streaming callback is still activity:
+                            # the attempt did work, it just did not answer.
+                            or _result_carries_reasoning(
+                                _previous_context_messages, _all_result_messages,
+                                result=result,
+                            )
                         ),
                         tool_limit_reached=bool(_tool_limit_reached),
                         compression_rotated=(
