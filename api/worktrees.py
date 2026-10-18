@@ -604,33 +604,48 @@ def _gitfile_points_at_common_outside(common_path: Path, root: Path) -> bool:
     except OSError:
         return False
 
-    for base in (common_path.parent, common_path.parent.parent):
+    # The owning checkout sits beside the metadata, one level below its parent
+    # (``<base>/checkout`` next to ``<base>/storage/.git``), or a few levels
+    # deeper in the operator's own layout (``<base>/elsewhere/deep/checkout``).
+    # Bound the walk: scanning ``parent.parent`` recursively could mean walking
+    # `$HOME` on every resolution, and a checkout nested arbitrarily deep under
+    # the metadata's grandparent is not a layout this resolver claims to find —
+    # that case deliberately falls back to the caller's current checkout.
+    candidates = []
+    for base, max_depth in ((common_path.parent, 1), (common_path.parent.parent, 3)):
         if not base.is_dir():
             continue
         try:
-            entries = list(base.rglob(".git"))
+            for path in base.rglob(".git"):
+                try:
+                    depth = len(path.relative_to(base).parts) - 1
+                except ValueError:
+                    continue
+                if depth > max_depth:
+                    continue
+                if path.is_file():
+                    candidates.append(path)
         except OSError:
             continue
-        for gitfile in entries:
-            if not gitfile.is_file():
+
+    for gitfile in candidates:
+        entry = gitfile.parent
+        try:
+            if entry.resolve() == root_resolved:
                 continue
-            entry = gitfile.parent
-            try:
-                if entry.resolve() == root_resolved:
-                    continue
-                text = gitfile.read_text(encoding="utf-8", errors="replace").strip()
-            except OSError:
-                continue
-            if not text.startswith("gitdir:"):
-                continue
-            pointed = Path(text.split(":", 1)[1].strip())
-            if not pointed.is_absolute():
-                pointed = entry / pointed
-            try:
-                if pointed.resolve() == target:
-                    return True
-            except OSError:
-                continue
+            text = gitfile.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not text.startswith("gitdir:"):
+            continue
+        pointed = Path(text.split(":", 1)[1].strip())
+        if not pointed.is_absolute():
+            pointed = entry / pointed
+        try:
+            if pointed.resolve() == target:
+                return True
+        except OSError:
+            continue
     return False
 
 
