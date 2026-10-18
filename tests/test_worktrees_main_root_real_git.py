@@ -331,3 +331,94 @@ def test_distant_primary_allocation_never_lands_in_storage(git_env, monkeypatch)
     root = Path(seen["repo_root"]).resolve()
     assert root != storage.resolve(), "the Agent must never be handed storage"
     assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
+
+
+def test_distant_primary_with_storage_notes_never_returns_storage(git_env, monkeypatch):
+    """Unrelated content beside the metadata is not checkout ownership.
+
+    Same distant-primary layout, plus ``storage-only/README.txt``: operator
+    notes next to the metadata must not turn the metadata's parent into a
+    checkout. The resolver may answer the real checkout or the conservative
+    ``None``, never storage; allocation then keeps the current checkout and the
+    committed sentinel in the real checkout survives untouched.
+    """
+    base = git_env / "distant-notes"
+    checkout = base / "elsewhere" / "deep" / "actual-checkout"
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    sentinel = checkout / "sentinel.txt"
+    sentinel.write_text("keep me\n", encoding="utf-8")
+    _git("add", "sentinel.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+
+    linked = base / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+    nested = linked / "nested"
+    nested.mkdir()
+    (storage / "README.txt").write_text("operator notes\n", encoding="utf-8")
+
+    find = _import()
+    assert find(checkout) == checkout.resolve()
+    for workspace in (linked, nested):
+        root = find(workspace)
+        assert root != storage.resolve(), (
+            f"storage must never be returned as a project root (input {workspace})"
+        )
+        assert root is None or root == checkout.resolve()
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(nested)
+
+    # The resolver cannot prove the distant primary, so the conservative
+    # current-checkout fallback applies: the Agent is handed the linked
+    # checkout, never the metadata's parent.
+    assert Path(seen["repo_root"]).resolve() == linked.resolve()
+    assert Path(info["repo_root"]).resolve() == linked.resolve()
+    allocated = Path(info["path"]).resolve()
+    assert allocated.parent == (linked / ".worktrees").resolve()
+    assert not allocated.is_relative_to(storage.resolve())
+    assert created and created[0].resolve() == allocated
+    assert sentinel.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_empty_primary_with_linked_checkout_resolves_and_allocates_there(
+    git_env, monkeypatch
+):
+    """Positive control: a valid primary whose only commit is empty.
+
+    An ordinary repository with just an empty commit legitimately holds nothing
+    but ``.git``; the ownership check must not mistake that for storage. A
+    linked checkout outside it must unnest to the primary and allocate there.
+    """
+    base = git_env / "empty-primary"
+    primary = base / "primary"
+    primary.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", cwd=primary)
+    _git("commit", "-q", "--allow-empty", "-m", "init", cwd=primary)
+
+    linked = base / "linked-empty"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
+
+    find = _import()
+    assert find(primary) == primary.resolve()
+    assert find(linked) == primary.resolve()
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(linked)
+
+    assert Path(seen["repo_root"]).resolve() == primary.resolve()
+    assert Path(info["repo_root"]).resolve() == primary.resolve()
+    allocated = Path(info["path"]).resolve()
+    assert allocated.parent == (primary / ".worktrees").resolve()
+    assert not allocated.is_relative_to(linked.resolve())
+    assert created and created[0].resolve() == allocated

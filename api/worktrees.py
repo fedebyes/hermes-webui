@@ -458,14 +458,16 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
             # trap looks structurally identical from here (``<storage>/.git`` is
             # the common dir, and git reports ``storage`` as a working tree
             # because of the basename), so a plain-repo answer additionally
-            # requires the candidate to hold working-tree content: a real
-            # checkout has files besides ``.git``, storage holds only ``.git``.
+            # requires that the repository's own index does not contradict the
+            # claim: a storage dir holds none of the tracked paths, while an
+            # ordinary checkout — including one whose only commit is empty —
+            # is not contradicted by it.
             if git_entry.is_dir() and entry_resolves_to_common:
                 toplevel = _git_toplevel(root)
                 if (
                     toplevel is not None
                     and toplevel == root.resolve()
-                    and _looks_like_working_tree(root)
+                    and _candidate_holds_working_tree(root)
                 ):
                     return toplevel
             # A gitfile here means this is a separate-git-dir *checkout* whose
@@ -543,35 +545,52 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     return None
 
 
-def _looks_like_working_tree(root: Path) -> bool:
-    """True when *root* holds working content, not just its ``.git`` metadata.
+def _candidate_holds_working_tree(root: Path) -> bool:
+    """True unless *root* is contradicted as the repository's working tree.
 
-    A checkout has at least one entry besides ``.git`` (a tracked file, a
-    subdirectory, even an untracked artefact). A ``--separate-git-dir`` storage
-    directory holds the metadata as its only child, and git still reports it as
-    a working tree because of the ``.git`` basename — which is exactly the shape
-    that must never be returned as a project root.
+    ``git rev-parse --show-toplevel`` infers a working tree from a directory
+    literally named ``.git``, so the parent of a
+    ``--separate-git-dir=<storage>/.git`` metadata dir reports itself as a
+    checkout. Content beside the metadata does not prove ownership: operator
+    notes sit there too, and an ordinary repository whose only commit is empty
+    legitimately holds nothing but ``.git``. The index settles the one thing
+    that matters, and only in the rejecting direction: when the repository
+    tracks paths and *none* of them exists here, the files live in the checkout
+    that owns them, and this directory is the metadata's parent — git's
+    basename inference, not a checkout. A directory holding at least one
+    tracked path, a repository that tracks nothing, or an unreadable index is
+    not contradicted and keeps the caller's shape-based answer.
     """
     try:
-        for entry in root.iterdir():
-            if entry.name != ".git":
-                return True
-    except OSError:
-        return False
-    return False
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if result.returncode != 0:
+        return True
+    tracked = [p for p in result.stdout.split("\0") if p]
+    if not tracked:
+        return True
+    return any((root / p).exists() for p in tracked)
 
 
 def _linked_primary_candidate(workspace: Path) -> Path | None:
-    """Best-effort primary-checkout path for a linked worktree, or None.
+    """Best-effort search start for a linked worktree, or None.
 
-    Reads the linked worktree's own ``gitdir`` file: it points at
-    ``<common>/worktrees/<name>``, whose sibling ``gitdir`` file records the
-    primary checkout's ``.git`` path. That gives the primary checkout directly,
-    even when it is nowhere near the metadata directory.
-
-    This is a *search start*, never an answer: git also treats a storage dir
-    literally named ``.git`` as a working tree, so the caller still has to prove
-    ownership by finding a gitfile that points at the common dir.
+    Reads ``<common>/worktrees/<name>/gitdir``, which records the path of that
+    linked checkout's own ``.git`` gitfile (``<checkout>/.git``) — it does *not*
+    generally name the primary checkout, and a sibling entry can name a
+    different linked worktree. So the result is only a directory to start the
+    ownership search from, never an answer: git also treats a storage dir
+    literally named ``.git`` as a working tree, and the caller still has to
+    prove ownership by finding a gitfile that points straight at the common
+    dir.
     """
     try:
         result = subprocess.run(
