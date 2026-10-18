@@ -2126,16 +2126,26 @@ def _current_turn_produced_a_row(previous_context, result_messages) -> bool:
     reproduces the identical result — which is also why the retry's own
     acceptance check ("the retry must add an answer the seed did not hold")
     would reject it. Skip the retry rather than spend a provider call on it.
+
+    With no pre-turn context there is nothing to echo, so an empty (or
+    non-empty) result is the turn's own output: a genuinely empty fresh turn is
+    a cut and stays retryable. Equality is exact — a lossy prefix compare made
+    two unrelated transcripts look identical.
     """
     messages = list(result_messages or [])
     previous = list(previous_context or [])
     if not previous:
-        return bool(messages)
+        # Nothing to echo: whatever came back is this turn's own output.
+        return True
     if len(messages) < len(previous):
         return True
-    if _messages_have_prefix(messages, previous):
-        return len(messages) > len(previous)
-    return True
+    # An echo is the pre-turn context handed back *whole*: same length and the
+    # same rows. A result that extends the context carries a row of its own,
+    # even when that row is only the current turn's user message — the echo
+    # veto is about replay, not about "no answer yet".
+    if len(messages) != len(previous):
+        return True
+    return not _messages_have_exact_prefix(messages, previous)
 
 
 def _silent_retry_added_a_new_answer(result, previous_context, identity=None, msg_text=None) -> bool:
@@ -10288,6 +10298,43 @@ def _messages_have_prefix(messages, prefix, *, key_fn=None):
         return False
     for idx, expected in enumerate(prefix or []):
         if key_fn((messages or [])[idx]) != key_fn(expected):
+            return False
+    return True
+
+
+def _messages_have_exact_prefix(messages, prefix):
+    """True when *messages* starts with the same rows as *prefix*.
+
+    Compared by role + full (untruncated) text + tool identity, not by
+    ``_message_identity``: that key truncates text at 500 chars and drops the
+    per-row bookkeeping, so two different transcripts could compare equal on a
+    provenance decision. Volatile bookkeeping (timestamps, turn tokens) is
+    deliberately ignored — the worker rewrites it on the row it materializes, so
+    including it would make every real replay look different.
+    """
+    messages = list(messages or [])
+    prefix = list(prefix or [])
+    if len(messages) < len(prefix):
+        return False
+    for got, expected in zip(messages, prefix):
+        if not isinstance(got, dict) or not isinstance(expected, dict):
+            if got != expected:
+                return False
+            continue
+        if got.get('role') != expected.get('role'):
+            return False
+        got_text = str(got.get('content') or '')
+        expected_text = str(expected.get('content') or '')
+        if got_text != expected_text:
+            return False
+        if str(got.get('tool_call_id') or '') != str(expected.get('tool_call_id') or ''):
+            return False
+        try:
+            got_calls = json.dumps(got.get('tool_calls') or [], sort_keys=True)
+            expected_calls = json.dumps(expected.get('tool_calls') or [], sort_keys=True)
+        except (TypeError, ValueError):
+            got_calls, expected_calls = got.get('tool_calls'), expected.get('tool_calls')
+        if got_calls != expected_calls:
             return False
     return True
 
