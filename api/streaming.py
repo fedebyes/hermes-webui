@@ -2088,36 +2088,46 @@ def _current_turn_produced_a_row(previous_context, result_messages) -> bool:
     return True
 
 
-def _silent_retry_added_a_new_answer(result, previous_context) -> bool:
-    """Return True when a silent retry produced an answer the seed did not hold.
+def _silent_retry_added_a_new_answer(result, previous_context, identity=None, msg_text=None) -> bool:
+    """Return True when a silent retry produced the current turn's own answer.
 
     A provider cut often replays the transcript: the retry hands back a copy of
-    a previous turn's assistant message. ``_self_heal_result_succeeded`` accepts
-    any trailing assistant text, so without this check the turn would settle on
-    the old answer and the user would read it as the reply to the message they
-    just sent. Only an assistant row whose text is not already present in the
-    pre-retry context counts as a recovery.
+    a previous turn's assistant message, and settling on it would answer the
+    user's new message with an old reply.
+
+    Ownership — not text novelty — decides. An answer may legitimately repeat an
+    earlier one verbatim ("Yes.", a short acknowledgement), so comparing text
+    against everything already in history discarded real recoveries. The
+    current turn's boundary comes from ``_active_turn_boundary`` (checkpoint /
+    active-turn token authority), and only assistant rows *after* it are the
+    retry's own answer. A tail with no current-turn boundary is a bare replay
+    of historical rows and is rejected.
     """
     if not isinstance(result, dict):
         return False
     messages = list(result.get('messages') or [])
     previous = list(previous_context or [])
-    if previous and _messages_have_prefix(messages, previous):
-        tail = messages[len(previous):]
-    else:
-        tail = messages
-    seen = set()
-    for row in previous:
-        if not isinstance(row, dict) or row.get('role') != 'assistant':
-            continue
-        text = _normalize_user_text(_message_text(row.get('content')))
-        if text:
-            seen.add(text)
+    if not messages:
+        return False
+
+    start = _active_turn_boundary(messages, previous, identity, msg_text)
+    # ``start`` indexes the current turn's own user row; the answer follows it.
+    # When the boundary is not proven the helper still returns the last
+    # prompt-matching user row, else 0 — in which case every row counts as
+    # current, which is what the "fresh session" shape needs.
+    tail = messages[start:]
+    if not tail:
+        return False
+    # The tail must carry the current turn itself, otherwise nothing was
+    # produced for this turn (a pure replay of the pre-turn context).
+    if start > 0 and len(tail) <= 1:
+        return False
     for row in tail:
         if not isinstance(row, dict) or row.get('role') != 'assistant':
             continue
-        text = _normalize_user_text(_message_text(row.get('content')))
-        if text and text not in seen:
+        if row.get('tool_calls'):
+            continue
+        if _normalize_user_text(_message_text(row.get('content'))):
             return True
     return False
 
@@ -12191,7 +12201,15 @@ def _self_heal_result_succeeded(
         (
             index
             for index, row in enumerate(current_turn_rows)
-            if isinstance(row, dict) and row.get('role') == 'user'
+            if isinstance(row, dict)
+            and row.get('role') == 'user'
+            # The current turn's own user row can reappear in the tail (a retry
+            # that re-appends the turn it is answering). Only a *different*
+            # following user message starts a new turn; treating the current
+            # turn's own row as one truncated the answer away and made every
+            # equal-text recovery look like a failure.
+            and _normalize_user_text(_message_text(row.get('content')))
+            != _normalize_user_text(msg_text)
         ),
         None,
     )
@@ -16886,11 +16904,15 @@ def _run_agent_streaming(
                                     msg_text,
                                 )
                                 if _heal_ok and _is_silent_no_response:
-                                    # A replayed transcript is not a recovery:
-                                    # the retry must hand back an answer the
-                                    # pre-retry context did not already hold.
+                                    # A replayed transcript is not a recovery.
+                                    # Ownership comes from the current turn's
+                                    # checkpoint, not from text novelty: a new
+                                    # answer may legitimately repeat an earlier
+                                    # one verbatim.
                                     _heal_ok = _silent_retry_added_a_new_answer(
                                         _heal_result, _heal_context_messages,
+                                        identity=_active_turn_identity,
+                                        msg_text=msg_text,
                                     )
                             except Exception as _retry_exc:
                                 logger.warning(
