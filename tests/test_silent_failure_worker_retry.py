@@ -544,3 +544,34 @@ def test_an_interim_assistant_message_blocks_the_silent_retry(
     assert calls == 1, (
         "a turn that emitted an interim assistant message must not be replayed"
     )
+
+
+# ── Follow-up: a genuinely empty fresh turn is retryable ─────────────────────
+
+
+def test_a_fresh_silent_turn_with_no_rows_is_retried(worker_scene):
+    """An empty result in a fresh session is a cut, not an echoed context."""
+    scene = worker_scene
+    scene.session.messages = []
+    scene.session.context_messages = []
+    scene.result = {"messages": []}
+
+    scene.run()
+
+    assert _runs(scene) == 2, (
+        "an empty fresh turn produced nothing to echo: it earns its retry"
+    )
+
+
+def test_a_fresh_silent_turn_with_no_messages_key_is_retried(worker_scene):
+    """A result carrying neither messages nor an answer is still retryable."""
+    scene = worker_scene
+    scene.session.messages = []
+    scene.session.context_messages = []
+    scene.result = {}
+
+    scene.run()
+
+    assert _runs(scene) == 2, (
+        "an empty result dict must not be read as an echoed transcript"
+    )

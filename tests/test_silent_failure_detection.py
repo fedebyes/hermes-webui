@@ -337,9 +337,16 @@ class TestCurrentTurnProducedARow:
     def test_an_empty_previous_context_reports_a_row_when_anything_came_back(self):
         assert _current_turn_produced_a_row([], [_msg("user", "q")]) is True
 
-    def test_nothing_at_all_reports_no_row(self):
-        assert _current_turn_produced_a_row([], []) is False
-        assert _current_turn_produced_a_row(None, None) is False
+    def test_nothing_at_all_is_not_an_echo(self):
+        """An empty fresh turn produced nothing to echo, so it stays retryable.
+
+        The echo veto exists to avoid re-sending a transcript the provider
+        simply handed back. With no pre-turn context there is nothing to hand
+        back, so an empty result is a cut — the reviewer asked for exactly this
+        case on #8011 (a fresh session returning ``{}`` or no rows).
+        """
+        assert _current_turn_produced_a_row([], []) is True
+        assert _current_turn_produced_a_row(None, None) is True
 
     def test_a_shrunk_transcript_is_not_an_echo(self):
         """A compacted result is not the input handed back."""
