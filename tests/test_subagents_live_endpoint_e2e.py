@@ -135,13 +135,12 @@ def test_live_endpoint_ignores_a_stale_crashed_row(test_server, tmp_path, monkey
     assert routes._live_subagent_counts(now, db) == {}
 
 
-def test_live_endpoint_retires_a_wedged_row_before_two_hours(test_server, tmp_path, monkeypatch):
+def test_live_endpoint_retires_a_wedged_row_inside_the_grace_window(test_server, tmp_path, monkeypatch):
     """A child the runner never closed must stop counting within the window.
 
-    Measured regression: a subagent row with `ended_at IS NULL` whose last message
-    was 145 minutes old was reported as "1 live" while nothing was running, because
-    the grace window was 2 hours. The window must sit above the real long-run tail
-    (~15 min, 44 of ~790 runs) and below a genuinely dead row.
+    Measured regression: a subagent row with `ended_at IS NULL` whose last
+    message was 73 minutes old was reported as "1 live" while nothing was
+    running, because the grace window was 2 hours.
     """
     import api.routes as routes
 
@@ -168,7 +167,12 @@ def test_live_endpoint_retires_a_wedged_row_before_two_hours(test_server, tmp_pa
         """
     )
     now = time.time()
-    started = now - 145 * 60
+    # 73 minutes: the age of the row actually measured in production (a child
+    # whose runner died without stamping `ended_at`). It sits INSIDE the old 2h
+    # window and OUTSIDE the current one, which is what makes this test a
+    # regression guard rather than a tautology — at 145 minutes every window
+    # under test would have retired the row anyway.
+    started = now - 73 * 60
     con.execute(
         "INSERT INTO sessions (id, source, parent_session_id, started_at, ended_at) VALUES (?,?,?,?,?)",
         ("child-wedged", "subagent", "parent-z", started, None),
@@ -192,9 +196,18 @@ def test_live_endpoint_retires_a_wedged_row_before_two_hours(test_server, tmp_pa
 
 
 def test_grace_window_covers_the_real_long_run_tail():
-    """The window must stay above the measured long-run tail (~15 min)."""
+    """The window must be bounded on BOTH sides.
+
+    Too low and a legitimately quiet child (one long tool call) loses its badge;
+    too high and a row the runner never closed keeps counting as live. The
+    73-minute production row is the case the upper bound exists for.
+    """
     import api.routes as routes
 
     assert routes._LIVE_SUBAGENTS_GRACE_SECONDS >= 20 * 60, (
         "a window below the long-run tail hides a badge for a live child"
+    )
+    assert routes._LIVE_SUBAGENTS_GRACE_SECONDS <= 45 * 60, (
+        "a window this wide keeps a wedged row (never closed by the runner) "
+        "counting as live for far too long"
     )

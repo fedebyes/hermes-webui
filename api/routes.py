@@ -14918,14 +14918,17 @@ _LIVE_SUBAGENTS_CACHE_TTL_SECONDS = 3.0
 # A subagent child still counts as live while it is silent for less than this.
 # `ended_at IS NULL` is the authoritative signal; this window only bounds rows a
 # crashed run left open (a run that dies without `agent_close` keeps NULL
-# forever). It is a false-negative source for a genuinely live child stuck in a
-# long tool call, so it cannot be tight — 44 of ~790 real runs exceed 15 minutes
-# end to end. 30 minutes sits above that tail while still retiring a child the
-# runner never closed: measured on a wedged row (NULL `ended_at`, last message
-# 145 minutes earlier) the old 2h window reported "1 live" with nothing running,
-# which is exactly the false positive this bound exists to prevent. Degradation
-# is acceptable here (a badge missing during an unusually quiet stretch) but a
-# stuck badge is not.
+# forever). Two failure modes pull in opposite directions:
+#   - too tight  → a child in one long tool call loses its badge while it works.
+#     The measured tail is ~15 minutes end to end (44 of ~790 runs), so the
+#     window must stay comfortably above it.
+#   - too wide   → a wedged row keeps counting as live. Measured: a child whose
+#     last message was 73 minutes old (runner died, `ended_at` never stamped)
+#     still reported "1 live" under the previous 2h window.
+# 30 minutes sits between the two. Note that the duration tail bounds TOTAL run
+# length, while the predicate measures message silence — they are different
+# quantities, and a child genuinely quieter than the window is the accepted
+# degradation (a badge missing during a quiet stretch, never a stuck one).
 _LIVE_SUBAGENTS_GRACE_SECONDS = 1800.0
 # Keyed by state.db path: the path is per-request (active profile), so a single
 # slot would serve profile A's counts to a profile B request inside the TTL.
