@@ -14919,10 +14919,14 @@ _LIVE_SUBAGENTS_CACHE_TTL_SECONDS = 3.0
 # `ended_at IS NULL` is the authoritative signal; this window only bounds rows a
 # crashed run left open (a run that dies without `agent_close` keeps NULL
 # forever). It is a false-negative source for a genuinely live child stuck in a
-# long tool call, so it is kept generous rather than tight — 44 of ~790 real
-# runs exceed 15 minutes end to end. Degradation is acceptable here (a badge
-# missing for a while) but a stuck badge is not.
-_LIVE_SUBAGENTS_GRACE_SECONDS = 7200.0
+# long tool call, so it cannot be tight — 44 of ~790 real runs exceed 15 minutes
+# end to end. 30 minutes sits above that tail while still retiring a child the
+# runner never closed: measured on a wedged row (NULL `ended_at`, last message
+# 145 minutes earlier) the old 2h window reported "1 live" with nothing running,
+# which is exactly the false positive this bound exists to prevent. Degradation
+# is acceptable here (a badge missing during an unusually quiet stretch) but a
+# stuck badge is not.
+_LIVE_SUBAGENTS_GRACE_SECONDS = 1800.0
 # Keyed by state.db path: the path is per-request (active profile), so a single
 # slot would serve profile A's counts to a profile B request inside the TTL.
 _live_subagents_cache: dict = {}
