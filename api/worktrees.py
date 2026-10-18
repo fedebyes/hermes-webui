@@ -657,7 +657,7 @@ def _checkout_claiming_common(common_path: Path, common_resolved: Path) -> Path 
     says the candidate is its working tree. Without a claim the ownership is
     unknown and the answer is ``None``: a search that finds nothing must not
     promote metadata shape, a Git-inferred toplevel, an empty index or a
-    colliding filename into positive evidence (see ``_plain_checkout_shapes``).
+    colliding filename into positive evidence (see ``_topology_candidate``).
     """
     parent = common_path.parent
     seen: set[str] = set()
@@ -758,30 +758,37 @@ def _topology_candidate(common_path: Path, common_resolved: Path) -> Path | None
     if common_resolved.name == ".git" and _plain_git_dir_owner(parent, common_resolved):
         if _tracks_paths_in_parent(common_resolved, parent):
             return parent
-        # Nothing tracked to compare with paths. A ``git init`` with no commits
-        # and a ``--separate-git-dir`` storage dir are byte-identical here: every
-        # git query answers the same, so no rule can separate them. Resolving the
-        # parent is still the right call — it is the answer for the overwhelmingly
-        # common case (a repository that simply tracks nothing yet), and the
-        # storage variant cannot be told apart from it by any recorded fact. The
-        # protection against writing into git's bookkeeping is one layer up: the
-        # caller allocates into ``<root>/.worktrees/``, which a storage dir's own
-        # parent — being untracked, i.e. not a checkout — never receives from us.
-        if not _tracked_tops(common_resolved):
+        # No tracked set at all: a fresh ``init`` or an empty commit, whose
+        # checkout legitimately holds nothing but ``.git``. Resolving the parent
+        # keeps that ordinary positive working (a repository that simply tracks
+        # nothing yet), and it is the pre-existing behaviour for this layout.
+        # A *failed* index query is unknown rather than empty and claims nothing.
+        tops = _tracked_tops(common_resolved)
+        if tops is not None and not tops:
             return parent
         return None
     return None
 
 
 def _tracks_paths_in_parent(common_resolved: Path, parent: Path) -> bool:
-    """True when the parent's tree *is* the repository's committed tree.
+    """True when the parent's tree is the repository's work tree, not a copy.
 
-    Requires every tracked top-level entry under the parent **and** those paths
-    to match what is committed. The second half is what a storage dir cannot
-    fake: an operator note that merely reuses a tracked name differs from the
-    committed content, so ``git status`` reports it modified. A plain checkout's
-    tree matches its own INDEX exactly, which is the whole point of being its
-    work tree. Empty or unreadable index answers *False*.
+    Every tracked top-level entry must exist under the parent, and those entries
+    must not *all* differ from the index. That single test covers both layouts:
+
+    * a **dirty checkout** differs on the paths the operator edited — some, not
+      all. It remains that repository's work tree, so it owns the metadata.
+    * a **``--separate-git-dir`` storage dir** carrying operator notes whose
+      names collide with tracked entries differs on *every* tracked entry: the
+      notes are not the committed content. No real work tree can differ on all
+      of them, since a tree matching nothing in its own index is not a checkout.
+
+    Cleanliness is therefore not required — a modified, staged or
+    untracked-under-a-committed-name primary still qualifies, which is what an
+    earlier ``status --porcelain`` gate got wrong.
+
+    ``False`` for an empty index, an unreadable index or a failed query: an
+    *unknown* answer is never ownership.
     """
     tops = _tracked_tops(common_resolved)
     if not tops:
@@ -792,14 +799,24 @@ def _tracks_paths_in_parent(common_resolved: Path, parent: Path) -> bool:
                 return False
         except OSError:
             return False
-    # Names present is not enough: they must be the committed content.
     result = _run_git(
-        ["--git-dir", str(common_resolved), "status", "--porcelain", "--", *sorted(tops)],
+        [
+            f"--git-dir={common_resolved}",
+            f"--work-tree={parent}",
+            "diff-files",
+            "--name-only",
+            "--",
+            *sorted(tops),
+        ],
         cwd=parent,
     )
     if result.returncode != 0:
         return False
-    return not result.stdout.strip()
+    differing = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    if not differing:
+        return True
+    # Differ on every tracked entry -> the parent is an imitation of the tree.
+    return len(differing) < len(tops)
 
 
 def _plain_git_dir_owner(parent: Path, common_resolved: Path) -> bool:
@@ -818,8 +835,14 @@ def _plain_git_dir_owner(parent: Path, common_resolved: Path) -> bool:
         return False
 
 
-def _tracked_tops(common_resolved: Path) -> set[str]:
-    """The first path component of every tracked entry; empty when unknown."""
+def _tracked_tops(common_resolved: Path) -> set[str] | None:
+    """The first path component of every tracked entry; ``None`` when unknown.
+
+    ``None`` and ``set()`` are deliberately distinct: a *successful* empty index
+    says "this repository tracks nothing", while a failed, timed-out or
+    unreadable query says nothing at all. Neither is ownership, but only the
+    failure is a reason to distrust an otherwise-empty answer.
+    """
     try:
         result = subprocess.run(
             ["git", "--git-dir", str(common_resolved), "ls-files", "-z"],
@@ -830,9 +853,9 @@ def _tracked_tops(common_resolved: Path) -> set[str]:
             creationflags=windows_hide_flags(),
         )
     except (OSError, subprocess.TimeoutExpired):
-        return set()
+        return None
     if result.returncode != 0:
-        return set()
+        return None
     return {p.split("/", 1)[0] for p in result.stdout.split("\0") if p}
 
 
