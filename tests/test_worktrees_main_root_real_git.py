@@ -422,3 +422,75 @@ def test_empty_primary_with_linked_checkout_resolves_and_allocates_there(
     assert allocated.parent == (primary / ".worktrees").resolve()
     assert not allocated.is_relative_to(linked.resolve())
     assert created and created[0].resolve() == allocated
+
+
+def test_storage_dir_holding_a_tracked_basename_is_still_not_a_checkout(git_env):
+    """Reviewer's README case, tightened: the stray file *collides* with a path.
+
+    The storage dir holds an operator note whose basename matches a tracked
+    path in the repository. Content is not ownership evidence in either
+    direction, so the resolver must still refuse the metadata's parent and let
+    the caller keep the checkout it already has.
+    """
+    base = git_env / "collide"
+    checkout = base / "elsewhere" / "deep" / "actual-checkout"
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "README.md").write_text("real\n", encoding="utf-8")
+    _git("add", "README.md", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+
+    linked = base / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+
+    # The operator note reuses the tracked basename.
+    (storage / "README.md").write_text("operator notes\n", encoding="utf-8")
+
+    find = _import()
+    assert find(checkout) == checkout.resolve()
+    for workspace in (linked, linked / "nested"):
+        if not workspace.exists():
+            workspace.mkdir()
+        root = find(workspace)
+        assert root != storage.resolve(), "storage must never be answered"
+        assert root is None or root == checkout.resolve()
+
+
+def test_storage_dir_with_only_an_unrelated_README_is_not_a_checkout(git_env, monkeypatch):
+    """The reviewer's literal fixture: unrelated content beside the metadata.
+
+    Asserts the whole allocation path, not only the resolver: the Agent must
+    never be handed storage and the tree must never land under it.
+    """
+    base = git_env / "readme-beside"
+    checkout = base / "elsewhere" / "deep" / "actual-checkout"
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "sentinel.txt").write_text("keep me\n", encoding="utf-8")
+    _git("add", "sentinel.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+
+    linked = base / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+
+    (storage / "README.txt").write_text("operator notes\n", encoding="utf-8")
+
+    find = _import()
+    root = find(linked)
+    assert root != storage.resolve()
+    assert root is None or root == checkout.resolve()
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(linked)
+
+    assert Path(seen["repo_root"]).resolve() != storage.resolve()
+    assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
+    assert (checkout / "sentinel.txt").exists()

@@ -433,6 +433,28 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     if owning is not None:
         return owning
 
+    # 1b. A plain repository: the workspace's own ``.git`` IS the common dir and
+    #     git reports the workspace as its toplevel. That is an ordinary
+    #     checkout — including one whose only commit is empty, which legitimately
+    #     holds nothing but ``.git`` — and answering the workspace keeps it on
+    #     its own root. The storage trap cannot reach this branch: there the
+    #     workspace is a linked worktree (handled above) or a subtree of the
+    #     real checkout, whose ``.git`` gitfile the branch above already read.
+    #     A path whose ``.git`` is a plain directory has no checkout of its own
+    #     to report, so it can be answered here from its own shape.
+    if not _is_linked_worktree(ws, common_path):
+        ws_git = ws / ".git"
+        try:
+            ws_owns_common = ws_git.is_dir() and (
+                ws_git.resolve() == common_path.resolve()
+            )
+        except OSError:
+            ws_owns_common = False
+        if ws_owns_common:
+            toplevel = _git_toplevel(ws)
+            if toplevel is not None and toplevel == ws:
+                return toplevel
+
     # 2. A common dir shaped ``<main>/.git`` names its checkout directly — but
     #    only when the parent really is that checkout. Two traps to exclude:
     #    a separate-git-dir storage dir named ``.git`` (its parent holds
@@ -454,20 +476,32 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
                 )
             except OSError:
                 entry_resolves_to_common = False
-            # A plain repository: ``<root>/.git`` IS the common dir. The storage
-            # trap looks structurally identical from here (``<storage>/.git`` is
-            # the common dir, and git reports ``storage`` as a working tree
-            # because of the basename), so a plain-repo answer additionally
-            # requires that the repository's own index does not contradict the
-            # claim: a storage dir holds none of the tracked paths, while an
-            # ordinary checkout — including one whose only commit is empty —
-            # is not contradicted by it.
+            # A common dir shaped ``<root>/.git`` is *not* evidence that *root*
+            # is a checkout. Two layouts produce it and are indistinguishable
+            # from inside ``root``:
+            #
+            #   plain repo         ``<root>/.git`` is the metadata AND ``root``
+            #                      is the working tree
+            #   separate-git-dir   the metadata lives in ``<root>/.git`` while
+            #                      the working tree is somewhere else
+            #
+            # git reports both as working trees, ``git worktree list`` reports
+            # both, and the index does not separate them (run inside the
+            # storage dir, ``git ls-files`` answers with the repository's
+            # tracked paths and ``git status`` calls a stray file "modified").
+            # So no file, name or content inside ``root`` may answer here: the
+            # branch answers only from a **gitfile** pointing straight at this
+            # common dir — the workspace's own ancestry is already checked in
+            # step 1, so what remains is another checkout on the same
+            # filesystem. When there is none, the layout is ambiguous and the
+            # conservative fallback decides (the caller keeps the checkout it
+            # already has) rather than risking the metadata directory.
             if git_entry.is_dir() and entry_resolves_to_common:
                 toplevel = _git_toplevel(root)
                 if (
                     toplevel is not None
                     and toplevel == root.resolve()
-                    and _candidate_holds_working_tree(root)
+                    and not _gitfile_points_at_common_outside(common_path, root)
                 ):
                     return toplevel
             # A gitfile here means this is a separate-git-dir *checkout* whose
@@ -543,6 +577,61 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
                     except OSError:
                         pass
     return None
+
+
+def _gitfile_points_at_common_outside(common_path: Path, root: Path) -> bool:
+    """True when a checkout *other than* ``root`` claims this common dir.
+
+    This is the only signal that separates a ``--separate-git-dir`` storage dir
+    from a plain repository — the two are otherwise identical from ``root``
+    (both hold a ``.git`` that resolves to the common dir, git reports both as
+    working trees, and the index answers identically in both).
+
+    The difference is a *second* claim on the same metadata: the real
+    checkout's ``<checkout>/.git`` gitfile, pointing straight at this common
+    dir, from a path that is not ``root``. When such a gitfile exists, ``root``
+    is the metadata's parent (storage) and the checkout lives elsewhere — so
+    ``root`` must not be answered. When none exists, nothing contradicts
+    ``root`` as the checkout, and the caller's shape-based answer stands.
+
+    Only a gitfile pointing **straight** at the common dir counts: one pointing
+    at ``<common>/worktrees/<name>`` is a linked worktree's own admin dir and
+    says nothing about who owns the primary.
+    """
+    try:
+        target = common_path.resolve()
+        root_resolved = root.resolve()
+    except OSError:
+        return False
+
+    for base in (common_path.parent, common_path.parent.parent):
+        if not base.is_dir():
+            continue
+        try:
+            entries = list(base.rglob(".git"))
+        except OSError:
+            continue
+        for gitfile in entries:
+            if not gitfile.is_file():
+                continue
+            entry = gitfile.parent
+            try:
+                if entry.resolve() == root_resolved:
+                    continue
+                text = gitfile.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if not text.startswith("gitdir:"):
+                continue
+            pointed = Path(text.split(":", 1)[1].strip())
+            if not pointed.is_absolute():
+                pointed = entry / pointed
+            try:
+                if pointed.resolve() == target:
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 def _candidate_holds_working_tree(root: Path) -> bool:
