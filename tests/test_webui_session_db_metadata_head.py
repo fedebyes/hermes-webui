@@ -17,6 +17,7 @@ These tests pin the three properties that make that safe:
 Timing is deliberately not asserted: it depends on the host's page cache.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -109,15 +110,16 @@ def test_missing_message_count_falls_back_to_full_parse(session_store):
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # The head read alone cannot answer: the count is derived from `messages`.
-    head = DB._read_metadata_head(path)
-    assert isinstance(head, dict)
-    assert "message_count" not in head
+    # A legacy sidecar carries none of the current writer's layout keys, so the
+    # cut is refused and the row comes from the full read.
+    assert DB._read_metadata_head(path) is None
 
     source = DB._read_metadata_row_source(path)
     assert isinstance(source, dict)
     row = DB._metadata_row("legacy", source)
     assert row["message_count"] == 2
     assert DB(session_store).list_sessions()[0]["message_count"] == 2
+    assert source["title"] == "Legacy"
 
 
 def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypatch):
@@ -129,6 +131,8 @@ def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypat
         "updated_at": 200.0,
         "compression_anchor_summary": "S" * (DB._METADATA_HEAD_BYTES + 16 * 1024),
         "message_count": 3,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "anchor_scene_index": {},
         "messages": [{"role": "user", "content": "hi"}] * 3,
     }
     path = session_store / "fat.json"
@@ -147,13 +151,25 @@ def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypat
     assert source["message_count"] == 3
 
 
-def test_compact_sidecar_is_read_from_the_head(session_store):
+def test_compact_sidecar_of_the_writer_contract_is_read_from_the_head(session_store):
+    """Key layout, not whitespace, decides: a marked compact head still cuts."""
+    session = models.Session(
+        session_id="compact",
+        title="Compact",
+        workspace=str(session_store.parent),
+        model="test-model",
+        messages=[{"role": "user", "content": "a" * 400}, {"role": "assistant", "content": "b"}],
+    )
     payload = {
         "session_id": "compact",
         "title": "Compact",
         "created_at": 100.0,
         "message_count": 2,
-        "messages": [{"role": "user", "content": "a" * 400}, {"role": "assistant", "content": "b"}],
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "anchor_scene_index": {},
+        "messages": session.messages,
+        "archived": False,
+        "profile": "default",
     }
     path = session_store / "compact.json"
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -163,6 +179,96 @@ def test_compact_sidecar_is_read_from_the_head(session_store):
     assert "messages" not in source
     assert source["title"] == "Compact"
     assert DB._metadata_row("compact", source)["message_count"] == 2
+
+
+def test_messages_before_metadata_takes_the_full_read(session_store):
+    """A payload ordered messages-first must not lose title/profile/archived.
+
+    ``write_session()`` preserves the caller's dictionary order, so a valid
+    payload can serialize ``messages`` before the rest of the metadata. Cutting
+    at that key would return a row missing every later field. The layout check
+    refuses the cut even when the count marker is present.
+    """
+    payload = {
+        "session_id": "reordered",
+        "message_count": 1,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "messages": [{"role": "user", "content": "hi"}],
+        "title": "Reordered Title",
+        "profile": "work",
+        "archived": True,
+        "created_at": 100.0,
+        "updated_at": 200.0,
+    }
+    path = session_store / "reordered.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    assert DB._read_metadata_head(path) is None
+
+    source = DB._read_metadata_row_source(path)
+    full = DB._read_path(path)
+    assert isinstance(source, dict) and isinstance(full, dict)
+    sid = str(full["session_id"])
+    assert DB._metadata_row(sid, source) == DB._metadata_row(sid, full)
+
+    row = DB(session_store).list_sessions()[0]
+    assert row["title"] == "Reordered Title"
+    assert row["profile"] == "work"
+    assert row["archived"] is True
+    assert row["message_count"] == 1
+
+
+def test_write_session_round_trip_keeps_metadata_after_messages(session_store):
+    """The round trip through the adapter's own writer keeps every row field."""
+    db = DB(session_store)
+    payload = {
+        "session_id": "rt",
+        "message_count": 2,
+        "messages": [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
+        "title": "Round Trip",
+        "profile": "work",
+        "archived": True,
+        "pinned": True,
+    }
+    db.write_session(payload)
+    path = session_store / "rt.json"
+
+    source = db._read_metadata_row_source(path)
+    full = db._read_path(path)
+    assert isinstance(source, dict) and isinstance(full, dict)
+    assert db._metadata_row("rt", source) == db._metadata_row("rt", full)
+
+    row = db.list_sessions()[0]
+    assert row["title"] == "Round Trip"
+    assert row["profile"] == "work"
+    assert row["archived"] is True
+    assert row["pinned"] is True
+    assert row["message_count"] == 2
+
+
+def test_unreadable_sidecar_falls_back_to_its_own_row(session_store, monkeypatch):
+    """A sidecar that fails to open must skip its row, not raise out of the list.
+
+    ``_read_metadata_head`` catches OSError; the budgeted-reader fallback opens
+    the file again, so it needs the same boundary.
+    """
+    _save_modern_session(session_store, sid="healthy", messages=[{"role": "user", "content": "hi"}])
+    doomed = session_store / "doomed.json"
+    doomed.write_text("{}", encoding="utf-8")
+
+    real_budgeted = models._read_metadata_json_prefix
+
+    def _unreadable(path, *args, **kwargs):
+        if Path(path).name == "doomed.json":
+            raise FileNotFoundError(str(path))
+        return real_budgeted(path, *args, **kwargs)
+
+    monkeypatch.setattr(models, "_read_metadata_json_prefix", _unreadable)
+    monkeypatch.setattr(DB, "_read_metadata_head", classmethod(lambda cls, p: None))
+
+    assert DB._read_metadata_row_source(doomed) is None
+    rows = DB(session_store).list_sessions()
+    assert [row["session_id"] for row in rows] == ["healthy"]
 
 
 def test_malformed_sidecar_is_skipped(session_store):
