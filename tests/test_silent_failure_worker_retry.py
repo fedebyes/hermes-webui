@@ -456,3 +456,91 @@ def test_raised_quota_error_on_the_retry_is_classified_as_quota(
     assert "quota" in body.lower() or "balance" in body.lower() or "credit" in body.lower(), (
         f"quota wording expected, got: {body[:200]}"
     )
+
+
+# ── Blocker: every form of current-turn activity counts ──────────────────────
+
+
+class _ActivityAgent:
+    """Synthetic agent whose first attempt shows activity but no final answer."""
+
+    instances = []
+    calls = 0
+    result_messages = []
+    reasoning_content = None
+    fire_interim = False
+
+    def __init__(self, session_id=None, tool_progress_callback=None,
+                 interim_assistant_callback=None, **_kwargs):
+        self.session_id = session_id
+        self.tool_progress_callback = tool_progress_callback
+        self.context_compressor = None
+        self.session_prompt_tokens = self.session_completion_tokens = 0
+        self.session_cache_read_tokens = self.session_cache_write_tokens = 0
+        self.session_estimated_cost_usd = None
+        self.reasoning_config = self.ephemeral_system_prompt = self._last_error = None
+        self.pending = []
+        self.pending_lock = threading.Lock()
+        # Named explicitly so the worker's signature probe wires the callback,
+        # exactly as it does for a real AIAgent.
+        self.interim_assistant_callback = interim_assistant_callback
+        _ActivityAgent.instances.append(self)
+
+    def run_conversation(self, **_kwargs):
+        _ActivityAgent.calls += 1
+        first = _ActivityAgent.calls == 1
+        if first and _ActivityAgent.fire_interim and self.interim_assistant_callback:
+            self.interim_assistant_callback("Let me look into that.")
+        result = {"messages": [dict(row) for row in _ActivityAgent.result_messages]}
+        if first and _ActivityAgent.reasoning_content:
+            result["reasoning_content"] = _ActivityAgent.reasoning_content
+        return result
+
+    def interrupt(self, _message):
+        return None
+
+    def steer(self, _text):
+        return True
+
+    def _drain_pending_steer(self):
+        return None
+
+
+def _run_activity_scene(scene, monkeypatch, *, reasoning=None, interim=False):
+    _ActivityAgent.instances = []
+    _ActivityAgent.calls = 0
+    _ActivityAgent.result_messages = [_user_row()]
+    _ActivityAgent.reasoning_content = reasoning
+    _ActivityAgent.fire_interim = interim
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: _ActivityAgent)
+    try:
+        scene.run()
+    finally:
+        _ActivityAgent.reasoning_content = None
+        _ActivityAgent.fire_interim = False
+    return _ActivityAgent.calls
+
+
+def test_result_only_reasoning_blocks_the_silent_retry(worker_scene, monkeypatch):
+    """Reasoning returned on the result — not streamed — is still activity."""
+    scene = worker_scene
+    calls = _run_activity_scene(
+        scene, monkeypatch,
+        reasoning="I considered the request and decided to answer shortly.",
+    )
+
+    assert calls == 1, (
+        "a turn that produced reasoning did work and must not be replayed"
+    )
+
+
+def test_an_interim_assistant_message_blocks_the_silent_retry(
+    worker_scene, monkeypatch,
+):
+    """Visible interim output is work already shown to the user."""
+    scene = worker_scene
+    calls = _run_activity_scene(scene, monkeypatch, interim=True)
+
+    assert calls == 1, (
+        "a turn that emitted an interim assistant message must not be replayed"
+    )
