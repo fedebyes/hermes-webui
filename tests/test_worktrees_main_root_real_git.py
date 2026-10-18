@@ -616,3 +616,132 @@ def _max_listing_depth() -> int:
     import api.worktrees as worktrees
 
     return worktrees._CHECKOUT_LISTING_DEPTH
+
+
+# --- Recognised-topology finding: an unclaimed search claims nothing ---------
+# The reviewer's residual case: ``unsuccessful gitfile discovery`` used to fall
+# through to a *shape* fallback (empty index, a filename that happens to collide)
+# and hand the Agent the metadata's parent. Ownership now has to be recorded, and
+# the allocation controls below assert where the tree actually lands.
+
+
+def _reviewer_layout(base, levels=("elsewhere", "deep", "more", "further")):
+    """The reviewer's exact fixture: depth-5 checkout, storage with a colliding file."""
+    checkout = base.joinpath(*levels, "actual-checkout")
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "tracked.txt").write_text("real\n", encoding="utf-8")
+    _git("add", "tracked.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    # Unrelated operator notes that only share the tracked *filename*.
+    (storage / "tracked.txt").write_text("unrelated operator notes\n", encoding="utf-8")
+    linked = base / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+    nested = linked / "nested"
+    nested.mkdir()
+    return checkout, storage, linked, nested
+
+
+def test_colliding_filename_is_not_checkout_ownership(git_env, monkeypatch):
+    """A recorded claim wins; a name collision never does."""
+    checkout, storage, linked, nested = _reviewer_layout(git_env / "collision")
+    find = _import()
+    for workspace in (linked, nested):
+        root = find(workspace)
+        assert root != storage.resolve(), "storage must never be answered"
+        assert root is None or root == checkout.resolve()
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(nested)
+    repo_root = Path(seen["repo_root"]).resolve()
+    assert repo_root != storage.resolve()
+    assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
+
+
+def test_tracked_file_whose_content_differs_is_not_ownership(git_env):
+    """A storage note that reuses a tracked name but not its content.
+
+    This is the maintainer's collision fixture at depth 6, where the bounded
+    search cannot reach the primary. Name presence alone must not claim the
+    storage dir: the parent's tree has to *be* the committed tree, and an
+    operator note only shares the name.
+    """
+    base = git_env / "collision-content"
+    checkout = base.joinpath(
+        "elsewhere", "l0", "l1", "l2", "l3", "actual-checkout"
+    )
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    for name in ("tracked.txt", "second.txt"):
+        (checkout / name).write_text(f"committed {name}\n", encoding="utf-8")
+        _git("add", name, cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    # Operator notes that reuse both tracked names with different content.
+    for name in ("tracked.txt", "second.txt"):
+        (storage / name).write_text(f"unrelated notes about {name}\n", encoding="utf-8")
+    linked = base / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+
+    find = _import()
+    for workspace in (linked, linked / "nested" if (linked / "nested").mkdir() is None else linked):
+        assert find(workspace) != storage.resolve()
+
+
+def test_plain_single_file_checkout_still_resolves(git_env):
+    """A plain checkout tracking one file keeps resolving to itself.
+
+    The positive the ownership rule must not lose: names present *and* matching
+    the committed content is affirmative, at any repository size.
+    """
+    primary = git_env / "single" / "primary"
+    primary.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", cwd=primary)
+    (primary / "a.txt").write_text("one file\n", encoding="utf-8")
+    _git("add", "a.txt", cwd=primary)
+    _git("commit", "-q", "-m", "init", cwd=primary)
+    linked = git_env / "single" / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
+
+    find = _import()
+    assert find(primary) == primary.resolve()
+    assert find(linked) == primary.resolve()
+
+
+def test_inside_and_outside_the_search_boundary(git_env):
+    """Allocation controls immediately inside and outside the listing bound."""
+    import api.worktrees as worktrees
+
+    depth = worktrees._CHECKOUT_LISTING_DEPTH
+    inside = tuple(f"lvl{i}" for i in range(depth - 1))
+    outside = tuple(f"lvl{i}" for i in range(depth + 1))
+    find = _import()
+
+    for label, levels in (("inside", inside), ("outside", outside)):
+        base = git_env / f"boundary-{label}"
+        checkout = base.joinpath(*levels, "checkout")
+        storage = base / "storage"
+        checkout.mkdir(parents=True)
+        storage.mkdir(parents=True)
+        _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+        (checkout / "sentinel.txt").write_text("keep me\n", encoding="utf-8")
+        _git("add", "sentinel.txt", cwd=checkout)
+        _git("commit", "-q", "-m", "init", cwd=checkout)
+        linked = base / "linked"
+        _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+
+        assert find(checkout) == checkout.resolve(), f"{label}: the checkout is its own root"
+        root = find(linked)
+        assert root != storage.resolve(), f"{label}: storage must never be answered"
+        # Inside the bound the primary is recovered; outside it the caller keeps
+        # its own checkout (the documented ``None`` fallback).
+        if label == "inside":
+            assert root == checkout.resolve(), "inside the bound the primary is found"
+        else:
+            assert root in (None, checkout.resolve())
