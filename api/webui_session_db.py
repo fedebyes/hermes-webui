@@ -17,8 +17,34 @@ from typing import Any
 import api.models as models
 
 
-_METADATA_FIELDS = frozenset(
-    {
+def _head_shows_metadata_first(head: bytes) -> bool:
+    """True when the head bytes prove the metadata precedes ``messages``.
+
+    The writer contract ``Session.save`` is what makes the cut safe; the
+    ``_mc_v`` marker alone only vouches for the count, not for the layout. A
+    sidecar can carry the marker and still serialize title/profile/archived
+    after ``messages`` (any foreign writer, or a payload handed to
+    ``write_session()`` in that order), and cutting there would silently drop
+    those fields. ``anchor_scene_index`` and ``_mc_v`` are emitted next to
+    ``message_count`` immediately before ``messages``, so both appearing ahead
+    of the cut is the evidence that the metadata prefix is complete.
+    """
+    cut = _metadata_cut_offset(head)
+    if cut < 0:
+        return False
+    before = head[:cut]
+    return b'"anchor_scene_index"' in before and b'"_mc_v"' in before
+
+
+def _metadata_cut_offset(head: bytes) -> int:
+    """Offset of the top-level ``messages`` key in a sidecar head, or -1."""
+    cut = head.find(b'\n  "messages":')
+    if cut < 0:
+        cut = head.find(b'"messages":')
+    return cut
+
+
+_METADATA_FIELDS = frozenset({
         "title",
         "workspace",
         "model",
@@ -80,6 +106,10 @@ _METADATA_FIELDS = frozenset(
 )
 
 _UNSAFE_FIELDS = frozenset({"session_id", "messages", "tool_calls", "message_count"})
+
+#: Fields ``_metadata_row`` derives itself, so a cut prefix is only complete
+#: when the metadata it needs is already present alongside them.
+_ROW_FIELDS = frozenset({"session_id", "message_count", "updated_at", "created_at"})
 
 
 class WebUIJsonSessionDB:
@@ -222,13 +252,12 @@ class WebUIJsonSessionDB:
                 head = fh.read(cls._METADATA_HEAD_BYTES)
         except OSError:
             return None
-        # Prefer the indented key a normal ``Session.save`` writes; a compact
-        # document from a foreign writer still carries the bare key.
-        cut = head.find(b'\n  "messages":')
-        if cut < 0:
-            cut = head.find(b'"messages":')
-        if cut < 0:
+        # The cut is only a shortcut under the writer's layout: when the head
+        # does not prove every metadata key precedes ``messages``, refuse it and
+        # let the caller read the document whole.
+        if not _head_shows_metadata_first(head):
             return None
+        cut = _metadata_cut_offset(head)
         prefix = head[:cut].rstrip()
         # Drop any trailing separator so the object closes cleanly.
         while prefix and prefix[-1:] in (b",", b"\n", b"\r", b"\t", b" "):
@@ -247,27 +276,66 @@ class WebUIJsonSessionDB:
         the field is absent. The head read never sees ``messages``, so a sidecar
         without an integer ``message_count`` must be parsed whole -- otherwise
         the sidebar would report 0 messages for it.
+
+        A head read is only trusted when the layout AND the writer marker vouch
+        for it. ``_read_metadata_head`` already refuses a head whose cut is not
+        proven metadata-first (see ``_head_shows_metadata_first``), so a payload
+        that serializes ``messages`` before title/profile/archived -- the order
+        ``write_session()`` preserves from its caller -- takes the full read.
+        An integer ``message_count`` alone is not proof that the rest of the
+        metadata precedes ``messages``; ``api/models.py`` gates its own count
+        shortcut on the same ``_mc_v`` writer marker, so this does too and any
+        unmarked layout gets the full reader.
         """
         data = cls._read_metadata_head(path)
-        if data is None:
-            # Metadata overflowed the head window (measured worst case: a 73 KB
-            # ``compression_anchor_summary``, #4633). models' budgeted reader
-            # stages up to 1 MiB and also stops at ``messages``, so an oversized
-            # prefix still avoids a multi-megabyte parse; it is the fallback
-            # rather than the default because its tokenizer scans the whole
-            # window once per stop key instead of stopping at a byte offset.
-            raw_prefix = models._read_metadata_json_prefix(path)
+        marked = isinstance(data, dict) and data.get("_mc_v") == models._MESSAGE_COUNT_MARKER
+        if not marked:
+            # Either metadata overflowed the head window (measured worst case: a
+            # 73 KB ``compression_anchor_summary``, #4633), the layout is not the
+            # writer's, or the file carries no marker. Any head that failed the
+            # layout/marker test is discarded here, so a partial prefix can never
+            # be served as a row. models' budgeted reader stages up to 1 MiB and
+            # also stops at ``messages``, so an oversized prefix still avoids a
+            # multi-megabyte parse; it is the fallback rather than the default
+            # because its tokenizer scans the whole window once per stop key
+            # instead of stopping at a byte offset.
+            #
+            # The shared reader opens the file itself, so this fallback needs
+            # the same error boundary the head read has: a sidecar removed or
+            # unreadable after enumeration must skip its own row, never raise
+            # out of the whole ``list_sessions()``.
+            data = None
+            try:
+                raw_prefix = models._read_metadata_json_prefix(path)
+            except (OSError, ValueError):
+                return None
+            fallback = None
             if raw_prefix:
                 try:
-                    data = json.loads(raw_prefix)
-                except json.JSONDecodeError:
-                    data = None
+                    fallback = json.loads(raw_prefix)
+                except (json.JSONDecodeError, ValueError):
+                    fallback = None
+            # The budgeted prefix is cut at its own stop key, which is not
+            # proof the metadata is complete either -- take it only when every
+            # field ``_metadata_row`` needs is already there, and let the full
+            # reader answer otherwise.
+            if (
+                isinstance(fallback, dict)
+                and fallback.get("_mc_v") == models._MESSAGE_COUNT_MARKER
+                and isinstance(fallback.get("message_count"), int)
+                and "messages" not in fallback
+                and _ROW_FIELDS.issubset(fallback)
+            ):
+                data = fallback
         if (
             isinstance(data, dict)
+            and data.get("_mc_v") == models._MESSAGE_COUNT_MARKER
             and isinstance(data.get("message_count"), int)
             and "messages" not in data
         ):
             return data
+        # Unmarked or ambiguous layout: the full reader is the only one that
+        # sees every field regardless of key order.
         return cls._read_path(path)
 
     @staticmethod
