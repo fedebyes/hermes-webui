@@ -10478,7 +10478,7 @@ def _messages_have_exact_prefix(messages, prefix):
     prefix = list(prefix or [])
     if len(messages) < len(prefix):
         return False
-    for got, expected in zip(messages, prefix):
+    for got, expected in zip(messages, prefix, strict=False):
         if not isinstance(got, dict) or not isinstance(expected, dict):
             if got != expected:
                 return False
@@ -17573,6 +17573,38 @@ def _run_agent_streaming(
                                 # normal post-result persistence path by
                                 # leaving _assistant_added truthy (set below).
                                 _assistant_added = True  # prevent re-entering guard
+                            elif (
+                                _is_silent_no_response
+                                and _heal_result is not None
+                                and _retry_raised_error is None
+                            ):
+                                # The retry failed *and* returned rows: a tool
+                                # round it executed, reasoning it produced. Those
+                                # are outcomes of this turn and must survive the
+                                # failure — settle them through the canonical
+                                # path instead of discarding the whole result
+                                # for the sake of the error card.
+                                _retry_partial = _heal_result.get('messages') or []
+                                if _retry_partial:
+                                    _settled_partial = _settle_result_messages(
+                                        s,
+                                        _previous_messages,
+                                        _previous_owner_context_messages,
+                                        _retry_partial,
+                                        msg_text,
+                                        _turn_pending_source,
+                                        _active_turn_identity,
+                                    )
+                                    if _settled_partial:
+                                        s.messages = list(_settled_partial)
+                                        try:
+                                            s.save()
+                                        except Exception:
+                                            logger.debug(
+                                                '[webui] self-heal: could not persist '
+                                                'the failed retry partial result',
+                                                exc_info=True,
+                                            )
                         if (
                             _is_silent_no_response
                             and not _assistant_added
