@@ -110,11 +110,15 @@ def test_dirty_ordinary_primary_still_unnests_to_primary(git_env, monkeypatch, k
     assert not Path(info["path"]).resolve().is_relative_to(linked.resolve())
 
 
-def test_ownership_rule_dirty_checkout_versus_storage_collision(git_env):
-    """Pin the rule itself: partial divergence is a checkout, total is a copy.
+def test_ownership_rule_ignores_content_and_requires_the_tracked_tree(git_env):
+    """Pin the rule itself: presence of the tracked tree, never its content.
 
-    A storage dir whose notes collide with *every* tracked name differs on all
-    of them; a dirty checkout differs only on the paths the operator touched.
+    A working tree owns its repository whether or not its files match the
+    index, so the rule must not consult content at all — an edited, staged or
+    merely ``touch``-ed checkout stays the tree. The discrimination against a
+    ``--separate-git-dir`` storage dir is done one layer up, by the gitfile
+    claim that a storage dir cannot make; here the only remaining signal is
+    whether the tracked paths exist.
     """
     from api.worktrees import _tracks_paths_in_parent
 
@@ -133,9 +137,21 @@ def test_ownership_rule_dirty_checkout_versus_storage_collision(git_env):
     _git("add", "b.txt", cwd=dirty)
     assert _tracks_paths_in_parent((storage / ".git").resolve(), dirty.resolve()) is True
 
-    # Same repository, storage holding notes that collide with every name.
+    # Every tracked file edited: still the tree (a divergence ratio got this
+    # wrong, and so did the earlier clean-status gate).
+    (dirty / "b.txt").write_text("edited again\n", encoding="utf-8")
+    assert _tracks_paths_in_parent((storage / ".git").resolve(), dirty.resolve()) is True
+
+    # A storage dir *of the same repository* that happens to carry notes under
+    # every tracked name is not rejected by this helper — it holds all the
+    # paths. Content is deliberately not evidence; the gitfile claim is what
+    # refuses storage, and that is asserted by the allocation tests.
     for name in ("a.txt", "b.txt"):
         (storage / name).write_text(f"unrelated notes about {name}\n", encoding="utf-8")
+    assert _tracks_paths_in_parent((storage / ".git").resolve(), storage.resolve()) is True
+
+    # A partial copy is a copy: one path missing is not the tracked tree.
+    (storage / "b.txt").unlink()
     assert _tracks_paths_in_parent((storage / ".git").resolve(), storage.resolve()) is False
 
 

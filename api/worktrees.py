@@ -28,11 +28,13 @@ _CHECKOUT_OWNING_GITDIR_MAX_UP = 4
 
 # How many directory levels below each ancestor of a metadata parent are
 # listed when looking for the gitfile that claims it. Every level is listed
-# once and never walked twice; this is what keeps the search bounded. Five
-# levels cover an operator layout such as
-# ``<base>/elsewhere/deep/more/further/<checkout>``, whose checkout sits at the
-# fifth level below ``<base>``.
-_CHECKOUT_LISTING_DEPTH = 5
+# once and never walked twice; this is what keeps the search bounded. The bound
+# must cover the layouts operators actually build: the maintainer's regression
+# fixture puts the checkout at ``<base>/elsewhere/d0/d1/d2/d3/checkout``, six
+# levels below ``<base>``, and a checkout the search cannot reach leaves only
+# the weaker topology fallback to decide ownership — which is how a
+# ``--separate-git-dir`` storage dir got crowned.
+_CHECKOUT_LISTING_DEPTH = 6
 
 
 def _run_git(args: list[str], cwd: str | Path, timeout: float = 2) -> subprocess.CompletedProcess:
@@ -738,7 +740,7 @@ def _topology_candidate(common_path: Path, common_resolved: Path) -> Path | None
     parent = _as_dir(common_resolved.parent)
     if parent is None:
         return None
-    # A plain ``<tree>/.git`` claims its parent only when the parent carries the
+    # A plain ``<tree>/.git`` claims its parent when the parent carries the
     # repository's tracked tree.
     #
     # Shape alone proves nothing: a ``--separate-git-dir`` storage dir has the
@@ -747,14 +749,15 @@ def _topology_candidate(common_path: Path, common_resolved: Path) -> Path | None
     # primary worktree. All three are the false signal this resolver exists to
     # reject, so none of them is used.
     #
-    # Which leaves tracked paths, and one asymmetry a storage dir cannot fake: a
-    # checkout keeps its *whole* tree beside the metadata, so every tracked
-    # top-level entry is there. A storage dir holds git's bookkeeping plus at most
-    # an operator note or two, so it reproduces that layout only when the
-    # repository tracks nothing but those same names. A repository with nothing
-    # tracked (a fresh ``init`` or an empty commit) therefore has no affirmative
-    # evidence left: ownership stays unknown and the caller keeps its own
-    # checkout — nesting at worst, never a session inside git's bookkeeping.
+    # Nor is *content*: a work tree owns its repository whether or not its files
+    # match the index, so nothing is compared against the committed bytes. A
+    # ``diff-files``-style test is wrong in both directions — it rejects an
+    # ordinary primary whose every tracked file was edited, and (because it is
+    # stat-dependent and never refreshes the index) it can misread a checkout
+    # whose files merely got a new mtime. What a storage dir cannot reproduce is
+    # the *tracked tree itself*: a checkout holds every tracked path, while
+    # storage holds git's bookkeeping plus at most an operator note that reuses a
+    # tracked name.
     if common_resolved.name == ".git" and _plain_git_dir_owner(parent, common_resolved):
         if _tracks_paths_in_parent(common_resolved, parent):
             return parent
@@ -773,50 +776,41 @@ def _topology_candidate(common_path: Path, common_resolved: Path) -> Path | None
 def _tracks_paths_in_parent(common_resolved: Path, parent: Path) -> bool:
     """True when the parent's tree is the repository's work tree, not a copy.
 
-    Every tracked top-level entry must exist under the parent, and those entries
-    must not *all* differ from the index. That single test covers both layouts:
+    Every tracked path must exist under the parent. That single test covers both
+    layouts without consulting, or trusting, the committed content:
 
-    * a **dirty checkout** differs on the paths the operator edited — some, not
-      all. It remains that repository's work tree, so it owns the metadata.
-    * a **``--separate-git-dir`` storage dir** carrying operator notes whose
-      names collide with tracked entries differs on *every* tracked entry: the
-      notes are not the committed content. No real work tree can differ on all
-      of them, since a tree matching nothing in its own index is not a checkout.
+    * a **checkout** — clean, dirty, staged, or with every tracked file edited —
+      holds its whole tracked tree;
+    * a **``--separate-git-dir`` storage dir** holds git's bookkeeping, plus at
+      most an operator note that happens to reuse a tracked basename. It cannot
+      hold the repository's tree, because git never puts one there.
 
-    Cleanliness is therefore not required — a modified, staged or
-    untracked-under-a-committed-name primary still qualifies, which is what an
-    earlier ``status --porcelain`` gate got wrong.
+    Full paths, not top-level names: a note colliding with a top-level
+    ``tracked.txt`` must not speak for a tracked ``src/tracked.txt``, and a
+    partial copy of the tree is a copy.
+
+    Deliberately *not* used, both because a work tree owns its repository
+    regardless of uncommitted state:
+
+    * ``git status`` — a clean requirement rejects every dirty primary;
+    * ``git diff-files`` — a divergence ratio rejects a primary whose every
+      tracked file was edited, and, being stat-driven, also depends on whether
+      the index happened to be refreshed (a same-content rewrite or a bare
+      ``touch`` either counts as a difference or does not).
 
     ``False`` for an empty index, an unreadable index or a failed query: an
     *unknown* answer is never ownership.
     """
-    tops = _tracked_tops(common_resolved)
-    if not tops:
+    paths = _tracked_paths(common_resolved)
+    if not paths:
         return False
-    for top in tops:
+    for rel in paths:
         try:
-            if not (parent / top).exists():
+            if not (parent / rel).exists():
                 return False
         except OSError:
             return False
-    result = _run_git(
-        [
-            f"--git-dir={common_resolved}",
-            f"--work-tree={parent}",
-            "diff-files",
-            "--name-only",
-            "--",
-            *sorted(tops),
-        ],
-        cwd=parent,
-    )
-    if result.returncode != 0:
-        return False
-    differing = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-    if not differing:
-        return True
-    # Differ on every tracked entry -> the parent is an imitation of the tree.
-    return len(differing) < len(tops)
+    return True
 
 
 def _plain_git_dir_owner(parent: Path, common_resolved: Path) -> bool:
@@ -835,13 +829,18 @@ def _plain_git_dir_owner(parent: Path, common_resolved: Path) -> bool:
         return False
 
 
-def _tracked_tops(common_resolved: Path) -> set[str] | None:
-    """The first path component of every tracked entry; ``None`` when unknown.
+def _tracked_paths(common_resolved: Path) -> set[str] | None:
+    """Every tracked path in the index; ``None`` when the query failed.
 
     ``None`` and ``set()`` are deliberately distinct: a *successful* empty index
     says "this repository tracks nothing", while a failed, timed-out or
     unreadable query says nothing at all. Neither is ownership, but only the
     failure is a reason to distrust an otherwise-empty answer.
+
+    Full paths, not top-level entries: a subtree rule ("every top-level name is
+    present somewhere below") would accept a storage dir holding one colliding
+    note for a repository whose only colliding name is top-level, which is
+    exactly the partial-copy layout this resolver must refuse.
     """
     try:
         result = subprocess.run(
@@ -856,7 +855,15 @@ def _tracked_tops(common_resolved: Path) -> set[str] | None:
         return None
     if result.returncode != 0:
         return None
-    return {p.split("/", 1)[0] for p in result.stdout.split("\0") if p}
+    return {p for p in result.stdout.split("\0") if p}
+
+
+def _tracked_tops(common_resolved: Path) -> set[str] | None:
+    """The first path component of every tracked entry; ``None`` when unknown."""
+    paths = _tracked_paths(common_resolved)
+    if paths is None:
+        return None
+    return {p.split("/", 1)[0] for p in paths}
 
 
 def _as_dir(raw: Path) -> Path | None:
