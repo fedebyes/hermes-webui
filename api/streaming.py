@@ -1415,6 +1415,8 @@ def _is_quota_error_text(err_text: str) -> bool:
         or 'fewer max_tokens' in _err_lower
         or 'quota_exceeded' in _err_lower
         or 'quota exceeded' in _err_lower
+        or 'insufficient_quota' in _err_lower
+        or 'insufficient quota' in _err_lower
         or 'exceeded your current quota' in _err_lower
         # OpenAI Codex OAuth usage-exhaustion shapes (#1765).
         or 'plan limit reached' in _err_lower
@@ -17138,6 +17140,7 @@ def _run_agent_streaming(
                         # this turn.
                         _heal_result = None
                         _heal_stale_classification = None
+                        _retry_raised_error = None
                         if _is_silent_no_response:
                             # A silent cut is a transient provider failure, not
                             # a credential problem: reuse the current runtime.
@@ -17382,6 +17385,10 @@ def _run_agent_streaming(
                                 logger.warning(
                                     '[webui] self-heal: retry also failed: %s', _retry_exc,
                                 )
+                                # The retry's own cause must survive the catch:
+                                # a raised 429 / 402 otherwise reaches the card
+                                # as the first attempt's silent no-response.
+                                _retry_raised_error = _retry_exc
                                 _heal_ok = False
                             if cancel_event.is_set():
                                 # A Stop or a server settle (#7293) during the retry
@@ -17471,10 +17478,12 @@ def _run_agent_streaming(
                             # attempt must not be reported as the first
                             # attempt's silent "no response from provider",
                             # while a retry that also came back empty keeps
-                            # exactly that no-response wording.
+                            # exactly that no-response wording. A *raised*
+                            # retry error counts as the retry's cause too.
                             _retry_err = (
                                 getattr(agent, '_last_error', None)
                                 or (_heal_result or {}).get('error')
+                                or _retry_raised_error
                                 or ''
                             )
                             _heal_stale_classification = _classify_provider_error(
