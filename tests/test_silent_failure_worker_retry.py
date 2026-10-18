@@ -575,3 +575,28 @@ def test_a_fresh_silent_turn_with_no_messages_key_is_retried(worker_scene):
     assert _runs(scene) == 2, (
         "an empty result dict must not be read as an echoed transcript"
     )
+
+
+# ── Follow-up: a failed retry keeps its partial result ───────────────────────
+
+
+def test_a_failed_retry_keeps_its_partial_tool_rows(worker_scene):
+    """A retry that returns a tool outcome *and* an error keeps the outcome.
+
+    Dropping it loses work the turn really performed; the canonical settlement
+    path is what makes it survive a reload.
+    """
+    scene = worker_scene
+    scene.on_run = _silent_then(scene, {
+        "error": "429 rate limit exceeded",
+        "messages": [_user_row()] + _tool_rows(),
+    })
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the retry must have run"
+    tool_rows = [row for row in scene.session.messages if row.get("role") == "tool"]
+    assert len(tool_rows) == 1, (
+        "the retry returned a tool outcome; discarding it loses real work"
+    )
+    assert tool_rows[0].get("content") == "done"
