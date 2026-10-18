@@ -268,3 +268,66 @@ def test_separate_git_dir_named_dotgit_resolver_direct(git_env):
     assert find(checkout) == checkout.resolve()
     assert find(linked) == checkout.resolve()
     assert find(checkout) != storage.resolve()
+
+
+def test_distant_primary_with_linked_input_never_returns_storage(git_env, monkeypatch):
+    """Reviewer's residual layout: the primary checkout is outside the search.
+
+    ``base/elsewhere/deep/actual-checkout`` holds the gitfile, the metadata is
+    ``base/storage-only/.git``, and the session enters ``base/linked-wt/nested``.
+    Scanning the metadata's children cannot reach the checkout, so the resolver
+    must not fall back to ``storage-only`` (git reports it as a working tree
+    because of the basename). The contract: either the real checkout, or the
+    explicit conservative ``None`` that lets the caller keep the current
+    checkout — never storage.
+    """
+    base = git_env / "distant"
+    checkout = base / "elsewhere" / "deep" / "actual-checkout"
+    storage = base / "storage-only"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "sentinel.txt").write_text("keep me\n", encoding="utf-8")
+    _git("add", "sentinel.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+
+    linked = base / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+    nested = linked / "nested"
+    nested.mkdir()
+
+    find = _import()
+    for workspace in (checkout, linked, nested):
+        root = find(workspace)
+        assert root != storage.resolve(), (
+            f"storage must never be returned as a project root (input {workspace})"
+        )
+        assert root is None or root == checkout.resolve(), (
+            f"expected the checkout or the conservative None, got {root}"
+        )
+
+
+def test_distant_primary_allocation_never_lands_in_storage(git_env, monkeypatch):
+    """The allocation control: whatever the resolver answers, not storage."""
+    base = git_env / "distant-alloc"
+    checkout = base / "elsewhere" / "deep" / "checkout-two"
+    storage = base / "storage-two"
+    checkout.mkdir(parents=True)
+    storage.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "tracked.txt").write_text("x\n", encoding="utf-8")
+    _git("add", "tracked.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    linked = base / "linked-two"
+    _git("worktree", "add", "-q", "-b", "side2", str(linked), cwd=checkout)
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(linked)
+
+    root = Path(seen["repo_root"]).resolve()
+    assert root != storage.resolve(), "the Agent must never be handed storage"
+    assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
