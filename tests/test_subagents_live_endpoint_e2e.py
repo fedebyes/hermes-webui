@@ -133,3 +133,68 @@ def test_live_endpoint_ignores_a_stale_crashed_row(test_server, tmp_path, monkey
 
     monkeypatch.setattr(routes, "_active_state_db_path", lambda: db)
     assert routes._live_subagent_counts(now, db) == {}
+
+
+def test_live_endpoint_retires_a_wedged_row_before_two_hours(test_server, tmp_path, monkeypatch):
+    """A child the runner never closed must stop counting within the window.
+
+    Measured regression: a subagent row with `ended_at IS NULL` whose last message
+    was 145 minutes old was reported as "1 live" while nothing was running, because
+    the grace window was 2 hours. The window must sit above the real long-run tail
+    (~15 min, 44 of ~790 runs) and below a genuinely dead row.
+    """
+    import api.routes as routes
+
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            parent_session_id TEXT,
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            end_reason TEXT,
+            message_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT,
+            content TEXT,
+            timestamp REAL NOT NULL
+        );
+        """
+    )
+    now = time.time()
+    started = now - 145 * 60
+    con.execute(
+        "INSERT INTO sessions (id, source, parent_session_id, started_at, ended_at) VALUES (?,?,?,?,?)",
+        ("child-wedged", "subagent", "parent-z", started, None),
+    )
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+        ("child-wedged", "assistant", "done", started + 21),
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(routes, "_active_state_db_path", lambda: db)
+    assert routes._live_subagent_counts(now, db) == {}
+
+    # ...while a child still inside the window keeps counting.
+    con = sqlite3.connect(db)
+    con.execute("UPDATE messages SET timestamp=? WHERE session_id='child-wedged'", (now - 60,))
+    con.commit()
+    con.close()
+    assert routes._live_subagent_counts(now, db) == {"parent-z": 1}
+
+
+def test_grace_window_covers_the_real_long_run_tail():
+    """The window must stay above the measured long-run tail (~15 min)."""
+    import api.routes as routes
+
+    assert routes._LIVE_SUBAGENTS_GRACE_SECONDS >= 20 * 60, (
+        "a window below the long-run tail hides a badge for a live child"
+    )
