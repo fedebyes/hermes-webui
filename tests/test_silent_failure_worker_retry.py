@@ -289,3 +289,67 @@ def test_gate_off_means_a_silent_turn_is_not_retried(worker_scene, monkeypatch):
     scene.run()
 
     assert _runs(scene) == 1, "the gate is off: no second provider call"
+
+
+# ── Blocker: an answer is owned by the turn, not by its text ─────────────────
+
+
+def _history_with_an_earlier_yes():
+    """History already holds an assistant ``Yes.`` from an earlier turn."""
+    return [
+        {"role": "user", "content": "Earlier question."},
+        {"role": "assistant", "content": "Yes."},
+        _materialized_user_row(),
+    ]
+
+
+def test_retry_accepts_an_equal_text_answer_owned_by_the_current_turn(
+    worker_scene, monkeypatch,
+):
+    """A new answer may repeat an older one verbatim; it is still the answer.
+
+    The reviewer's case: history holds ``Yes.``, the first attempt is silent,
+    and the retry answers the current turn with the same text the earlier
+    assistant used. Text novelty rejected it, settled ``no_response`` and threw
+    the answer away. Ownership comes from the current turn's checkpoint, not
+    from the text.
+    """
+    scene = worker_scene
+    history = _history_with_an_earlier_yes()
+    scene.session.messages = [dict(row) for row in history]
+    scene.session.context_messages = [dict(row) for row in history]
+
+    def answer_now():
+        if _runs(scene) == 1:
+            scene.result = {"messages": [dict(row) for row in history]}
+        else:
+            scene.result = {"messages": [dict(row) for row in history] + [
+                {"role": "assistant", "content": "Yes."},
+            ]}
+
+    scene.on_run = answer_now
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the silent turn still earns exactly one retry"
+    assert _error_rows(scene) == [], (
+        "an equal-text answer owned by the current turn must settle, not error"
+    )
+    assert "Yes." in _session_text(scene), (
+        "the retry's answer must reach the session"
+    )
+
+
+def test_retry_rejects_a_bare_replay_of_historical_rows(worker_scene):
+    """The negative control: replaying only history is not a recovery."""
+    scene = worker_scene
+    history = _history_with_an_earlier_yes()
+    scene.session.messages = [dict(row) for row in history]
+    scene.session.context_messages = [dict(row) for row in history]
+    scene.result = {"messages": [dict(row) for row in history]}
+
+    scene.run()
+
+    errors = _error_rows(scene)
+    assert len(errors) == 1, "a replayed historical transcript must not settle"
+    assert "No response from provider" in errors[0]["content"]
