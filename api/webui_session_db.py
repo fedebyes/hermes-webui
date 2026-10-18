@@ -104,7 +104,7 @@ class WebUIJsonSessionDB:
         for path in self.session_dir.glob("*.json"):
             if path.name.startswith("_"):
                 continue
-            data = self._read_path(path)
+            data = self._read_metadata_row_source(path)
             if not isinstance(data, dict):
                 continue
             sid = str(data.get("session_id") or path.stem)
@@ -195,6 +195,80 @@ class WebUIJsonSessionDB:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None
+
+    #: Bytes read from the head of a sidecar when listing session rows. The
+    #: metadata keys are serialized before ``messages`` (see ``Session.save``),
+    #: so they all live in the first few KB: measured over 637 real sidecars the
+    #: top-level ``"messages"`` key started at p50 2.6 KB, p99 32 KB, max 43 KB.
+    _METADATA_HEAD_BYTES = 64 * 1024
+
+    @classmethod
+    def _read_metadata_head(cls, path: Path) -> dict[str, Any] | None:
+        """Parse only the metadata that precedes ``messages`` in a sidecar.
+
+        ``list_sessions()`` consumes ~20 scalar fields per session, but a full
+        ``json.loads`` also decodes every message: on this store's 637 sidecars
+        (1.18 GB) that costs ~14 s per refresh, spent entirely on bytes the
+        sidebar never reads. Metadata is serialized before ``messages``, so the
+        document is cut at that key and closed with ``}`` -- a few KB instead of
+        megabytes.
+
+        Returns ``None`` when the cut is unavailable (key missing, or a metadata
+        prefix that overflowed the window), so the caller can fall back to
+        ``models._read_metadata_json_prefix`` or a full parse.
+        """
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(cls._METADATA_HEAD_BYTES)
+        except OSError:
+            return None
+        # Prefer the indented key a normal ``Session.save`` writes; a compact
+        # document from a foreign writer still carries the bare key.
+        cut = head.find(b'\n  "messages":')
+        if cut < 0:
+            cut = head.find(b'"messages":')
+        if cut < 0:
+            return None
+        prefix = head[:cut].rstrip()
+        # Drop any trailing separator so the object closes cleanly.
+        while prefix and prefix[-1:] in (b",", b"\n", b"\r", b"\t", b" "):
+            prefix = prefix[:-1]
+        try:
+            data = json.loads(prefix.decode("utf-8") + "\n}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _read_metadata_row_source(cls, path: Path) -> dict[str, Any] | None:
+        """Read only the fields ``_metadata_row`` consumes, for ``list_sessions``.
+
+        ``_metadata_row`` derives ``message_count`` from ``len(messages)`` when
+        the field is absent. The head read never sees ``messages``, so a sidecar
+        without an integer ``message_count`` must be parsed whole -- otherwise
+        the sidebar would report 0 messages for it.
+        """
+        data = cls._read_metadata_head(path)
+        if data is None:
+            # Metadata overflowed the head window (measured worst case: a 73 KB
+            # ``compression_anchor_summary``, #4633). models' budgeted reader
+            # stages up to 1 MiB and also stops at ``messages``, so an oversized
+            # prefix still avoids a multi-megabyte parse; it is the fallback
+            # rather than the default because its tokenizer scans the whole
+            # window once per stop key instead of stopping at a byte offset.
+            raw_prefix = models._read_metadata_json_prefix(path)
+            if raw_prefix:
+                try:
+                    data = json.loads(raw_prefix)
+                except json.JSONDecodeError:
+                    data = None
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("message_count"), int)
+            and "messages" not in data
+        ):
+            return data
+        return cls._read_path(path)
 
     @staticmethod
     def _metadata_row(sid: str, data: dict[str, Any]) -> dict[str, Any]:
