@@ -17,23 +17,32 @@ from typing import Any
 import api.models as models
 
 
-def _head_shows_metadata_first(head: bytes) -> bool:
-    """True when the head bytes prove the metadata precedes ``messages``.
+#: Layout version of the sidecars whose writer normalizes EVERY projected
+#: metadata key -- and its effective ordering values -- before ``messages``.
+#: Emitted by ``Session.save`` as ``_row_layout`` next to ``_mc_v``, i.e. inside
+#: the head window. A head/count marker is not enough on its own: a payload can
+#: carry ``_mc_v`` and ``anchor_scene_index`` and still serialize title/profile/
+#: archived/pinned/raw_source/source_label AFTER ``messages``
+#: (``write_session()`` preserves the caller's order), and a cut there would drop
+#: every one of them. Only the explicit version vouches that the projected set
+#: precedes the cut.
+_ROW_LAYOUT_KEY = "_row_layout"
+_ROW_LAYOUT_MARKER = f'"{_ROW_LAYOUT_KEY}"'
 
-    The writer contract ``Session.save`` is what makes the cut safe; the
-    ``_mc_v`` marker alone only vouches for the count, not for the layout. A
-    sidecar can carry the marker and still serialize title/profile/archived
-    after ``messages`` (any foreign writer, or a payload handed to
-    ``write_session()`` in that order), and cutting there would silently drop
-    those fields. ``anchor_scene_index`` and ``_mc_v`` are emitted next to
-    ``message_count`` immediately before ``messages``, so both appearing ahead
-    of the cut is the evidence that the metadata prefix is complete.
+
+def _head_shows_metadata_first(head: bytes) -> bool:
+    """True when the head bytes prove every projected field precedes ``messages``.
+
+    The writer contract ``Session.save`` is what makes the cut safe, and it
+    states that contract explicitly: a sidecar whose metadata was normalized
+    ahead of ``messages`` carries ``_row_layout`` before that key. Nothing else
+    proves it -- ``anchor_scene_index``/``_mc_v`` only vouch for the count and
+    the fingerprint, not for the position of the remaining projected fields.
     """
     cut = _metadata_cut_offset(head)
     if cut < 0:
         return False
-    before = head[:cut]
-    return b'"anchor_scene_index"' in before and b'"_mc_v"' in before
+    return _ROW_LAYOUT_MARKER.encode("ascii") in head[:cut]
 
 
 def _metadata_cut_offset(head: bytes) -> int:
@@ -42,6 +51,23 @@ def _metadata_cut_offset(head: bytes) -> int:
     if cut < 0:
         cut = head.find(b'"messages":')
     return cut
+
+
+def _has_complete_row_layout(data: Any) -> bool:
+    """True when ``data`` carries the writer's complete-row layout marker.
+
+    A prefix may be served as a row only when the writer stated, in the same
+    write, that every projected metadata key precedes ``messages``. The marker
+    alone is not enough: the row also needs an integer ``message_count``, since
+    the head never sees ``messages`` and ``_metadata_row`` would otherwise fall
+    back to ``len(messages)`` == 0.
+    """
+    return (
+        isinstance(data, dict)
+        and data.get(_ROW_LAYOUT_KEY) == models._ROW_LAYOUT_VERSION
+        and data.get("_mc_v") == models._MESSAGE_COUNT_MARKER
+        and isinstance(data.get("message_count"), int)
+    )
 
 
 _METADATA_FIELDS = frozenset({
@@ -277,28 +303,27 @@ class WebUIJsonSessionDB:
         without an integer ``message_count`` must be parsed whole -- otherwise
         the sidebar would report 0 messages for it.
 
-        A head read is only trusted when the layout AND the writer marker vouch
-        for it. ``_read_metadata_head`` already refuses a head whose cut is not
-        proven metadata-first (see ``_head_shows_metadata_first``), so a payload
-        that serializes ``messages`` before title/profile/archived -- the order
-        ``write_session()`` preserves from its caller -- takes the full read.
-        An integer ``message_count`` alone is not proof that the rest of the
-        metadata precedes ``messages``; ``api/models.py`` gates its own count
-        shortcut on the same ``_mc_v`` writer marker, so this does too and any
-        unmarked layout gets the full reader.
+        Both admission paths are gated on the SAME proof, ``_ROW_LAYOUT_KEY``
+        before the cut. ``_mc_v``/``anchor_scene_index``/``message_count`` only
+        vouch for the count and the fingerprint: a payload can carry all three
+        and still serialize title/profile/archived/pinned/raw_source/
+        source_label after ``messages`` (``write_session()`` preserves the
+        caller's order). Admitting either prefix on a narrower condition
+        silently drops those fields from the row, so nothing but the explicit
+        layout marker admits a prefix -- any other shape takes the full read.
         """
         data = cls._read_metadata_head(path)
-        marked = isinstance(data, dict) and data.get("_mc_v") == models._MESSAGE_COUNT_MARKER
-        if not marked:
+        if not _has_complete_row_layout(data):
             # Either metadata overflowed the head window (measured worst case: a
             # 73 KB ``compression_anchor_summary``, #4633), the layout is not the
             # writer's, or the file carries no marker. Any head that failed the
-            # layout/marker test is discarded here, so a partial prefix can never
-            # be served as a row. models' budgeted reader stages up to 1 MiB and
+            # layout test is discarded here, so a partial prefix can never be
+            # served as a row. models' budgeted reader stages up to 1 MiB and
             # also stops at ``messages``, so an oversized prefix still avoids a
             # multi-megabyte parse; it is the fallback rather than the default
             # because its tokenizer scans the whole window once per stop key
-            # instead of stopping at a byte offset.
+            # instead of stopping at a byte offset -- and it is held to the same
+            # layout proof.
             #
             # The shared reader opens the file itself, so this fallback needs
             # the same error boundary the head read has: a sidecar removed or
@@ -315,27 +340,16 @@ class WebUIJsonSessionDB:
                     fallback = json.loads(raw_prefix)
                 except (json.JSONDecodeError, ValueError):
                     fallback = None
-            # The budgeted prefix is cut at its own stop key, which is not
-            # proof the metadata is complete either -- take it only when every
-            # field ``_metadata_row`` needs is already there, and let the full
-            # reader answer otherwise.
             if (
-                isinstance(fallback, dict)
-                and fallback.get("_mc_v") == models._MESSAGE_COUNT_MARKER
-                and isinstance(fallback.get("message_count"), int)
+                _has_complete_row_layout(fallback)
                 and "messages" not in fallback
                 and _ROW_FIELDS.issubset(fallback)
             ):
                 data = fallback
-        if (
-            isinstance(data, dict)
-            and data.get("_mc_v") == models._MESSAGE_COUNT_MARKER
-            and isinstance(data.get("message_count"), int)
-            and "messages" not in data
-        ):
+        if isinstance(data, dict) and _has_complete_row_layout(data) and "messages" not in data:
             return data
-        # Unmarked or ambiguous layout: the full reader is the only one that
-        # sees every field regardless of key order.
+        # Unmarked, incomplete or ambiguous layout: the full reader is the only
+        # one that sees every field regardless of key order.
         return cls._read_path(path)
 
     @staticmethod
