@@ -6,7 +6,6 @@ import subprocess
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
-from typing import Iterator
 from pathlib import Path
 
 import logging
@@ -21,20 +20,46 @@ logger = logging.getLogger(__name__)
 # parent; the bound only stops a pathological path, it is not a search radius.
 _CHECKOUT_WALK_MAX_DEPTH = 256
 
-# How many ancestors above a metadata parent are listed when looking for the
-# gitfile that claims it. Each step is one flat ``scandir`` of that level plus
-# one pruned level, never a recursive walk.
+# How many ancestors above a metadata parent are searched when looking for the
+# gitfile that claims it. Each ancestor is one bounded descent (see
+# ``_CHECKOUT_LISTING_DEPTH``), never an unbounded walk.
 _CHECKOUT_OWNING_GITDIR_MAX_UP = 4
 
-# How many directory levels below each ancestor of a metadata parent are
-# listed when looking for the gitfile that claims it. Every level is listed
-# once and never walked twice; this is what keeps the search bounded. The bound
-# must cover the layouts operators actually build: the maintainer's regression
-# fixture puts the checkout at ``<base>/elsewhere/d0/d1/d2/d3/checkout``, six
-# levels below ``<base>``, and a checkout the search cannot reach leaves only
-# the weaker topology fallback to decide ownership — which is how a
-# ``--separate-git-dir`` storage dir got crowned.
-_CHECKOUT_LISTING_DEPTH = 6
+# How many directory levels below each root the gitfile claim search looks.
+# Every level is listed once and never walked twice; descent is decided before a
+# directory is entered, so a large sibling subtree is never walked to completion
+# (the ``rglob`` failure mode). Depth is not what grants ownership: when the
+# search is *truncated* — by this bound or by the listing budget below — the
+# ownership is unknown and the caller keeps its own checkout. Truncation is
+# therefore strictly conservative, and raising the bound only makes the answer
+# better (the real checkout instead of ``None``); it can never crown a
+# ``--separate-git-dir`` storage dir.
+_CHECKOUT_LISTING_DEPTH = 16
+
+# Hard cap on directories visited by one claim search. A plain repository has no
+# claim to find, so the search runs to completion over its tree; the budget keeps
+# that finite for operator layouts with very many directories. Exhausting the
+# budget is *truncation*, not "no claim": it must never be read as ownership.
+_CHECKOUT_SEARCH_MAX_DIRS = 8192
+
+# Directory names the claim search does not descend into. They hold dependency or
+# tooling trees, not a repository checkout; skipping them keeps the search cheap
+# on ordinary working trees and is a deliberate stop, not an unfinished search.
+# A checkout of this metadata living inside one would go unfound, which costs the
+# plain-layout answer at worst — it can never promote a candidate.
+_CHECKOUT_SKIP_DESCENT = frozenset(
+    {
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "site-packages",
+        "venv",
+    }
+)
 
 
 def _run_git(args: list[str], cwd: str | Path, timeout: float = 2) -> subprocess.CompletedProcess:
@@ -416,27 +441,28 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
 
     The answer is derived from the **common git dir**, which is not always
     ``<main>/.git``: ``--separate-git-dir=X`` and submodules put the metadata
-    elsewhere. One rule decides, and it never looks at a directory's name or at
-    stray files — both describe a ``--separate-git-dir`` *storage* dir exactly
-    as well as a real checkout, since git even reports storage as a working
-    tree (its basename is ``.git``):
+    elsewhere. One rule decides, and it never looks at a directory's name, at
+    stray files, at the index or at committed content — all of those describe a
+    ``--separate-git-dir`` *storage* dir exactly as well as a real checkout,
+    since git even reports storage as a working tree (its basename is ``.git``):
 
         the working tree is the directory whose ``.git`` **gitfile** claims
-        this metadata — the workspace's own ancestry first, then one flat
-        listing level around the metadata parent (a plain repository's parent
-        dir holds the metadata itself as ``.git``).
+        this metadata — the workspace's own ancestry first, then the metadata's
+        parent and its ancestors, each listed with bounded descent (a plain
+        repository's parent dir holds the metadata itself as ``.git``).
 
-    Only a gitfile pointing *straight* at the common dir counts; one naming
-    ``<common>/worktrees/<name>`` belongs to a linked worktree and says nothing
-    about the primary. ``core.worktree`` is accepted when git records it.
+    A gitfile naming ``<common>/worktrees/<name>`` belongs to a linked worktree
+    and is followed through that admin dir's ``commondir``; ``core.worktree`` is
+    accepted when git records it.
 
     When no claim exists the layout is genuinely ambiguous — a
-    ``--separate-git-dir`` checkout outside the listed levels leaves its
-    metadata as the only ``.git`` in its parent — and the answer is ``None``:
-    the caller then keeps the workspace's own toplevel, which nests at worst.
-    It never starts a session inside a Git metadata directory, and a bounded
-    search that found no claim never turns metadata shape, a Git-inferred
-    toplevel, an empty index or a colliding filename into positive ownership.
+    ``--separate-git-dir`` storage dir is shaped exactly like a plain checkout —
+    and the answer is ``None``: the caller then keeps the workspace's own
+    toplevel, which nests at worst. It never starts a session inside git
+    bookkeeping. The plain layout is trusted only when the claim search finished
+    without being truncated; a truncated search (depth cap, listing budget or an
+    unreadable level) is unknown ownership, never a promotion of metadata shape
+    into ownership.
     """
     ws = Path(workspace).expanduser().resolve()
     if not ws.is_dir():
@@ -457,12 +483,16 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
         if owner is not None:
             return owner
 
-    owner = _checkout_claiming_common(common_path, common_resolved)
+    owner, search_complete = _claiming_checkout(common_path, common_resolved)
     if owner is not None:
         return owner
 
-    # No gitfile claimed the metadata: decide from recorded topology only.
-    candidate = _topology_candidate(common_path, common_resolved)
+    # No gitfile claimed the metadata. Decide from recorded topology only, and
+    # only when the claim search actually finished: a truncated search says
+    # nothing about who owns the metadata, so "found nothing" stays unknown.
+    candidate = _topology_candidate(
+        common_path, common_resolved, claim_search_complete=search_complete
+    )
     if candidate is not None:
         return candidate
 
@@ -578,103 +608,41 @@ def _repo_effective_root(common_resolved: Path) -> Path | None:
         return None
 
 
-def _iter_dirs_bounded(start: Path, max_depth: int) -> Iterator[Path]:
-    """Every directory under *start*, descending at most *max_depth* levels.
+def _claiming_checkout(
+    common_path: Path, common_resolved: Path
+) -> tuple[Path | None, bool]:
+    """A checkout whose gitfile claims the metadata, and whether we searched all.
 
-    Descent is bounded before a directory is entered, so an unrelated deep
-    subtree is never walked to completion just to be filtered out afterwards —
-    the failure mode of ``rglob``. ``.git`` is never entered: git metadata holds
-    no checkouts. ``start`` itself is not yielded.
+    Returns ``(owner, complete)``. ``owner`` is a checkout whose ``.git`` gitfile
+    points at this metadata (directly, or at its per-worktree admin dir); that
+    claim is the only authoritative evidence of who owns separate metadata, and
+    the first one found wins.
 
-    Depth is counted in *levels below* ``start``, so ``max_depth=4`` yields the
-    four levels ``a``, ``a/b``, ``a/b/c`` and ``a/b/c/d``. The child is added to
-    the walk while ``depth + 1 < max_depth`` — a child at the last level is
-    yielded but not descended into, which is exactly the cap.
-    """
-    try:
-        if not start.is_dir():
-            return
-    except OSError:
-        return
-    stack: list[tuple[Path, int]] = [(start, 0)]
-    while stack:
-        current, depth = stack.pop()
-        try:
-            entries = sorted(os.scandir(current), key=lambda entry: entry.name)
-        except OSError:
-            continue
-        children: list[tuple[Path, int]] = []
-        for entry in entries:
-            try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-            except OSError:
-                continue
-            if entry.name == ".git":
-                continue
-            child = Path(entry.path)
-            yield child
-            # Descend from a child below the last permitted level. Levels are
-            # counted from ``start``: ``depth`` is the level of ``current``, so a
-            # child sits at ``depth + 1`` and may be entered only while that is
-            # still below ``max_depth``.
-            if depth + 1 < max_depth:
-                children.append((child, depth + 1))
-        stack.extend(reversed(children))
+    ``complete`` says whether the walk exhausted every directory it was allowed
+    to enter. ``False`` means truncated — by ``_CHECKOUT_LISTING_DEPTH``, by the
+    listing budget or by an unreadable level — so "no claim found" is *unknown
+    ownership*, not evidence that the metadata's parent owns it. The caller must
+    then keep the workspace's own checkout: nesting at worst, never a session
+    inside a ``--separate-git-dir`` storage dir.
 
+    The metadata's parent is tried first — for a plain repository the parent *is*
+    the working tree, but its ``.git`` is a directory rather than a gitfile, so
+    nothing is claimed here — then the ancestors of the metadata parent, each
+    listed with the same bounded descent so a checkout sitting beside the
+    metadata (``<base>/storage/.git`` with the checkout in ``<base>/elsewhere/…``)
+    is found.
 
-def _looks_plain(common_resolved: Path) -> bool:
-    """The local shape a plain repository's ``.git`` (or its storage twin) has.
-
-    Decidable without a claim, so it gates the claim search: metadata that is a
-    ``.git`` *directory* by basename, carries no ``commondir`` (that marker means
-    a linked worktree's admin dir), and lives nowhere under a submodule's
-    ``.git/modules``. Everything else is a shape the search cannot resolve by
-    gitfile, and continuing would only spend directory listings.
-    """
-    try:
-        if common_resolved.name != ".git":
-            return False
-        if (common_resolved / "commondir").is_file():
-            return False
-    except OSError:
-        return False
-    return not (
-        common_resolved.parent.name == "modules"
-        and common_resolved.parent.parent.name == ".git"
-    )
-
-
-def _checkout_claiming_common(common_path: Path, common_resolved: Path) -> Path | None:
-    """A checkout whose gitfile claims the metadata, found by directory listing.
-
-    The metadata's parent is tried first — for a plain repository it *is* the
-    working tree (its ``.git`` is the metadata dir, not a gitfile) — then the
-    ancestors of the metadata parent, each listed with bounded descent so a
-    checkout sitting beside the metadata (``<base>/storage/.git`` with the
-    checkout in ``<base>`` or a couple of levels below it) is still found.
-
-    Only a *claim* decides: a gitfile pointing straight at this metadata, or a
-    ``.git`` directory that **is** this metadata *and* whose recorded topology
-    says the candidate is its working tree. Without a claim the ownership is
-    unknown and the answer is ``None``: a search that finds nothing must not
-    promote metadata shape, a Git-inferred toplevel, an empty index or a
-    colliding filename into positive evidence (see ``_topology_candidate``).
+    A directory that is itself a working-tree root (it holds a ``.git`` entry) is
+    never descended into: it is a checkout, not a container of one. That prunes
+    session trees under ``.worktrees/`` and nested repositories in one step.
     """
     parent = common_path.parent
     seen: set[str] = set()
 
-    # Every descendant of the metadata parent is listed once, with descent
-    # capped at ``_CHECKOUT_LISTING_DEPTH`` *from that level*: a checkout can sit
-    # beside the metadata, or a few directory levels down in the operator's own
-    # layout (``<base>/elsewhere/deep/<checkout>``). Descent is bounded before a
-    # directory is entered, so a large sibling subtree is never walked to
-    # completion after a failed match — the ``rglob`` failure mode.
-    #
     # When the local search finds nothing, the *ancestor* levels are listed too:
     # the primary can sit above the metadata's parent (``<base>/storage/.git``
-    # with the checkout at ``<base>/elsewhere/deep/...``). Those levels are
-    # finite, since ``$HOME`` and ``/`` are excluded.
+    # with the checkout at ``<base>/elsewhere/...``). Those levels are finite,
+    # since ``$HOME`` and ``/`` are excluded.
     roots = [parent]
     stop_at = _repo_effective_root(common_resolved)
     ancestor = parent.parent
@@ -689,40 +657,91 @@ def _checkout_claiming_common(common_path: Path, common_resolved: Path) -> Path 
     if parent.name == "modules" and parent.parent.name == ".git":
         # ``<super>/.git/modules/<name>``: the submodule lives in ``<super>/<name>``.
         roots.append(parent.parent.parent)
+    # A git metadata directory is never a container of checkouts (the submodule
+    # or storage checkout lives beside it, not inside it), so walking it would
+    # only spend the budget on ``objects/``.
+    roots = [root for root in roots if root.name != ".git"]
 
+    budget = _CHECKOUT_SEARCH_MAX_DIRS
+    truncated = False
     for root in roots:
-        level: list[Path] = []
-        for candidate in _iter_dirs_bounded(root, _CHECKOUT_LISTING_DEPTH):
-            key = str(candidate)
-            if key in seen:
-                continue
-            seen.add(key)
-            level.append(candidate)
-        for candidate in level:
-            owner = _gitfile_owner(candidate, common_resolved)
-            if owner is not None:
-                return owner
-    return None
+        stack: list[tuple[Path, int]] = [(root, 0)]
+        while stack:
+            current, depth = stack.pop()
+            try:
+                entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+            except OSError:
+                # Unreadable level: we could not look, so the answer is unknown.
+                return None, False
+            children: list[tuple[Path, int]] = []
+            for entry in entries:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                if entry.name == ".git":
+                    continue
+                child = Path(entry.path)
+                key = str(child)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if budget <= 0:
+                    return None, False
+                budget -= 1
+                owner = _gitfile_owner(child, common_resolved)
+                if owner is not None:
+                    return owner, True
+                # Descend only past the dependency trees and outside other
+                # checkouts; stopping there is a deliberate policy, not an
+                # unfinished search. Stopping at the cap is different: a claim
+                # may sit below it, so that is truncation, not "no claim".
+                if entry.name in _CHECKOUT_SKIP_DESCENT:
+                    continue
+                try:
+                    if os.path.lexists(child / ".git"):
+                        # A checkout of some repository: not a container of one.
+                        continue
+                except OSError:
+                    continue
+                if depth + 1 >= _CHECKOUT_LISTING_DEPTH:
+                    truncated = True
+                    continue
+                children.append((child, depth + 1))
+            stack.extend(reversed(children))
+
+    return None, not truncated
 
 
-def _topology_candidate(common_path: Path, common_resolved: Path) -> Path | None:
+def _topology_candidate(
+    common_path: Path, common_resolved: Path, *, claim_search_complete: bool
+) -> Path | None:
     """The working tree git's own records tie to this metadata, or ``None``.
 
-    Reached only after no gitfile claimed the metadata. Three recorded facts can
+    Reached only after no gitfile claimed the metadata. Two recorded facts can
     still name a working tree, in this order:
 
     * ``core.worktree``, which names it outright (a ``--separate-git-dir``
       checkout may carry it);
-    * ``<tree>/.git`` *is* this metadata and the parent carries the repository's
-      tracked tree — the plain layout, where the parent is the working tree.
+    * ``<tree>/.git`` *is* this metadata (a real directory, not a gitfile) — the
+      plain layout, where the parent is the working tree.
 
-    A linked admin dir (``commondir``) is never a primary. Nothing else is a
-    candidate: basename alone, a Git-inferred toplevel, ``git worktree list``,
-    an empty index beside a ``worktrees/`` admin area, or a single file sharing
-    a tracked name are all true of a ``--separate-git-dir`` storage dir too, so
-    they are refused here — unknown ownership stays unknown and the caller keeps
-    the checkout it has. That is the deliberate failure mode: nesting at worst,
-    never creating a session inside git's bookkeeping.
+    Both are *layout* facts, never content or presence facts. A working tree owns
+    its repository whether its files are clean, modified, staged, deleted or
+    entirely rewritten, so no index query, ``git status`` or per-path existence
+    test takes part in this decision: an ordinary primary that deleted a tracked
+    leaf still owns its repository. An empty index is not a special case either —
+    a fresh ``init`` tracks nothing and still owns its parent.
+
+    A linked admin dir (``commondir``) is never a primary. The plain layout is
+    only trusted when the gitfile claim search actually finished
+    (``claim_search_complete``): a ``--separate-git-dir`` storage dir named
+    ``.git`` has exactly the same shape as a plain checkout, so its ownership is
+    decided by the claim its real checkout makes elsewhere — and when that claim
+    was not found because the search was truncated, the answer is ``None``.
+    Unknown ownership stays unknown, and the caller keeps the checkout it has:
+    nesting at worst, never a session inside git's bookkeeping.
     """
     recorded = _core_worktree(common_path)
     if recorded is not None:
@@ -740,85 +759,29 @@ def _topology_candidate(common_path: Path, common_resolved: Path) -> Path | None
     parent = _as_dir(common_resolved.parent)
     if parent is None:
         return None
-    # A plain ``<tree>/.git`` claims its parent when the parent carries the
-    # repository's tracked tree.
-    #
-    # Shape alone proves nothing: a ``--separate-git-dir`` storage dir has the
-    # identical ``.git``-beside-parent layout, ``git rev-parse --show-toplevel``
-    # answers the storage dir itself, and ``git worktree list`` names it as the
-    # primary worktree. All three are the false signal this resolver exists to
-    # reject, so none of them is used.
-    #
-    # Nor is *content*: a work tree owns its repository whether or not its files
-    # match the index, so nothing is compared against the committed bytes. A
-    # ``diff-files``-style test is wrong in both directions — it rejects an
-    # ordinary primary whose every tracked file was edited, and (because it is
-    # stat-dependent and never refreshes the index) it can misread a checkout
-    # whose files merely got a new mtime. What a storage dir cannot reproduce is
-    # the *tracked tree itself*: a checkout holds every tracked path, while
-    # storage holds git's bookkeeping plus at most an operator note that reuses a
-    # tracked name.
-    if common_resolved.name == ".git" and _plain_git_dir_owner(parent, common_resolved):
-        if _tracks_paths_in_parent(common_resolved, parent):
-            return parent
-        # No tracked set at all: a fresh ``init`` or an empty commit, whose
-        # checkout legitimately holds nothing but ``.git``. Resolving the parent
-        # keeps that ordinary positive working (a repository that simply tracks
-        # nothing yet), and it is the pre-existing behaviour for this layout.
-        # A *failed* index query is unknown rather than empty and claims nothing.
-        tops = _tracked_tops(common_resolved)
-        if tops is not None and not tops:
-            return parent
-        return None
+    # The plain layout: the parent's own ``.git`` *is* this metadata directory.
+    # Shape alone cannot tell the parent of a ``--separate-git-dir`` storage dir
+    # apart from a plain checkout — both hold a ``.git`` directory, both are
+    # reported as the toplevel by git, and ``git worktree list`` names both as the
+    # primary worktree — so the claim search above is what refuses storage. Here
+    # we only accept the layout once that search provably found no claim.
+    if (
+        claim_search_complete
+        and common_resolved.name == ".git"
+        and _plain_git_dir_owner(parent, common_resolved)
+    ):
+        return parent
     return None
-
-
-def _tracks_paths_in_parent(common_resolved: Path, parent: Path) -> bool:
-    """True when the parent's tree is the repository's work tree, not a copy.
-
-    Every tracked path must exist under the parent. That single test covers both
-    layouts without consulting, or trusting, the committed content:
-
-    * a **checkout** — clean, dirty, staged, or with every tracked file edited —
-      holds its whole tracked tree;
-    * a **``--separate-git-dir`` storage dir** holds git's bookkeeping, plus at
-      most an operator note that happens to reuse a tracked basename. It cannot
-      hold the repository's tree, because git never puts one there.
-
-    Full paths, not top-level names: a note colliding with a top-level
-    ``tracked.txt`` must not speak for a tracked ``src/tracked.txt``, and a
-    partial copy of the tree is a copy.
-
-    Deliberately *not* used, both because a work tree owns its repository
-    regardless of uncommitted state:
-
-    * ``git status`` — a clean requirement rejects every dirty primary;
-    * ``git diff-files`` — a divergence ratio rejects a primary whose every
-      tracked file was edited, and, being stat-driven, also depends on whether
-      the index happened to be refreshed (a same-content rewrite or a bare
-      ``touch`` either counts as a difference or does not).
-
-    ``False`` for an empty index, an unreadable index or a failed query: an
-    *unknown* answer is never ownership.
-    """
-    paths = _tracked_paths(common_resolved)
-    if not paths:
-        return False
-    for rel in paths:
-        try:
-            if not (parent / rel).exists():
-                return False
-        except OSError:
-            return False
-    return True
 
 
 def _plain_git_dir_owner(parent: Path, common_resolved: Path) -> bool:
     """True when *parent*'s own ``.git`` is this metadata directory.
 
     The plain layout, decided without asking git to interpret a gitfile: the
-    parent holds a ``.git`` *directory* that is the metadata itself. A storage
-    dir's parent holds no ``.git`` at all.
+    parent holds a ``.git`` *directory* that is the metadata itself. This is a
+    layout fact only — a storage dir's parent holds the very same ``.git``
+    directory (git's bookkeeping lives there too), which is why it is not
+    ownership on its own.
     """
     try:
         parent_git = parent / ".git"
@@ -827,43 +790,6 @@ def _plain_git_dir_owner(parent: Path, common_resolved: Path) -> bool:
         return parent_git.samefile(common_resolved)
     except OSError:
         return False
-
-
-def _tracked_paths(common_resolved: Path) -> set[str] | None:
-    """Every tracked path in the index; ``None`` when the query failed.
-
-    ``None`` and ``set()`` are deliberately distinct: a *successful* empty index
-    says "this repository tracks nothing", while a failed, timed-out or
-    unreadable query says nothing at all. Neither is ownership, but only the
-    failure is a reason to distrust an otherwise-empty answer.
-
-    Full paths, not top-level entries: a subtree rule ("every top-level name is
-    present somewhere below") would accept a storage dir holding one colliding
-    note for a repository whose only colliding name is top-level, which is
-    exactly the partial-copy layout this resolver must refuse.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "--git-dir", str(common_resolved), "ls-files", "-z"],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-            creationflags=windows_hide_flags(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    return {p for p in result.stdout.split("\0") if p}
-
-
-def _tracked_tops(common_resolved: Path) -> set[str] | None:
-    """The first path component of every tracked entry; ``None`` when unknown."""
-    paths = _tracked_paths(common_resolved)
-    if paths is None:
-        return None
-    return {p.split("/", 1)[0] for p in paths}
 
 
 def _as_dir(raw: Path) -> Path | None:

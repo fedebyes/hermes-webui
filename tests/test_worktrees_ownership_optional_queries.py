@@ -110,49 +110,49 @@ def test_dirty_ordinary_primary_still_unnests_to_primary(git_env, monkeypatch, k
     assert not Path(info["path"]).resolve().is_relative_to(linked.resolve())
 
 
-def test_ownership_rule_ignores_content_and_requires_the_tracked_tree(git_env):
-    """Pin the rule itself: presence of the tracked tree, never its content.
+def test_ownership_rule_consults_no_index_and_no_path_presence(git_env, monkeypatch):
+    """Pin the rule itself: layout and claims, never content, presence or index.
 
-    A working tree owns its repository whether or not its files match the
-    index, so the rule must not consult content at all — an edited, staged or
-    merely ``touch``-ed checkout stays the tree. The discrimination against a
-    ``--separate-git-dir`` storage dir is done one layer up, by the gitfile
-    claim that a storage dir cannot make; here the only remaining signal is
-    whether the tracked paths exist.
+    A working tree owns its repository whether its files match the index or not,
+    so the rule must not consult the index, ``git status`` or per-path existence:
+    an edited, staged, ``touch``-ed or partially deleted checkout stays the tree.
+    The discrimination against a ``--separate-git-dir`` storage dir is done one
+    layer up, by the gitfile claim that a storage dir cannot make, so no ownership
+    question ever reaches an optional Git query.
+
+    A failed ``ls-files`` is therefore not merely conservative — it is not asked.
     """
-    from api.worktrees import _tracks_paths_in_parent
+    import api.worktrees as worktrees
 
-    # Multi-entry dirty checkout: one modified, one staged -> still the tree.
-    dirty = git_env / "rule-dirty" / "checkout"
-    dirty.mkdir(parents=True)
-    storage = dirty.parent / "storage"
-    storage.mkdir()
-    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=dirty)
-    for name in ("a.txt", "b.txt"):
-        (dirty / name).write_text(f"committed {name}\n", encoding="utf-8")
-        _git("add", name, cwd=dirty)
-    _git("commit", "-q", "-m", "init", cwd=dirty)
-    (dirty / "a.txt").write_text("modified\n", encoding="utf-8")
-    (dirty / "b.txt").write_text("staged\n", encoding="utf-8")
-    _git("add", "b.txt", cwd=dirty)
-    assert _tracks_paths_in_parent((storage / ".git").resolve(), dirty.resolve()) is True
+    primary = git_env / "rule" / "primary"
+    primary.mkdir(parents=True)
+    (primary / "src").mkdir()
+    _git("init", "-q", "-b", "main", cwd=primary)
+    (primary / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    (primary / "src" / "second.txt").write_text("committed\n", encoding="utf-8")
+    _git("add", "tracked.txt", "src/second.txt", cwd=primary)
+    _git("commit", "-q", "-m", "init", cwd=primary)
+    linked = primary.parent / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
 
-    # Every tracked file edited: still the tree (a divergence ratio got this
-    # wrong, and so did the earlier clean-status gate).
-    (dirty / "b.txt").write_text("edited again\n", encoding="utf-8")
-    assert _tracks_paths_in_parent((storage / ".git").resolve(), dirty.resolve()) is True
+    # Uncommitted states that must not change the answer: edited, staged, and a
+    # deleted nested leaf (the ordinary-primary regression).
+    (primary / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    (primary / "src" / "second.txt").unlink()
 
-    # A storage dir *of the same repository* that happens to carry notes under
-    # every tracked name is not rejected by this helper — it holds all the
-    # paths. Content is deliberately not evidence; the gitfile claim is what
-    # refuses storage, and that is asserted by the allocation tests.
-    for name in ("a.txt", "b.txt"):
-        (storage / name).write_text(f"unrelated notes about {name}\n", encoding="utf-8")
-    assert _tracks_paths_in_parent((storage / ".git").resolve(), storage.resolve()) is True
+    seen: list[list[str]] = []
+    real_run = subprocess.run
 
-    # A partial copy is a copy: one path missing is not the tracked tree.
-    (storage / "b.txt").unlink()
-    assert _tracks_paths_in_parent((storage / ".git").resolve(), storage.resolve()) is False
+    def recording_run(cmd, *a, **kw):
+        if isinstance(cmd, (list, tuple)):
+            seen.append([str(part) for part in cmd])
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(worktrees.subprocess, "run", recording_run)
+
+    assert worktrees.find_main_worktree_root(linked) == primary.resolve()
+    queried = [cmd for cmd in seen if any("ls-files" in part for part in cmd)]
+    assert not queried, f"ownership must not read the index: {queried}"
 
 
 def _distant_separate(base):

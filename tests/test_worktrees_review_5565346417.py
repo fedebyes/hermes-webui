@@ -62,9 +62,11 @@ def _stub_agent_setup(monkeypatch, created_root):
 #   3. an OSError/timeout of that optional query escaped `create_worktree_*`;
 #   4. a partial copy in a separate storage dir, after a real `status` refresh
 #      changed the index stat records, *gained* ownership.
-# The owned behaviour is that content is never evidence: ownership comes from
-# the gitfile claim that a storage dir cannot make, plus the presence of the
-# tracked tree. These tests assert allocation, not just the resolver.
+# The owned behaviour is that content is never evidence: ownership comes from the
+# gitfile claim that a storage dir cannot make, or — for a plain repository — from
+# the recorded `<tree>/.git` layout once the claim search has finished. No index
+# query, stat record or per-path existence test takes part. These tests assert
+# allocation, not just the resolver.
 
 
 def _ordinary_primary_single(base):
