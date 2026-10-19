@@ -14443,6 +14443,35 @@ def _run_agent_streaming(
     _last_runtime_model_identity = None
     _runtime_model_session_id = session_id
 
+    def _settle_cancel_after_retry(session, *, ephemeral, stream_id):
+        """Settle a Stop observed after a retry as a cancel, not as its outcome.
+
+        Both retries in this worker (the silent no-response retry and the
+        credential self-heal) run a whole second provider call while the user
+        can still hit Stop. Without this, the stop is only noticed by the
+        pre-retry check (which has already run) and the turn is saved as the
+        retry's answer or its provider error: a cancelled turn that persists a
+        result the user refused, and no terminal ``cancel`` frame reaches the
+        client. The settlement is the same as the pre-retry one so a Stop looks
+        identical wherever it lands.
+        """
+        if session is not None:
+            _finalize_cancelled_turn(session, ephemeral=ephemeral, stream_id=stream_id)
+            if not ephemeral:
+                try:
+                    append_turn_journal_event_for_stream(
+                        session.session_id,
+                        stream_id,
+                        {
+                            "event": "interrupted",
+                            "created_at": time.time(),
+                            "reason": "cancelled",
+                        },
+                    )
+                except Exception:
+                    logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+        put('cancel', _cancel_event_payload('Cancelled by user'))
+
     def _observe_runtime_model():
         """Publish this turn's Agent identity at output, never at an attempted route."""
         nonlocal _last_runtime_model_identity
@@ -17109,23 +17138,9 @@ def _run_agent_streaming(
                                 # must end the turn as a cancel, not be saved as
                                 # the retry's provider error. Same settlement as
                                 # the pre-retry cancel check above.
-                                _finalize_cancelled_turn(
+                                _settle_cancel_after_retry(
                                     s, ephemeral=ephemeral, stream_id=stream_id,
                                 )
-                                if not ephemeral:
-                                    try:
-                                        append_turn_journal_event_for_stream(
-                                            s.session_id,
-                                            stream_id,
-                                            {
-                                                "event": "interrupted",
-                                                "created_at": time.time(),
-                                                "reason": "cancelled",
-                                            },
-                                        )
-                                    except Exception:
-                                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                                put('cancel', _cancel_event_payload('Cancelled by user'))
                                 return
                             # The retry can rotate the session too: it runs
                             # after the pre-request compression migration, so
@@ -18672,6 +18687,16 @@ def _run_agent_streaming(
                             _heal_kwargs2.get("conversation_history") or []
                         )
                         _heal_result = _heal_agent.run_conversation(**_heal_kwargs2)
+                        if cancel_event.is_set():
+                            # A Stop that lands while this retry runs must not
+                            # be saved as the retry's answer: the pre-retry
+                            # cancel checks have already run, so without this
+                            # the turn persists a result the user refused and
+                            # no terminal ``cancel`` frame is emitted.
+                            _settle_cancel_after_retry(
+                                s, ephemeral=ephemeral, stream_id=stream_id,
+                            )
+                            return
                         _remember_pending_steer_result(_heal_result)
                         _active_turn_identity = _resolve_active_turn_authority(
                             _active_turn_identity,

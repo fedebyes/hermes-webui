@@ -903,6 +903,145 @@ def test_stop_during_the_retry_is_saved_as_a_cancel(worker_scene):
     )
 
 
+# ── A Stop that lands after the retry is a cancel, whatever it produced ────
+
+
+def _stop_during_run(scene):
+    """Install the per-stream Stop flag; the caller signals it."""
+
+    stop = threading.Event()
+    config.CANCEL_FLAGS["run"] = stop
+    return stop
+
+
+def test_stop_during_a_retry_that_answers_is_saved_as_a_cancel(worker_scene):
+    """A retry that produced an answer the user stopped must not be persisted.
+
+    The pre-retry check already ran when the user hit Stop, so the answer the
+    retry returned is not the turn's outcome: settlement must be the cancel
+    path (``cancel`` frame, cancelled turn), not a saved answer.
+    """
+    scene = worker_scene
+    stop = _stop_during_run(scene)
+
+    def on_run():
+        if _runs(scene) == 1:
+            scene.result = _silent_result()
+            return
+        stop.set()
+        scene.result = {
+            "messages": [
+                _user_row(),
+                {"role": "assistant", "content": "Answered while stopped."},
+            ],
+        }
+
+    scene.on_run = on_run
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the turn must have reached the retry"
+    emitted = [event for event, _payload in list(scene.events.queue)]
+    assert "cancel" in emitted, "a stopped retry must settle as a cancel"
+    assert "apperror" not in emitted
+    assert "done" not in emitted, (
+        "the retry's answer must not be reported as this turn's result"
+    )
+    assert "Answered while stopped." not in _session_text(scene), (
+        "the cancelled turn must not persist the retry's answer"
+    )
+    assert _error_rows(scene) == []
+
+
+def test_stop_during_a_retry_that_raises_is_saved_as_a_cancel(worker_scene):
+    """Both retry outcomes — returned and raised — settle as a cancel."""
+    scene = worker_scene
+    stop = _stop_during_run(scene)
+
+    def on_run():
+        if _runs(scene) == 1:
+            scene.result = _silent_result()
+            return
+        stop.set()
+        raise RuntimeError("429 rate limit exceeded")
+
+    scene.on_run = on_run
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the turn must have reached the retry"
+    emitted = [event for event, _payload in list(scene.events.queue)]
+    assert "cancel" in emitted
+    assert "apperror" not in emitted, (
+        "a raised retry error is not the outcome of a cancelled turn"
+    )
+    assert _error_rows(scene) == []
+
+
+def test_stop_observed_before_the_retry_settles_as_a_cancel(
+    worker_scene, monkeypatch,
+):
+    """A Stop seen at the failure gate is a cancel, not a second provider call.
+
+    The flag is signalled from inside ``_classify_provider_error``, i.e. after
+    the pre-settlement checks and before the gate's retry branch: no second
+    provider call may be spent on a turn the user has already stopped.
+    """
+    scene = worker_scene
+    stop = _stop_during_run(scene)
+    classify = streaming._classify_provider_error
+
+    def classify_and_stop(*args, **kwargs):
+        stop.set()
+        return classify(*args, **kwargs)
+
+    monkeypatch.setattr(streaming, "_classify_provider_error", classify_and_stop)
+    scene.result = _silent_result()
+
+    scene.run()
+
+    assert _runs(scene) == 1, (
+        "a turn the user stopped must not be retried against the provider"
+    )
+    emitted = [event for event, _payload in list(scene.events.queue)]
+    assert "cancel" in emitted
+    assert "apperror" not in emitted
+
+
+def test_stop_after_a_settled_answer_ends_with_a_cancel_frame(
+    worker_scene, monkeypatch,
+):
+    """The same Stop on the normal path must not end with no terminal frame.
+
+    ``put`` drops every event but ``cancel`` once the flag is set, so a Stop
+    that lands after the pre-settlement checks used to leave the client with no
+    terminal event at all.
+    """
+    scene = worker_scene
+    stop = _stop_during_run(scene)
+    classify = streaming._classify_provider_error
+
+    def classify_and_stop(*args, **kwargs):
+        stop.set()
+        return classify(*args, **kwargs)
+
+    monkeypatch.setattr(streaming, "_classify_provider_error", classify_and_stop)
+    scene.result = {
+        "messages": [
+            _user_row(),
+            {"role": "assistant", "content": "Finished."},
+        ],
+    }
+
+    scene.run()
+
+    emitted = [event for event, _payload in list(scene.events.queue)]
+    assert "cancel" in emitted, (
+        "a stopped turn must terminate with a cancel frame"
+    )
+    assert "done" not in emitted
+
+
 # ── Compression inside the retry is migrated like the first attempt ────────
 
 
