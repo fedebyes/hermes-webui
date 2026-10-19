@@ -12,12 +12,17 @@ WHY THIS EXISTS
   while `documentElement.scrollWidth` stayed 390, so no horizontal scroll could
   recover it. The reviewer reproduced it by hand; this file makes it a gate.
 
-WHAT IT CHECKS, at 390x844 and 360x740
+WHAT IT CHECKS
+  Three viewports (390x844, 360x740, 320x700) x two labels (a ~55-char spaced
+  name and an unbroken one) x two focus paths (a real tap, and Tab from the
+  composer), so twelve cases. For every case:
   - the status row is reachable and focusable while it carries a label;
-  - after a real tap focuses it, the Send button's rect stays fully inside the
-    viewport with its full tap target, for BOTH a spaced name and an unbroken one;
-  - the focused label itself stays inside the viewport (it may wrap, not clip);
-  - an ordinary send still works after the disclosure.
+  - the focused label is actually readable: it wraps inside its own box and
+    nothing is clipped (scrollWidth/scrollHeight fit clientWidth/clientHeight);
+  - the Send button's rect stays fully inside the viewport, keeps its 44x44 tap
+    target, and its centre is hit-testable (nothing overlays it);
+  - the document does not hide the overflow behind an unscrollable clip;
+  - an ordinary send still works: the typed text reaches /api/chat/start.
 
 SCOPE
   Agent-free, like tests/browser_smoke.py: the real server.py on an ephemeral
@@ -32,6 +37,7 @@ EXIT CODES
   1 — a check failed (regression)
   2 — environment/setup failure (server didn't boot, playwright missing, etc.)
 """
+import json
 import os
 import subprocess
 import sys
@@ -48,7 +54,8 @@ SETTLE_SECONDS = 1.2
 LABEL_SPACED = "Production emergency guardrails review staging"
 LABEL_UNBROKEN = "ProductionEmergencyGuardrailsWithoutSpaces" * 3
 
-VIEWPORTS = ((390, 844), (360, 740))
+VIEWPORTS = ((390, 844), (360, 740), (320, 700))
+FOCUS_MODES = ("tap", "tab")
 
 
 def _wait_for_health(timeout=30):
@@ -96,21 +103,53 @@ _MEASURE = """
   const vw = window.innerWidth;
   const r = row ? row.getBoundingClientRect() : null;
   const s = send ? send.getBoundingClientRect() : null;
+  const cs = row ? getComputedStyle(row) : null;
+  let hitSendCentre = null;
+  if (send) {
+    const el = document.elementFromPoint((s.left + s.right) / 2, (s.top + s.bottom) / 2);
+    hitSendCentre = !!(el && (el === send || send.contains(el)));
+  }
   return {
     vw,
-    row: r ? {left: r.left, right: r.right, width: r.width, height: r.height} : null,
+    row: r ? {
+      left: r.left, right: r.right, width: r.width, height: r.height,
+      scrollWidth: row.scrollWidth, clientWidth: row.clientWidth,
+      scrollHeight: row.scrollHeight, clientHeight: row.clientHeight,
+    } : null,
     send: s ? {left: s.left, right: s.right, width: s.width, height: s.height} : null,
+    hitSendCentre,
     docScrollWidth: document.documentElement.scrollWidth,
     focused: document.activeElement === row,
-    focusedStyleMaxWidth: row ? getComputedStyle(row).maxWidth : null,
+    focusedStyleMaxWidth: cs ? cs.maxWidth : null,
+    whiteSpace: cs ? cs.whiteSpace : null,
+    text: row ? row.textContent : null,
   };
 }
 """
 
+_ACTIVE_IS_STATUS = """
+() => {
+  const a = document.activeElement;
+  return !!(a && a.classList && a.classList.contains('composer-status'));
+}
+"""
 
-def _check(browser, width, height, label, label_name):
-    """Return a list of failure lines for one viewport/label pair."""
+
+def _focus_by_tab(page, max_presses=25):
+    """Walk the real tab order from the composer to the status row."""
+    page.click("#msg")
+    for _ in range(max_presses):
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(40)
+        if page.evaluate(_ACTIVE_IS_STATUS):
+            return True
+    return False
+
+
+def _check(browser, width, height, label, label_name, focus_mode):
+    """Return a list of failure lines for one viewport/label/focus-mode case."""
     fails = []
+    tag = f"{width}x{height}/{label_name}/{focus_mode}"
     ctx = browser.new_context(
         viewport={"width": width, "height": height},
         base_url=BASE,
@@ -124,22 +163,28 @@ def _check(browser, width, height, label, label_name):
     page.goto("/", wait_until="domcontentloaded")
     if not page.wait_for_selector("#msg", timeout=15000):
         ctx.close()
-        return [f"  [{width}x{height}/{label_name}] composer never appeared"]
+        return [f"  [{tag}] composer never appeared"]
     if not _wait_until(page, "typeof S !== 'undefined'", 15000):
         ctx.close()
-        return [f"  [{width}x{height}/{label_name}] the app did not initialize"]
+        return [f"  [{tag}] the app did not initialize"]
     time.sleep(SETTLE_SECONDS)
 
-    if page.evaluate(_SET_LABEL, label) != "ok":
-        reason = page.evaluate(_SET_LABEL, label)
+    state = page.evaluate(_SET_LABEL, label)
+    if state != "ok":
         ctx.close()
-        return [f"  [{width}x{height}/{label_name}] could not establish the status label: {reason}"]
+        return [f"  [{tag}] could not establish the status label: {state}"]
 
-    # A real tap on the status row focuses it (the reveal path the report used).
-    try:
-        page.locator(".composer-status").first.tap(timeout=5000)
-    except Exception as exc:  # noqa: BLE001 - report, don't crash the driver
-        fails.append(f"  [{width}x{height}/{label_name}] tap on the status row failed: {exc}")
+    if focus_mode == "tap":
+        # A real tap on the status row focuses it (the reveal path the report used).
+        try:
+            page.locator(".composer-status").first.tap(timeout=5000)
+        except Exception as exc:  # noqa: BLE001 - report, don't crash the driver
+            fails.append(f"  [{tag}] tap on the status row failed: {exc}")
+    else:
+        # The keyboard path a desktop / keyboard user takes. `setComposerStatus`
+        # is what puts the row in the tab order, so this also guards tabIndex.
+        if not _focus_by_tab(page):
+            fails.append(f"  [{tag}] the status row is not reachable with Tab")
     page.wait_for_timeout(250)
 
     geo = page.evaluate(_MEASURE)
@@ -149,54 +194,76 @@ def _check(browser, width, height, label, label_name):
 
     if not geo["focused"]:
         fails.append(
-            f"  [{width}x{height}/{label_name}] the tap did not focus the status row"
+            f"  [{tag}] the row did not receive focus"
             f" (focused={geo['focused']}, applied max-width={geo['focusedStyleMaxWidth']})"
         )
+    else:
+        # The disclosure must actually reveal the label: normal wrapping, and no
+        # content spilling past the box (which `overflow:hidden` would clip).
+        if geo["whiteSpace"] != "normal":
+            fails.append(
+                f"  [{tag}] the focused row still uses white-space={geo['whiteSpace']};"
+                f" the label stays on one clipped line"
+            )
+        if row is not None:
+            if row["scrollWidth"] > row["clientWidth"] + 1:
+                fails.append(
+                    f"  [{tag}] the label is clipped horizontally:"
+                    f" scrollWidth={row['scrollWidth']:.0f} > clientWidth={row['clientWidth']:.0f}"
+                )
+            if row["scrollHeight"] > row["clientHeight"] + 1:
+                fails.append(
+                    f"  [{tag}] the label is clipped vertically:"
+                    f" scrollHeight={row['scrollHeight']:.0f} > clientHeight={row['clientHeight']:.0f}"
+                )
+        if geo["text"] != label:
+            fails.append(f"  [{tag}] the rendered label no longer matches the value")
 
     if send is None:
-        fails.append(f"  [{width}x{height}/{label_name}] Send control not found")
+        fails.append(f"  [{tag}] Send control not found")
     else:
         # Fully inside the viewport, with the mobile 44px tap target intact.
         if send["right"] > vw + 0.5 or send["left"] < -0.5:
+            row_w = row["width"] if row else 0
             fails.append(
-                f"  [{width}x{height}/{label_name}] Send displaced outside the viewport:"
+                f"  [{tag}] Send displaced outside the viewport:"
                 f" x={send['left']:.0f}-{send['right']:.0f}, viewport={vw}px"
-                f" (status row width={row['width']:.0f})"
+                f" (status row width={row_w:.0f})"
             )
         if send["width"] < 43.5 or send["height"] < 43.5:
             fails.append(
-                f"  [{width}x{height}/{label_name}] Send tap target shrank to"
+                f"  [{tag}] Send tap target shrank to"
                 f" {send['width']:.0f}x{send['height']:.0f} (needs >=44x44)"
+            )
+        if geo["hitSendCentre"] is False:
+            fails.append(
+                f"  [{tag}] Send is covered: elementFromPoint at its centre is not the button"
             )
 
     if row is not None and row["right"] > vw + 0.5:
         fails.append(
-            f"  [{width}x{height}/{label_name}] the focused label itself overflows:"
+            f"  [{tag}] the focused label itself overflows:"
             f" right={row['right']:.0f} > viewport={vw}px"
         )
 
     # The document must not be relying on horizontal scroll to hide the problem.
     if geo["docScrollWidth"] > vw + 1:
         fails.append(
-            f"  [{width}x{height}/{label_name}] document scrollWidth={geo['docScrollWidth']}"
+            f"  [{tag}] document scrollWidth={geo['docScrollWidth']}"
             f" exceeds the {vw}px viewport"
         )
 
     # An ordinary send still works after the disclosure. Intercept the POST so
     # the assertion is agent-free and deterministic: send() catches a rejected
-    # request and shows an error bubble WITHOUT raising a page error, so a bare
-    # Enter press can pass while nothing was ever sent.
-    sent = []
+    # request and shows an error bubble WITHOUT raising a page error, so a click
+    # that never reached the server must not pass.
     page.route(
-        "**/api/chat/start",
-        lambda route: (
-            sent.append(route.request.post_data or ""),
-            route.fulfill(
-                status=200,
-                content_type="application/json",
-                body='{"stream_id": "probe", "session_id": "probe"}',
-            ),
-        ) and None,
+        "**/api/chat/start*",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"stream_id": "probe", "session_id": "probe"}',
+        ),
     )
     try:
         page.click("#msg")
@@ -204,32 +271,28 @@ def _check(browser, width, height, label, label_name):
         # Click the real Send control: this build's composer has no Enter
         # handler on #msg, and the button only enables once the input event
         # has run updateSendBtn(), which typing already triggered.
-        page.click("#btnSend")
-        page.wait_for_timeout(600)
+        page.wait_for_selector("#btnSend:not([disabled])", timeout=5000)
+        with page.expect_request(
+            lambda req: "/api/chat/start" in req.url, timeout=10000
+        ) as req_info:
+            page.click("#btnSend")
+        payload = json.loads(req_info.value.post_data or "{}")
     except Exception as exc:  # noqa: BLE001
-        fails.append(f"  [{width}x{height}/{label_name}] send after reveal failed: {exc}")
-    finally:
-        page.unroute("**/api/chat/start")
-
-    if not sent:
         fails.append(
-            f"  [{width}x{height}/{label_name}] Send did not send: no POST to"
-            f" /api/chat/start reached the server"
+            f"  [{tag}] Send did not send: no POST to /api/chat/start"
+            f" reached the server ({type(exc).__name__}: {exc})"
         )
     else:
-        import json as _json
-        try:
-            payload = _json.loads(sent[0])
-        except ValueError:
-            payload = {}
         if payload.get("message") != "hello":
             fails.append(
-                f"  [{width}x{height}/{label_name}] the sent message was not the typed"
-                f" text: {payload.get('message')!r}"
+                f"  [{tag}] the sent message was not the typed text:"
+                f" {payload.get('message')!r}"
             )
+    finally:
+        page.unroute("**/api/chat/start*")
 
     if errors:
-        fails.append(f"  [{width}x{height}/{label_name}] page errors: {errors[:3]}")
+        fails.append(f"  [{tag}] page errors: {errors[:3]}")
 
     ctx.close()
     return fails
@@ -285,8 +348,14 @@ def main():
                 headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
             for width, height in VIEWPORTS:
-                failures.extend(_check(browser, width, height, LABEL_SPACED, "spaced"))
-                failures.extend(_check(browser, width, height, LABEL_UNBROKEN, "unbroken"))
+                for label, label_name in (
+                    (LABEL_SPACED, "spaced"),
+                    (LABEL_UNBROKEN, "unbroken"),
+                ):
+                    for focus_mode in FOCUS_MODES:
+                        failures.extend(
+                            _check(browser, width, height, label, label_name, focus_mode)
+                        )
             browser.close()
 
         if failures:

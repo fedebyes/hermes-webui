@@ -2919,10 +2919,11 @@
      `title` only reaches mouse users. setComposerStatus() marks the row
      focusable while it carries text, so focusing it — Tab, or a tap on a touch
      device — reveals the whole value instead of a cut-off fragment.
-     The disclosure must never win space from the Send control, so the cap is
-     measured against the *composer* (cqw-free: the row is a flex item, and
-     `100%` would resolve against its own grown box, not the available width),
-     and long unbroken tokens break instead of expanding the item. */
+     The disclosure must not win space from Send: the row wraps at 52ch, and
+     `overflow-wrap:anywhere` lets a long unbroken token break, so the flex item
+     has no min-content floor it cannot shrink below. `max-width:100%` on
+     `.composer-right` above bounds the percentage this resolves against to the
+     composer row, never the status text's own intrinsic width. */
   .composer-status:focus{white-space:normal;overflow-wrap:anywhere;word-break:break-word;text-overflow:clip;max-width:min(52ch,100%);}
   /* Context usage indicator */
   .ctx-indicator-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;}
@@ -3445,8 +3446,10 @@
     .composer-divider{display:none;}
     .composer-status{flex:0 1 auto;min-width:0;max-width:96px;font-size:10px;text-align:right;}
     /* On a phone the focused disclosure must share the row with Send, not
-       displace it: the cap is the composer width minus the Send tap target and
-       the row's gaps, and unbroken labels break rather than expand. */
+       displace it. `100%` is the `.composer-right` content box (bounded by
+       `max-width:100%` in the base rule), so the cap subtracts the 44px Send
+       tap target, the 6px row gap and slack for the composer padding: the
+       button can never be pushed past the right edge, at 390px or narrower. */
     .composer-status:focus{max-width:calc(100% - 120px);overflow-wrap:anywhere;word-break:break-word;}
     .send-btn{width:44px;height:44px;}
     .ctx-indicator-wrap{display:none!important;}
