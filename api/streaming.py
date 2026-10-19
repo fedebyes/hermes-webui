@@ -14031,24 +14031,24 @@ def _migrate_compression_rotation(session, agent, session_id, resolved_profile_n
     # Migrate cached agent to the new session ID so the turn count survives
     # context compression.
     from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
-    skipped_agent_migration_entry = None
+    _skipped_agent_migration_entry = None
     with SESSION_AGENT_CACHE_LOCK:
-        cached_entry = SESSION_AGENT_CACHE.pop(old_sid, None)
-        if cached_entry:
-            cached_agent = cached_entry[0]
+        _cached_entry = SESSION_AGENT_CACHE.pop(old_sid, None)
+        if _cached_entry:
+            cached_agent = _cached_entry[0]
             if _cached_agent_matches_session(cached_agent, new_sid):
-                SESSION_AGENT_CACHE[new_sid] = cached_entry
+                SESSION_AGENT_CACHE[new_sid] = _cached_entry
             else:
-                skipped_agent_migration_entry = cached_entry
+                _skipped_agent_migration_entry = _cached_entry
                 logger.warning(
                     '[webui] Skipped cached agent migration with mismatched session identity: old_sid=%s new_sid=%s agent_session_id=%s',
                     old_sid,
                     new_sid,
                     _cached_agent_session_identity(cached_agent),
                 )
-    if skipped_agent_migration_entry is not None:
+    if _skipped_agent_migration_entry is not None:
         try:
-            _close_cached_agent_entry_at_session_boundary(old_sid, skipped_agent_migration_entry)
+            _close_cached_agent_entry_at_session_boundary(old_sid, _skipped_agent_migration_entry)
         except Exception:
             logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
     return old_sid, new_sid, True
@@ -17401,11 +17401,16 @@ def _run_agent_streaming(
                             # without this the turn is saved under the parent
                             # id while the Agent moved on. Applies to the 401
                             # self-heal as well — that retry has the same gap.
+                            # The origin must be the session's CURRENT id, not
+                            # the pre-request one: a first attempt that already
+                            # rotated leaves s.session_id at the continuation, so
+                            # migrating "original" again fails the ownership check
+                            # and raises with the retry's real answer discarded.
                             _compression_origin_session_id, _compression_continuation_session_id, _compression_retry_rotated = (
                                 _migrate_compression_rotation(
                                     s,
                                     agent,
-                                    session_id,
+                                    s.session_id,
                                     _resolved_profile_name,
                                     _agent_lock,
                                 )
