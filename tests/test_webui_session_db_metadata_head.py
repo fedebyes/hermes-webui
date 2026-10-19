@@ -666,3 +666,46 @@ def test_malformed_sidecar_is_skipped(session_store):
     assert DB._read_metadata_row_source(session_store / "broken.json") is None
     rows = DB(session_store).list_sessions()
     assert [row["session_id"] for row in rows] == ["healthy"]
+
+
+def test_head_derived_row_keeps_the_eager_checkpoint_fact(session_store):
+    """A head-derived row must carry the field PR #8368 relies on.
+
+    ``_pending_hidden_wakeup_at`` tells the sidebar that the pending hidden
+    wakeup row was already checkpointed and therefore already excluded from the
+    visible count. ``_metadata_row`` projects an explicit allowlist, so a key
+    added to the payload without being added to that allowlist is silently
+    dropped by every head/budgeted-prefix read - and the sidebar then discounts
+    the hidden row a second time, which is exactly the undercount the field
+    exists to prevent. This pins the two halves together so the allowlist
+    cannot drift from the payload again.
+    """
+    db = DB(session_store)
+    payload = {
+        "session_id": "wakeup",
+        "message_count": 2,
+        "messages": [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
+        "title": "Eager Checkpoint",
+        "pending_user_message": "Do the task.",
+        "pending_started_at": 1234.5,
+        "_pending_hidden_wakeup_at": 1234.5,
+    }
+    db.write_session(payload)
+    path = session_store / "wakeup.json"
+
+    full = db._read_path(path)
+    assert isinstance(full, dict)
+    full_row = db._metadata_row("wakeup", full)
+    assert full_row.get("_pending_hidden_wakeup_at") == 1234.5, (
+        "the full read must expose the fact; without it this test proves nothing"
+    )
+
+    source = db._read_metadata_row_source(path)
+    assert isinstance(source, dict)
+    head_row = db._metadata_row("wakeup", source)
+    assert head_row is not None, "the payload must stay admissible through the head read"
+    assert head_row.get("_pending_hidden_wakeup_at") == 1234.5, (
+        "the head read dropped the eager-checkpoint fact, which reinstates the "
+        "double discount in the sidebar"
+    )
+    assert head_row == full_row, "the head row must equal the full row"
