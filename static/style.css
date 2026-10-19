@@ -5919,7 +5919,7 @@ main.main > #mainPlugin{display:none;}
    glance without relying on the pill alone. Deliberately NOT dimmed like
    `.archived` (storage): a finished row is still normal working history. */
 .session-item.done .session-title{font-weight:400;}
-.session-done-badge{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:color-mix(in srgb,var(--success,#22c55e) 16%,transparent);color:var(--success,#22c55e);margin-left:6px;flex-shrink:0;user-select:none;cursor:default;letter-spacing:.02em;}
+.session-done-badge{display:inline-flex;align-items:center;justify-content:center;height:12px;font-size:9px;font-weight:600;padding:0 4px;border-radius:999px;background:color-mix(in srgb,var(--success,#22c55e) 14%,transparent);color:var(--success,#22c55e);opacity:.75;margin-left:5px;flex-shrink:0;user-select:none;cursor:default;letter-spacing:0;}
 .session-item.active .session-done-badge{background:color-mix(in srgb,var(--success,#22c55e) 26%,transparent);}
 /* Live delegate children: same pill geometry as the done badge (they share the
    title row), but on the info accent so "3 running" is never mistaken for
