@@ -484,7 +484,10 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     worst, but never starts a session inside git's bookkeeping. The one
     documented limit of the search region is that a claim nested deeper than one
     level below an ancestor above the metadata's grandparent is not looked for;
-    see ``_claiming_checkout``.
+    see ``_claiming_checkout``. Because that boundary is a region limit and not a
+    gap, a plain layout is still accepted there: when the workspace is *not*
+    inside the claiming checkout (a session opened on the storage dir itself),
+    the metadata dir may be promoted as the repo root.
     """
     ws = Path(workspace).expanduser().resolve()
     if not ws.is_dir():
@@ -833,7 +836,10 @@ def _topology_candidate(
     directories outside this candidate (``<base>/node_modules/…``,
     ``<base>/vendor/otherrepo/…``), the answer is ``None``. Unknown ownership
     stays unknown, and the caller keeps the checkout it has: nesting at worst,
-    never a session inside git's bookkeeping.
+    never a session inside git's bookkeeping. The exception is the documented
+    search-region boundary (see ``find_main_worktree_root``): a claim that lives
+    beyond the region is not a gap, so the plain layout is accepted there while
+    the workspace is not inside the claiming checkout.
     """
     recorded = _core_worktree(common_path)
     if recorded is not None:
