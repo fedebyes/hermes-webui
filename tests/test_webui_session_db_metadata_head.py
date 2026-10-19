@@ -127,6 +127,8 @@ def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypat
     payload = {
         "session_id": "fat",
         "title": "Fat Prefix",
+        "workspace": "/tmp/fat",
+        "model": "test-model",
         "created_at": 100.0,
         "updated_at": 200.0,
         "compression_anchor_summary": "S" * (DB._METADATA_HEAD_BYTES + 16 * 1024),
@@ -134,6 +136,11 @@ def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypat
         "_mc_v": models._MESSAGE_COUNT_MARKER,
         "_row_layout": models._ROW_LAYOUT_VERSION,
         "anchor_scene_index": {},
+        "archived": False,
+        "profile": "default",
+        "pinned": False,
+        "raw_source": "webui",
+        "source_label": "WebUI",
         "messages": [{"role": "user", "content": "hi"}] * 3,
     }
     path = session_store / "fat.json"
@@ -153,7 +160,14 @@ def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypat
 
 
 def test_compact_sidecar_of_the_writer_contract_is_read_from_the_head(session_store):
-    """Key layout, not whitespace, decides: a marked compact head still cuts."""
+    """Key layout, not whitespace, decides: a marked compact head still cuts.
+
+    The head must physically show every projected key ahead of the cut, so this
+    payload carries the fields ``Session.save`` writes ahead of ``messages``. The
+    compact separators (no indentation) are the only difference from the real
+    layout: the cut is found by key position, not by the ``\\n  "messages":``
+    indented form.
+    """
     session = models.Session(
         session_id="compact",
         title="Compact",
@@ -164,14 +178,20 @@ def test_compact_sidecar_of_the_writer_contract_is_read_from_the_head(session_st
     payload = {
         "session_id": "compact",
         "title": "Compact",
+        "workspace": str(session_store.parent),
+        "model": "test-model",
         "created_at": 100.0,
+        "updated_at": 200.0,
         "message_count": 2,
         "_mc_v": models._MESSAGE_COUNT_MARKER,
         "_row_layout": models._ROW_LAYOUT_VERSION,
         "anchor_scene_index": {},
-        "messages": session.messages,
         "archived": False,
         "profile": "default",
+        "pinned": False,
+        "raw_source": "webui",
+        "source_label": "WebUI",
+        "messages": session.messages,
     }
     path = session_store / "compact.json"
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -181,6 +201,40 @@ def test_compact_sidecar_of_the_writer_contract_is_read_from_the_head(session_st
     assert "messages" not in source
     assert source["title"] == "Compact"
     assert DB._metadata_row("compact", source)["message_count"] == 2
+
+
+def test_marker_without_the_projected_keys_is_not_admitted(session_store):
+    """A marker alone must not admit a cut: the head has to show the keys.
+
+    ``write_session()`` can preserve a ``_row_layout`` it did not mint, and a
+    caller can serialize title/profile/archived after ``messages``. Admission
+    therefore requires the marker AND every projected key ahead of the cut.
+    """
+    payload = {
+        "session_id": "marker-only",
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "message_count": 2,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "_row_layout": models._ROW_LAYOUT_VERSION,
+        "messages": [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
+        "title": "Marker Only",
+        "profile": "work",
+        "archived": True,
+        "pinned": False,
+        "raw_source": "telegram",
+        "source_label": "Telegram",
+    }
+    path = session_store / "marker-only.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert DB._read_metadata_head(path) is None
+    source = DB._read_metadata_row_source(path)
+    assert isinstance(source, dict)
+    assert source["title"] == "Marker Only"
+    assert source["profile"] == "work"
+    assert source["archived"] is True
+    assert source["raw_source"] == "telegram"
 
 
 def test_messages_before_metadata_takes_the_full_read(session_store):
@@ -254,7 +308,12 @@ def _reorder_real_writer_payload(session_store, sid, *, keep_anchor_scene_index)
 
     Mirrors the review probe: the count marker, the timestamps and (optionally)
     ``anchor_scene_index`` are retained, only the projected metadata order
-    changes. Returns the sidecar path and the payload that was written.
+    changes. **Every other key of the real payload is carried over as well** --
+    including ``_row_layout`` -- because the round trip must replay what the
+    writer actually produced. Dropping the marker while building the input would
+    test a payload the reproduction never used, and would hide the case where a
+    generic writer preserves a marker it did not mint. Returns the sidecar path
+    and the payload that was written.
     """
     session = models.Session(
         session_id=sid,
@@ -272,19 +331,32 @@ def _reorder_real_writer_payload(session_store, sid, *, keep_anchor_scene_index)
     real = json.loads((session_store / f"{sid}.json").read_text(encoding="utf-8"))
     assert real["_row_layout"] == models._ROW_LAYOUT_VERSION
 
-    reordered = {
-        "session_id": sid,
-        "message_count": real["message_count"],
-        "_mc_v": real["_mc_v"],
-        "updated_at": real["updated_at"],
-        "created_at": real["created_at"],
-    }
-    if keep_anchor_scene_index:
-        reordered["anchor_scene_index"] = real.get("anchor_scene_index", {})
+    # Carry every actual key of the writer payload, then re-position only the
+    # projected ones after ``messages``. Nothing is dropped implicitly.
+    reordered = {key: value for key, value in real.items() if key != "messages"}
+    reordered.pop("tool_calls", None)
+    reordered.pop("anchor_activity_scenes", None)
+    if not keep_anchor_scene_index:
+        reordered.pop("anchor_scene_index", None)
     reordered["messages"] = real["messages"]
-    for field in ("title", "profile", "archived", "pinned", "raw_source", "source_label"):
-        reordered[field] = real[field]
-    DB(session_store).write_session(reordered)
+    for field in (
+        "title",
+        "profile",
+        "archived",
+        "pinned",
+        "raw_source",
+        "source_label",
+        "workspace",
+        "model",
+        "session_source",
+    ):
+        if field in real:
+            reordered[field] = real[field]
+    written = DB(session_store).write_session(reordered)
+    # ``write_session`` rewrites the caller's order verbatim, so it cannot vouch
+    # for the layout marker: it must retire it rather than pass it through.
+    assert "_row_layout" not in written
+    assert "_row_layout" not in json.loads((session_store / f"{sid}.json").read_text(encoding="utf-8"))
     return session_store / f"{sid}.json", real
 
 

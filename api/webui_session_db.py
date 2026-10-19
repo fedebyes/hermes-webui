@@ -29,6 +29,30 @@ import api.models as models
 _ROW_LAYOUT_KEY = "_row_layout"
 _ROW_LAYOUT_MARKER = f'"{_ROW_LAYOUT_KEY}"'
 
+#: Keys a cut prefix must physically expose before ``messages``. Not every key
+#: a row can carry is always persisted: a payload legitimately omits the
+#: optional ones (``created_workspace``, token counters, worktree fields...). So
+#: admission requires the keys that make a row honest plus the six projected
+#: fields whose loss has been measured -- ``title``/``profile``/``archived``/
+#: ``pinned``/``raw_source``/``source_label`` -- alongside the ordering values
+#: and the count. A missing optional field is absent in the full read too, so it
+#: cannot make the prefix and the full row disagree; a missing *required* one is
+#: exactly the silent truncation this gate exists to prevent.
+_PROJECTED_FIELDS = frozenset(
+    {
+        "session_id",
+        "title",
+        "created_at",
+        "updated_at",
+        "message_count",
+        "profile",
+        "archived",
+        "pinned",
+        "raw_source",
+        "source_label",
+    }
+)
+
 
 def _head_shows_metadata_first(head: bytes) -> bool:
     """True when the head bytes prove every projected field precedes ``messages``.
@@ -38,11 +62,24 @@ def _head_shows_metadata_first(head: bytes) -> bool:
     ahead of ``messages`` carries ``_row_layout`` before that key. Nothing else
     proves it -- ``anchor_scene_index``/``_mc_v`` only vouch for the count and
     the fingerprint, not for the position of the remaining projected fields.
+
+    The marker states the contract, it does not enforce it: a writer that
+    preserves the caller's order (``write_session``) can carry a marker it did
+    not produce. So the head must ALSO physically show every projected key ahead
+    of the cut. Any field that is only discovered after the read cannot be
+    recovered from a prefix, and serving the prefix would drop it from the row.
     """
     cut = _metadata_cut_offset(head)
     if cut < 0:
         return False
-    return _ROW_LAYOUT_MARKER.encode("ascii") in head[:cut]
+    prefix = head[:cut]
+    if _ROW_LAYOUT_MARKER.encode("ascii") not in prefix:
+        return False
+    return all(
+        f'"{field}"'.encode("ascii") in prefix
+        for field in _PROJECTED_FIELDS
+        if field != "message_count"
+    )
 
 
 def _metadata_cut_offset(head: bytes) -> int:
@@ -68,6 +105,19 @@ def _has_complete_row_layout(data: Any) -> bool:
         and data.get("_mc_v") == models._MESSAGE_COUNT_MARKER
         and isinstance(data.get("message_count"), int)
     )
+
+
+def _prefix_covers_projected_fields(data: Any) -> bool:
+    """True when an already-parsed prefix physically holds every projected key.
+
+    Companion to ``_has_complete_row_layout`` for the budgeted fallback, which
+    parses a window of bytes rather than a head: the marker only *states* the
+    contract, so a prefix parsed from a document whose caller-supplied order put
+    metadata after ``messages`` must not be admitted on the marker alone.
+    """
+    if not isinstance(data, dict):
+        return False
+    return all(field in data for field in _PROJECTED_FIELDS if field != "message_count")
 
 
 _METADATA_FIELDS = frozenset({
@@ -216,6 +266,15 @@ class WebUIJsonSessionDB:
         if not isinstance(messages, list):
             raise ValueError("session payload must include a messages list")
         payload = copy.deepcopy(session)
+        # This writer normalizes only ``message_count``: it deep-copies the
+        # caller dict and rewrites it verbatim, so every other metadata key keeps
+        # the caller's position and can land after ``messages``. The layout
+        # marker promises that ALL projected keys precede the cut, so a marker
+        # inherited from the input would vouch for a layout this writer did not
+        # produce -- measured: a reordered payload carrying the marker lost
+        # title/profile/archived/pinned/raw_source/source_label from the row.
+        # Minting it here would be equally wrong, so the marker is retired.
+        payload.pop(_ROW_LAYOUT_KEY, None)
         payload["message_count"] = len(messages)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._atomic_write(path, payload)
@@ -346,7 +405,12 @@ class WebUIJsonSessionDB:
                 and _ROW_FIELDS.issubset(fallback)
             ):
                 data = fallback
-        if isinstance(data, dict) and _has_complete_row_layout(data) and "messages" not in data:
+        if (
+            isinstance(data, dict)
+            and _has_complete_row_layout(data)
+            and "messages" not in data
+            and _prefix_covers_projected_fields(data)
+        ):
             return data
         # Unmarked, incomplete or ambiguous layout: the full reader is the only
         # one that sees every field regardless of key order.
