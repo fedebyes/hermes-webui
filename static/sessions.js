@@ -10656,15 +10656,10 @@ function renderSessionListFromCache(){
     // this renderer gets sliced by browser tests that extract fragments from
     // the middle of the function, and a helper declared above the slice would
     // be out of scope in their page context.
-    if(s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''){
-      const doneEl=document.createElement('span');
-      doneEl.className='session-done-badge';
-      const doneLabel=t('session_done_badge');
-      doneEl.textContent=doneLabel;
-      const doneMs=Number(s.done_at)*1000;
-      doneEl.title=t('session_done_tooltip', _formatRelativeSessionTime(doneMs));
-      titleRow.appendChild(doneEl);
-    }
+    // Done is rendered as the resting check in the state-indicator slot (see
+    // the `is-done` class below), not as a text pill beside the title: the pill
+    // competed with the live-subagent badge for the same row and was the noisy
+    // half of the marker. The timestamp tooltip still explains the flag.
     // Live subagent marker: `_live_subagent_count` is the number of delegate
     // children the runner still has open for this conversation, read from
     // GET /api/subagents/live (state.db `source='subagent' AND ended_at IS NULL`).
@@ -11105,7 +11100,14 @@ function renderSessionListFromCache(){
     el.appendChild(sessionText);
     const state=document.createElement('span');
     const attentionDotClass=attention?(attention.kind==='approval'?' is-attention-approval':(attention.kind==='clarify'?' is-attention-clarify':' is-attention-generic')):'';
-    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''))+attentionDotClass;
+    // Done is a RESTING state: a finished conversation with nothing live and
+    // nothing asking for attention shows a check instead of the empty slot.
+    // Live signals always win — a streaming or attention row must never be
+    // mistaken for a closed one, so `is-done` is only applied when the row has
+    // no state class of its own.
+    const _hasLiveState=isStreaming||hasUnread||!!attention;
+    const _isDone=!!s.done_at&&!_hasLiveState;
+    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''))+attentionDotClass+(_isDone?' is-done':'');
     state.setAttribute('aria-hidden','true');
     // Tooltip precedence: a localized attention title (pending approval/clarify,
     // from the attention-indicator feature) is more specific and actionable than
@@ -11114,6 +11116,7 @@ function renderSessionListFromCache(){
     // non-empty — never blank an otherwise-meaningful tooltip.
     const _stateTip=_sessionStateTooltip({isStreaming,hasUnread});
     if(attention&&attention.title) state.title=attention.title;
+    else if(_isDone) state.title=t('session_done_tooltip', _formatRelativeSessionTime(Number(s.done_at)*1000));
     else if(_stateTip) state.title=_stateTip;
     el.appendChild(state);
     // Single trigger button that opens a shared dropdown menu
