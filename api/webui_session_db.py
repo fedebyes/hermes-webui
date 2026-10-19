@@ -266,19 +266,47 @@ class WebUIJsonSessionDB:
         if not isinstance(messages, list):
             raise ValueError("session payload must include a messages list")
         payload = copy.deepcopy(session)
-        # This writer normalizes only ``message_count``: it deep-copies the
-        # caller dict and rewrites it verbatim, so every other metadata key keeps
-        # the caller's position and can land after ``messages``. The layout
-        # marker promises that ALL projected keys precede the cut, so a marker
-        # inherited from the input would vouch for a layout this writer did not
-        # produce -- measured: a reordered payload carrying the marker lost
-        # title/profile/archived/pinned/raw_source/source_label from the row.
-        # Minting it here would be equally wrong, so the marker is retired.
+        # This writer normalizes ``message_count`` and the projected layout only:
+        # it deep-copies the caller dict, then moves every key the row reader
+        # projects ahead of ``messages`` in the order ``Session.save`` uses for
+        # them. The layout marker promises that ALL projected keys precede the
+        # cut, so a marker inherited from the input would vouch for a layout this
+        # writer did not produce -- measured: a reordered payload carrying the
+        # marker lost title/profile/archived/pinned/raw_source/source_label from
+        # the row. Minting it here would be equally wrong, because the caller's
+        # remaining keys keep their order, so the marker is retired. Callers that
+        # normalize the complete layout themselves (``Session.save``) keep their
+        # own marker.
         payload.pop(_ROW_LAYOUT_KEY, None)
         payload["message_count"] = len(messages)
+        payload = self._normalize_row_layout(payload)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._atomic_write(path, payload)
         return copy.deepcopy(payload)
+
+    def _normalize_row_layout(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Re-emit every projected key ahead of ``messages``, caller order kept.
+
+        ``write_session`` copies the caller's dict, so a payload can serialize
+        the six projected fields after ``messages``. Moving them ahead (and
+        ``messages`` after them) makes the ``Session.save`` ordering contract
+        true for this writer's own output, so the full reader sees the same
+        values either way and a future reader cannot cut the fields away.
+        ``message_count`` keeps its value; only its position moves with the
+        ordering values.
+        """
+        if "messages" not in payload:
+            return payload
+        head: dict[str, Any] = {}
+        tail: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in _PROJECTED_FIELDS or key == _ROW_LAYOUT_KEY:
+                head[key] = value
+            else:
+                tail[key] = value
+        ordered = dict(head)
+        ordered.update(tail)
+        return ordered
 
     def _path_for_sid(self, sid: str) -> Path | None:
         if not models.is_safe_session_id(sid):

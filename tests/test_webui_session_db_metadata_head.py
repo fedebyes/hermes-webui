@@ -302,6 +302,54 @@ def test_write_session_round_trip_keeps_metadata_after_messages(session_store):
     assert row["message_count"] == 2
 
 
+def test_write_session_normalizes_projected_keys_ahead_of_messages(session_store):
+    """The generic writer now emits the ordering it retires the marker for.
+
+    Retiring ``_row_layout`` keeps the row correct, but it also means a sidecar
+    this writer produced can only be served from the head once the projected
+    keys really precede ``messages``. They do: the writer re-emits them ahead of
+    the transcript, so the full read and the head agree.
+    """
+    db = DB(session_store)
+    messages = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}]
+    payload = {
+        "session_id": "ordered",
+        "messages": messages,
+        "title": "Ordered",
+        "profile": "work",
+        "archived": True,
+        "pinned": True,
+        "raw_source": "telegram",
+        "source_label": "Telegram",
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "message_count": 1,
+    }
+    written = db.write_session(payload)
+
+    keys = list(written)
+    assert keys.index("messages") > max(keys.index(field) for field in (
+        "session_id", "title", "created_at", "updated_at", "message_count",
+        "profile", "archived", "pinned", "raw_source", "source_label",
+    ))
+    assert written["message_count"] == 2
+    assert written["messages"] == messages
+
+    # A hand-written marker on a payload this writer reordered is retired, so no
+    # prefix can be admitted on a promise the writer did not make.
+    db.write_session({**written, "_row_layout": models._ROW_LAYOUT_VERSION})
+    stored = json.loads((session_store / "ordered.json").read_text(encoding="utf-8"))
+    assert "_row_layout" not in stored
+
+    row = db.list_sessions()[0]
+    full = db._read_path(session_store / "ordered.json")
+    assert isinstance(full, dict)
+    assert db._metadata_row("ordered", stored) == db._metadata_row("ordered", full)
+    assert row["title"] == "Ordered"
+    assert row["raw_source"] == "telegram"
+    assert row["message_count"] == 2
+
+
 def _reorder_real_writer_payload(session_store, sid, *, keep_anchor_scene_index):
     """Persist a real writer payload, then replay it through ``write_session()``
     with every projected field moved AFTER ``messages``.
