@@ -745,3 +745,184 @@ def test_inside_and_outside_the_search_boundary(git_env):
             assert root == checkout.resolve(), "inside the bound the primary is found"
         else:
             assert root in (None, checkout.resolve())
+
+
+# --- Scope-aware claim search: a skipped directory is not a complete search ---
+#
+# The reviewer's residual: the claim search treated every stop as a finished
+# search, so ``<base>/storage/.git`` was promoted to a checkout whenever the
+# real checkout sat behind one — under ``node_modules``, inside another
+# repository, or one level above the level the ancestor walk stopped at. A skip
+# is only sound when it lies *inside* the plain candidate itself; anything the
+# search skipped outside the candidate leaves ownership unknown, and a gitfile
+# found by the one-level probe or the ancestor probe is answered positively.
+
+
+def _separate_git_dir_checkout(base, checkout, metadata):
+    """``git init --separate-git-dir=<metadata>/.git <checkout>`` with one commit."""
+    checkout.mkdir(parents=True)
+    metadata.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={metadata / '.git'}", cwd=checkout)
+    (checkout / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    _git("add", "tracked.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    return checkout
+
+
+@pytest.mark.parametrize("skipped", ["node_modules", ".venv", "site-packages"])
+def test_checkout_under_a_skipped_directory_is_unknown_not_storage(
+    git_env, monkeypatch, skipped
+):
+    """A checkout inside a skipped dir makes the plain layout unknown.
+
+    The metadata is ``<base>/storage/.git``; the real checkout is
+    ``<base>/<skipped>/pkg/checkout``. Skipping ``<skipped>`` is a deliberate
+    cost decision, but it hides the claim, so the search is *not* complete and
+    the metadata's parent must never be crowned. The allocation control then
+    keeps the caller's own checkout.
+    """
+    base = git_env / f"skipped-{skipped.strip('.')}"
+    storage = base / "storage"
+    checkout = _separate_git_dir_checkout(
+        base, base / skipped / "pkg" / "checkout", storage
+    )
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "linked", str(linked), cwd=checkout)
+
+    find = _import()
+    for workspace in (linked, checkout):
+        root = find(workspace)
+        assert root != storage.resolve(), f"{workspace}: storage must never be answered"
+
+    assert find(linked) is None, "a skip outside the candidate is unknown ownership"
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(linked)
+    repo_root = Path(seen["repo_root"]).resolve()
+    assert repo_root != storage.resolve()
+    assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
+
+
+def test_checkout_zero_colliding_content_still_unknown_not_storage(git_env):
+    """Same layout with nothing in common between storage and the checkout.
+
+    Pins the layout rule to the *skip*, not to any content coincidence: with no
+    colliding file at all the answer must still refuse storage.
+    """
+    base = git_env / "skipped-empty"
+    storage = base / "storage"
+    checkout = _separate_git_dir_checkout(
+        base, base / "node_modules" / "pkg" / "checkout", storage
+    )
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "linked", str(linked), cwd=checkout)
+
+    assert list(storage.iterdir()) == [storage / ".git"]
+    find = _import()
+    assert find(linked) is None
+    assert find(linked) != storage.resolve()
+
+
+def test_checkout_nested_in_another_repository_is_answered(git_env):
+    """A checkout one level inside another repo still claims the metadata.
+
+    ``<base>/vendor/otherrepo/checkout`` is a working tree of the separate
+    metadata. The search does not descend into ``otherrepo``, so it probes one
+    level: the claim is positive evidence and wins over the plain layout.
+    """
+    base = git_env / "nested-repo"
+    other = base / "vendor" / "otherrepo"
+    other.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", cwd=other)
+    (other / "README.md").write_text("other\n", encoding="utf-8")
+    _git("add", "README.md", cwd=other)
+    _git("commit", "-q", "-m", "init", cwd=other)
+
+    storage = base / "storage"
+    checkout = _separate_git_dir_checkout(base, other / "checkout", storage)
+    linked = checkout / "linked-wt"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+
+    find = _import()
+    assert find(linked) == checkout.resolve()
+    assert find(linked) != storage.resolve()
+
+
+def test_primary_above_the_metadata_grandparent_is_answered(git_env, monkeypatch):
+    """The checkout may sit above the directory holding the metadata.
+
+    ``work/sub/storage/.git`` with the checkout at ``work/primary``: the old
+    ancestor bound stopped at ``work/sub``, so the search never saw the claim
+    and crowned storage. The ancestor probe reaches ``work``.
+    """
+    base = git_env / "above-bound"
+    storage = base / "sub" / "storage"
+    storage.mkdir(parents=True)
+    checkout = base / "primary"
+    checkout.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    (checkout / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    _git("add", "tracked.txt", cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "linked", str(linked), cwd=checkout)
+
+    find = _import()
+    assert find(linked) == checkout.resolve()
+    assert find(linked) != storage.resolve()
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(linked)
+    assert Path(seen["repo_root"]).resolve() == checkout.resolve()
+    assert Path(info["path"]).resolve().is_relative_to(checkout.resolve())
+
+
+def test_plain_repo_keeps_resolving_beside_skips_and_other_repos(git_env):
+    """The positive the scope rule must not lose.
+
+    An ordinary repository resolves even when its own ``node_modules`` and a
+    sibling checkout of another repository sit in the searched levels: those
+    stops are inside the candidate, or answered as complete by the probe.
+    """
+    base = git_env / "plain-neighbourhood"
+    sibling = _init_repo(base / "sibling")
+    primary = base / "primary"
+    primary.mkdir()
+    _git("init", "-q", "-b", "main", cwd=primary)
+    (primary / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    _git("add", "tracked.txt", cwd=primary)
+    _git("commit", "-q", "-m", "init", cwd=primary)
+    (primary / "node_modules" / "dep").mkdir(parents=True)
+    (primary / ".tox").mkdir()
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
+    # The same skips in the *session* tree, which is where a workspace really
+    # lands when the UI restores a session inside its own dependencies.
+    (linked / "node_modules" / "dep").mkdir(parents=True)
+
+    assert sibling.exists()
+    find = _import()
+    assert find(primary) == primary.resolve()
+    assert find(linked) == primary.resolve()
+    assert find(linked / "node_modules" / "dep") == primary.resolve()
+
+
+def test_plain_repo_deep_under_home_like_nesting_resolves(git_env):
+    """A plain repository many levels down still resolves its own root.
+
+    The ancestor probe walks to the filesystem root, so nesting depth is not
+    what makes ownership unknown.
+    """
+    primary = _init_repo(git_env / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "primary")
+    linked = git_env / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
+
+    find = _import()
+    assert find(linked) == primary.resolve()
+
