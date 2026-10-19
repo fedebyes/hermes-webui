@@ -13775,6 +13775,63 @@ def _close_cached_agent_entry_at_session_boundary(session_id: str, cache_entry) 
     return _close_evicted_agent_at_session_boundary(session_id, agent)
 
 
+def _migrate_compression_rotation(session, agent, session_id, resolved_profile_name, agent_lock):
+    """Move the turn's ownership and cached agent onto a compression continuation.
+
+    Returns ``(origin_session_id, continuation_session_id, rotated)``. Called once
+    after the turn's own ``run_conversation`` and again after a self-heal retry,
+    which runs after the first migration and can rotate the session a second time.
+    When nothing rotated the origin/continuation are returned unchanged so the
+    caller can assign them unconditionally.
+    """
+    agent_sid = getattr(agent, 'session_id', None)
+    if not agent_sid or agent_sid == session_id:
+        return session_id, None, False
+    old_sid = session_id
+    new_sid = agent_sid
+    pre_migration_profile = session.profile
+    # Carry profile identity across the compression boundary. Without this,
+    # session.profile stays None on the continuation session, and the next
+    # request falls back to the default profile's HERMES_HOME: memory writes
+    # land in the wrong profile's MEMORY.md. Stamping also persists a non-null
+    # profile field to the continuation session's JSON file.
+    if not session.profile and resolved_profile_name:
+        session.profile = resolved_profile_name
+        logger.info(
+            "Stamped profile=%r on continuation session %s after compression",
+            resolved_profile_name, new_sid,
+        )
+    if not _migrate_compression_session_ownership(session, old_sid, new_sid, agent_lock):
+        session.profile = pre_migration_profile
+        raise RuntimeError(
+            f"Failed to migrate compressed-session ownership: {old_sid}->{new_sid}",
+        )
+    # Migrate cached agent to the new session ID so the turn count survives
+    # context compression.
+    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+    skipped_agent_migration_entry = None
+    with SESSION_AGENT_CACHE_LOCK:
+        cached_entry = SESSION_AGENT_CACHE.pop(old_sid, None)
+        if cached_entry:
+            cached_agent = cached_entry[0]
+            if _cached_agent_matches_session(cached_agent, new_sid):
+                SESSION_AGENT_CACHE[new_sid] = cached_entry
+            else:
+                skipped_agent_migration_entry = cached_entry
+                logger.warning(
+                    '[webui] Skipped cached agent migration with mismatched session identity: old_sid=%s new_sid=%s agent_session_id=%s',
+                    old_sid,
+                    new_sid,
+                    _cached_agent_session_identity(cached_agent),
+                )
+    if skipped_agent_migration_entry is not None:
+        try:
+            _close_cached_agent_entry_at_session_boundary(old_sid, skipped_agent_migration_entry)
+        except Exception:
+            logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
+    return old_sid, new_sid, True
+
+
 def _refresh_cached_agent_runtime(agent, agent_kwargs: dict) -> bool:
     """Refresh volatile runtime credentials on a reused cached AIAgent.
 
@@ -16574,56 +16631,17 @@ def _run_agent_streaming(
                 _agent_sid = getattr(agent, 'session_id', None)
                 _compressed = False
                 if _agent_sid and _agent_sid != session_id:
-                    old_sid = session_id
-                    new_sid = _agent_sid
-                    _compression_origin_session_id = old_sid
-                    _compression_continuation_session_id = new_sid
-                    _pre_migration_profile = s.profile
-                    # Carry profile identity across the compression boundary.
-                    # Without this, s.profile stays None on the continuation
-                    # session. On the next request, _run_agent_streaming calls
-                    # get_hermes_home_for_profile(getattr(s, 'profile', None))
-                    # which falls back to the default profile's HERMES_HOME.
-                    # Memory writes then land in the wrong profile's MEMORY.md.
-                    # Stamping here also ensures s.save() persists a non-null
-                    # profile field to the continuation session's JSON file,
-                    # covering the case where the session is later evicted from
-                    # SESSIONS and reconstructed from disk via Session.load().
-                    if not s.profile and _resolved_profile_name:
-                        s.profile = _resolved_profile_name
-                        logger.info(
-                            "Stamped profile=%r on continuation session %s after compression",
-                            _resolved_profile_name, new_sid,
-                        )
-                    if not _migrate_compression_session_ownership(s, old_sid, new_sid, _agent_lock):
-                        s.profile = _pre_migration_profile
-                        raise RuntimeError(
-                            f"Failed to migrate compressed-session ownership: {old_sid}->{new_sid}",
-                        )
-                    # Migrate cached agent to the new session ID so the turn
-                    # count survives context compression.
-                    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
-                    _skipped_agent_migration_entry = None
-                    with SESSION_AGENT_CACHE_LOCK:
-                        _cached_entry = SESSION_AGENT_CACHE.pop(old_sid, None)
-                        if _cached_entry:
-                            _cached_agent = _cached_entry[0]
-                            if _cached_agent_matches_session(_cached_agent, new_sid):
-                                SESSION_AGENT_CACHE[new_sid] = _cached_entry
-                            else:
-                                _skipped_agent_migration_entry = _cached_entry
-                                logger.warning(
-                                    '[webui] Skipped cached agent migration with mismatched session identity: old_sid=%s new_sid=%s agent_session_id=%s',
-                                    old_sid,
-                                    new_sid,
-                                    _cached_agent_session_identity(_cached_agent),
-                                )
-                    if _skipped_agent_migration_entry is not None:
-                        try:
-                            _close_cached_agent_entry_at_session_boundary(old_sid, _skipped_agent_migration_entry)
-                        except Exception:
-                            logger.debug("Failed to close skipped compression-migration cached agent for session %s", old_sid, exc_info=True)
-                    _compressed = True
+                    (
+                        _compression_origin_session_id,
+                        _compression_continuation_session_id,
+                        _compressed,
+                    ) = _migrate_compression_rotation(
+                        s,
+                        agent,
+                        session_id,
+                        _resolved_profile_name,
+                        _agent_lock,
+                    )
 
                 # ── Detect silent agent failure (no assistant reply produced) ──
                 # When the agent catches an auth/network error internally it may return
@@ -16643,6 +16661,11 @@ def _run_agent_streaming(
                     _previous_context_messages,
                     msg_text,
                 )
+                # A dropped reply (settlement discards a text that repeats an
+                # earlier one) is still an answer the provider produced: the
+                # activity guard below must not treat this turn as silent and
+                # replay it against the provider.
+                _result_carried_current_reply = bool(_assistant_added)
                 _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
                 # #5940: if the Agent aborted on a non-retryable provider error
                 # (captured from its lifecycle status_callback) but left no error on
@@ -16749,7 +16772,9 @@ def _run_agent_streaming(
                     # and must not be replayed.
                     _is_silent_no_response = _should_retry_silent_failure(
                         last_err=_last_err,
-                        assistant_added=_assistant_added,
+                        assistant_added=(
+                            _assistant_added or _result_carried_current_reply
+                        ),
                         token_sent=_token_sent,
                         error_type=_classification['type'],
                         tool_activity=(
@@ -16780,7 +16805,7 @@ def _run_agent_streaming(
                         echoed_context=not _current_turn_produced_a_row(
                             _previous_context_messages, _all_result_messages,
                         ),
-                        retry_enabled=_silent_retry_enabled(),
+                        retry_enabled=_silent_retry_enabled(_cfg),
                     )
                     if _is_quota:
                         _err_label = _classification['label']
@@ -16902,7 +16927,55 @@ def _run_agent_streaming(
                                 _agent_kwargs['acp_args'] = _runtime_bundle['acp_args']
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
+                            _replaced_agent = agent
                             agent = _AIAgent(**_agent_kwargs)
+                            if _is_silent_no_response and _replaced_agent is not None:
+                                # A fresh agent starts its usage counters at
+                                # zero, and the per-turn writeback then saves
+                                # them as the session totals. Seed them from the
+                                # agent this turn already spent tokens on: the
+                                # installed Agent accumulates with ``+=``, so
+                                # the carried totals keep growing.
+                                for _usage_attr in (
+                                    'session_prompt_tokens',
+                                    'session_completion_tokens',
+                                    'session_cache_read_tokens',
+                                    'session_cache_write_tokens',
+                                    'session_estimated_cost_usd',
+                                ):
+                                    _carried_usage = getattr(
+                                        _replaced_agent, _usage_attr, None,
+                                    )
+                                    if _carried_usage is not None:
+                                        setattr(agent, _usage_attr, _carried_usage)
+                                # The replaced agent has left the cache
+                                # (overwritten below); close it so its
+                                # resources are not leaked like the 401 path
+                                # already does for its own replacement.
+                                from api.config import (
+                                    SESSION_AGENT_CACHE as _SAC,
+                                    SESSION_AGENT_CACHE_LOCK as _SAC_LOCK,
+                                )
+                                with _SAC_LOCK:
+                                    _replaced_entry = _SAC.get(session_id)
+                                    if (
+                                        _replaced_entry is not None
+                                        and _replaced_entry[0] is _replaced_agent
+                                    ):
+                                        _SAC.pop(session_id, None)
+                                    else:
+                                        _replaced_entry = None
+                                if _replaced_entry is not None:
+                                    try:
+                                        _close_cached_agent_entry_at_session_boundary(
+                                            session_id, _replaced_entry,
+                                        )
+                                    except Exception:
+                                        logger.debug(
+                                            '[webui] self-heal: could not close the '
+                                            'replaced silent-retry agent',
+                                            exc_info=True,
+                                        )
                             _agent_sig = _compute_agent_cache_signature(
                                 resolved_model,
                                 resolved_api_key,
@@ -17031,6 +17104,45 @@ def _run_agent_streaming(
                                 # as the first attempt's silent no-response.
                                 _retry_raised_error = _retry_exc
                                 _heal_ok = False
+                            if cancel_event.is_set():
+                                # A Stop that lands while the retry is running
+                                # must end the turn as a cancel, not be saved as
+                                # the retry's provider error. Same settlement as
+                                # the pre-retry cancel check above.
+                                _finalize_cancelled_turn(
+                                    s, ephemeral=ephemeral, stream_id=stream_id,
+                                )
+                                if not ephemeral:
+                                    try:
+                                        append_turn_journal_event_for_stream(
+                                            s.session_id,
+                                            stream_id,
+                                            {
+                                                "event": "interrupted",
+                                                "created_at": time.time(),
+                                                "reason": "cancelled",
+                                            },
+                                        )
+                                    except Exception:
+                                        logger.debug("Failed to append cancelled turn journal event", exc_info=True)
+                                put('cancel', _cancel_event_payload('Cancelled by user'))
+                                return
+                            # The retry can rotate the session too: it runs
+                            # after the pre-request compression migration, so
+                            # without this the turn is saved under the parent
+                            # id while the Agent moved on. Applies to the 401
+                            # self-heal as well — that retry has the same gap.
+                            _compression_origin_session_id, _compression_continuation_session_id, _compression_retry_rotated = (
+                                _migrate_compression_rotation(
+                                    s,
+                                    agent,
+                                    session_id,
+                                    _resolved_profile_name,
+                                    _agent_lock,
+                                )
+                            )
+                            if _compression_retry_rotated:
+                                _compressed = True
                             if _heal_ok and _heal_result is not None:
                                 # Retry succeeded — replace result and skip error
                                 result = _heal_result
@@ -17051,7 +17163,7 @@ def _run_agent_streaming(
                                     _result_messages,
                                     enabled=_agent_result_tool_limit_reached(result),
                                 )
-                                _result_messages = _settle_result_messages(
+                                _settle_result_messages(
                                     s,
                                     _previous_messages,
                                     _previous_owner_context_messages,
@@ -17076,7 +17188,18 @@ def _run_agent_streaming(
                                 )
                                 # normal post-result persistence path by
                                 # leaving _assistant_added truthy (set below).
-                                _assistant_added = True  # prevent re-entering guard
+                                if (
+                                    _is_silent_no_response
+                                    and _session_lacks_final_assistant_answer(s.messages)
+                                ):
+                                    # Settlement dropped the reply it had just
+                                    # accepted (a text equal to an earlier one),
+                                    # so this turn still has no answer in the
+                                    # transcript: keep the error card instead of
+                                    # ending on an empty ``done``.
+                                    _assistant_added = False
+                                else:
+                                    _assistant_added = True  # prevent re-entering guard
                             elif (
                                 _is_silent_no_response
                                 and _heal_result is not None
@@ -17090,7 +17213,13 @@ def _run_agent_streaming(
                                 # for the sake of the error card.
                                 _retry_partial = _heal_result.get('messages') or []
                                 if _retry_partial:
-                                    _settled_partial = _settle_result_messages(
+                                    # _settle_result_messages already wrote the
+                                    # merged DISPLAY transcript to s.messages and
+                                    # returned the raw, context-shaped rows.
+                                    # Assigning those back would drop every
+                                    # display-only row (and the compacted
+                                    # history) and save the current prompt twice.
+                                    _settle_result_messages(
                                         s,
                                         _previous_messages,
                                         _previous_owner_context_messages,
@@ -17099,16 +17228,14 @@ def _run_agent_streaming(
                                         _turn_pending_source,
                                         _active_turn_identity,
                                     )
-                                    if _settled_partial:
-                                        s.messages = list(_settled_partial)
-                                        try:
-                                            s.save()
-                                        except Exception:
-                                            logger.debug(
-                                                '[webui] self-heal: could not persist '
-                                                'the failed retry partial result',
-                                                exc_info=True,
-                                            )
+                                    try:
+                                        s.save()
+                                    except Exception:
+                                        logger.debug(
+                                            '[webui] self-heal: could not persist '
+                                            'the failed retry partial result',
+                                            exc_info=True,
+                                        )
                         if (
                             _is_silent_no_response
                             and not _assistant_added
@@ -17133,6 +17260,11 @@ def _run_agent_streaming(
                                 silent_failure=not bool(_retry_err),
                                 result=_heal_result,
                             )
+                            if _retry_err:
+                                # Keep the retry's own 429/quota text: _err_str
+                                # still holds the first attempt's empty value,
+                                # so the card would fall back to the label alone.
+                                _err_str = str(_retry_err)
                         if not _assistant_added:
                             # Self-heal didn't apply or retry failed — emit error.
                             if _heal_stale_classification is not None:
