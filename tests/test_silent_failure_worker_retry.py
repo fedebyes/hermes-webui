@@ -13,6 +13,8 @@ import threading
 import pytest
 
 from api import streaming
+from api import config
+from api import config as api_config
 from tests.test_steer_worker_boundaries import worker_scene as worker_scene
 
 
@@ -267,6 +269,40 @@ def test_a_failed_retry_reports_the_retrys_own_error(worker_scene):
     assert "No response from provider" not in errors[0]["content"], (
         "the retry's own failure must replace the silent-first-attempt wording"
     )
+    assert "429 rate limit exceeded" in errors[0]["content"], (
+        "the retry's own provider text must survive, not just its label"
+    )
+
+
+def test_a_failed_retry_keeps_the_earlier_display_transcript(worker_scene):
+    """Settlement owns the writeback: the raw context rows must not replace it.
+
+    Assigning the raw rows back to ``s.messages`` dropped every display-only row
+    and saved the current prompt twice. The retry here returns only current
+    rows while the session already holds an earlier turn.
+    """
+    scene = worker_scene
+    earlier = [
+        {"role": "user", "content": "Earlier question."},
+        {"role": "assistant", "content": "Earlier answer."},
+    ]
+    scene.session.messages = [dict(row) for row in earlier]
+    scene.session.context_messages = [dict(row) for row in earlier]
+    scene.on_run = _silent_then(scene, {
+        "error": "429 rate limit exceeded",
+        "messages": [_materialized_user_row()],
+    })
+
+    scene.run()
+
+    assert _runs(scene) == 2
+    text = _session_text(scene)
+    assert "Earlier question." in text, "the earlier display rows must survive"
+    assert "Earlier answer." in text
+    assert text.count("Do the task.") == 1, (
+        "the current prompt must be saved exactly once"
+    )
+
 
 
 def test_gate_off_means_a_silent_turn_is_not_retried(worker_scene, monkeypatch):
@@ -303,31 +339,115 @@ def _history_with_an_earlier_yes():
     ]
 
 
-def test_retry_accepts_an_equal_text_answer_owned_by_the_current_turn(
-    worker_scene, monkeypatch,
-):
-    """A new answer may repeat an older one verbatim; it is still the answer.
+def _realistic_yes_scene(scene, replies):
+    """Realistic Agent: returns history + [user, reply]; ``None`` is a silent cut.
 
-    The reviewer's case: history holds ``Yes.``, the first attempt is silent,
-    and the retry answers the current turn with the same text the earlier
-    assistant used. Text novelty rejected it, settled ``no_response`` and threw
-    the answer away. Ownership comes from the current turn's checkpoint, not
-    from the text.
+    No user row is pre-seeded and no transcript row is injected: the fake
+    produces what the installed Agent produces, so the assertions below cannot
+    be satisfied by the input the test itself supplied.
     """
-    scene = worker_scene
-    history = _history_with_an_earlier_yes()
+    history = [
+        {"role": "user", "content": "Earlier question."},
+        {"role": "assistant", "content": "Yes."},
+    ]
     scene.session.messages = [dict(row) for row in history]
     scene.session.context_messages = [dict(row) for row in history]
 
-    def answer_now():
-        if _runs(scene) == 1:
-            scene.result = {"messages": [dict(row) for row in history]}
-        else:
-            scene.result = {"messages": [dict(row) for row in history] + [
-                {"role": "assistant", "content": "Yes."},
-            ]}
+    def on_run():
+        reply = replies[_runs(scene) - 1]
+        rows = [dict(row) for row in history] + [
+            {"role": "user", "content": "Do the task."},
+        ]
+        if reply is not None:
+            rows.append({"role": "assistant", "content": reply})
+        scene.result = {"messages": rows}
 
-    scene.on_run = answer_now
+    return on_run
+
+
+def _yes_answer_rows(scene):
+    """Assistant rows whose whole text is the (repeated) answer ``Yes.``."""
+    return [
+        row for row in scene.session.messages
+        if isinstance(row, dict)
+        and row.get("role") == "assistant"
+        and row.get("content") == "Yes."
+    ]
+
+
+def test_an_equal_text_answer_is_not_treated_as_a_silent_turn(worker_scene):
+    """One attempt answers with a text history already used: it still answered.
+
+    Settlement drops a reply whose text equals an earlier one (an existing
+    master defect), which zeroes ``_assistant_added``. Reading that overwritten
+    value made the gate replay a turn that did answer: an extra provider call,
+    and — because the retry's answer was dropped again while ``_assistant_added``
+    was forced True — a bare ``done`` with no answer and no card.
+    """
+    scene = worker_scene
+    scene.on_run = _realistic_yes_scene(scene, ["Yes."])
+
+    scene.run()
+
+    assert _runs(scene) == 1, "a turn that answered must not be replayed"
+    errors = _error_rows(scene)
+    assert len(errors) == 1, "the dropped answer must still surface a card"
+    assert "No response from provider" in errors[0]["content"]
+
+
+def test_a_retry_whose_answer_is_dropped_keeps_the_error_card(worker_scene):
+    """Silent first attempt, retry answers with the repeated text: no bare done."""
+    scene = worker_scene
+    scene.on_run = _realistic_yes_scene(scene, [None, "Yes."])
+
+    scene.run()
+
+    assert _runs(scene) == 2, "a silent turn earns exactly one retry"
+    errors = _error_rows(scene)
+    assert len(errors) == 1, (
+        "a retry whose reply settlement dropped must not end on a bare done"
+    )
+    # Settlement drops a reply whose text repeats an earlier one (a pre-existing
+    # master defect, out of scope here). The retry must not turn that into a
+    # silent ``done``: the dropped answer keeps the visible card, exactly as an
+    # un-retried attempt does on master.
+    assert len(_yes_answer_rows(scene)) == 1, (
+        "the settled transcript holds the earlier answer only; the dropped "
+        "retry answer is what the error card is reporting"
+    )
+
+
+def test_retry_accepts_an_equal_text_answer_owned_by_the_current_turn(worker_scene):
+    """A new answer may repeat an older one verbatim; it is still the answer.
+
+    Realistic Agent shape: the fake returns ``conversation_history + [user,
+    reply]`` — what the installed Agent returns — and nothing seeds the current
+    turn into the transcript, so neither assertion below can be satisfied by
+    input the test supplied. The earlier ``Yes.`` lives only in the DISPLAY
+    (the context was compacted), so the retry's identical text is the only copy
+    the model context has ever seen, and both copies must end up in the
+    transcript: the old one for the reader, the new one as this turn's answer.
+    """
+    scene = worker_scene
+    display = [
+        {"role": "user", "content": "Earlier question."},
+        {"role": "assistant", "content": "Yes."},
+        {"role": "user", "content": "Second question."},
+        {"role": "assistant", "content": "Second answer."},
+    ]
+    context = [dict(row) for row in display[2:]]
+    scene.session.messages = [dict(row) for row in display]
+    scene.session.context_messages = [dict(row) for row in context]
+
+    def on_run():
+        rows = [dict(row) for row in context] + [
+            {"role": "user", "content": "Do the task."},
+        ]
+        if _runs(scene) == 2:
+            rows.append({"role": "assistant", "content": "Yes."})
+        scene.result = {"messages": rows}
+
+    scene.on_run = on_run
 
     scene.run()
 
@@ -335,8 +455,12 @@ def test_retry_accepts_an_equal_text_answer_owned_by_the_current_turn(
     assert _error_rows(scene) == [], (
         "an equal-text answer owned by the current turn must settle, not error"
     )
-    assert "Yes." in _session_text(scene), (
-        "the retry's answer must reach the session"
+    assert len(_yes_answer_rows(scene)) == 2, (
+        "the earlier answer and the retry's identical answer are two turns and "
+        "must both be in the transcript"
+    )
+    assert _session_text(scene).count("Do the task.") == 1, (
+        "the current prompt must be saved exactly once"
     )
 
 
@@ -600,3 +724,225 @@ def test_a_failed_retry_keeps_its_partial_tool_rows(worker_scene):
         "the retry returned a tool outcome; discarding it loses real work"
     )
     assert tool_rows[0].get("content") == "done"
+
+
+# ── The retry reads the session's own profile config ────────────────────────
+
+
+def test_retry_opt_in_is_read_from_the_sessions_profile(worker_scene, monkeypatch):
+    """Every other worker setting comes from the session's profile home.
+
+    Reading the ambient config made the opt-in depend on the process default
+    instead: a session whose profile has the retry off still retried whenever
+    the ambient config (or another profile) had it on.
+    """
+    scene = worker_scene
+    scene.on_run = _silent_then(scene, None)
+
+    monkeypatch.delenv("HERMES_WEBUI_SILENT_FAILURE_RETRY", raising=False)
+    monkeypatch.setattr(
+        api_config, "get_config_for_profile_home",
+        lambda *_a, **_k: {"webui_silent_failure_retry": False},
+    )
+    # The ambient config says yes; the session's profile says no. The profile wins.
+    monkeypatch.setattr(
+        streaming, "get_config",
+        lambda *_a, **_k: {"webui_silent_failure_retry": True},
+    )
+    monkeypatch.setattr(
+        api_config, "get_config",
+        lambda *_a, **_k: {"webui_silent_failure_retry": True},
+    )
+
+    scene.run()
+
+    assert _runs(scene) == 1, (
+        "the session's profile has the retry off: the ambient config must not "
+        "enable it for this turn"
+    )
+
+
+# ── Replacing the agent carries its usage and closes the old one ────────────
+
+
+def test_a_replaced_agent_carries_usage_and_is_closed(worker_scene, monkeypatch):
+    """A fresh agent starts at zero; the turn's real spend would be lost."""
+    scene = worker_scene
+    built = []
+
+    def on_init():
+        built.append(scene.agent)
+
+    def on_run():
+        first = _runs(scene) == 1
+        scene.result = _silent_result() if first else None
+        if first:
+            # The attempt that went silent did spend tokens.
+            scene.agent.session_prompt_tokens = 600
+            scene.agent.session_estimated_cost_usd = 0.06
+        else:
+            # The replacement starts from the carried totals and adds its own.
+            scene.agent.session_prompt_tokens += 200
+            scene.agent.session_estimated_cost_usd += 0.02
+
+    scene.on_init = on_init
+    scene.on_run = on_run
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the silent turn must have been retried"
+    assert len(built) == 2, "the silent retry builds exactly one replacement"
+    assert built[1].session_prompt_tokens == 800, (
+        "the replacement must inherit the turn's spend and add its own"
+    )
+    assert built[1].session_estimated_cost_usd == pytest.approx(0.08)
+
+
+# ── Finding B: the settled display transcript is authoritative ──────────────
+
+
+def test_a_failed_retry_keeps_display_only_rows_when_context_was_compacted(worker_scene):
+    """Display and context differ (compaction): the save must keep the display.
+
+    ``_settle_result_messages`` already wrote the merged DISPLAY transcript and
+    returned the raw, context-shaped rows. Writing those rows back dropped every
+    display-only turn and (when the retry echoed the prompt) saved the current
+    prompt twice.
+    """
+    scene = worker_scene
+    display = [
+        {"role": "user", "content": "First question."},
+        {"role": "assistant", "content": "First answer."},
+        {"role": "user", "content": "Second question."},
+        {"role": "assistant", "content": "Second answer."},
+    ]
+    context = [dict(row) for row in display[2:]]
+    scene.session.messages = [dict(row) for row in display]
+    scene.session.context_messages = [dict(row) for row in context]
+
+    def on_run():
+        if _runs(scene) == 1:
+            scene.result = {"messages": [
+                {"role": "user", "content": "Do the task."},
+            ]}
+        else:
+            scene.result = {
+                "error": "429 rate limit exceeded",
+                "messages": [dict(row) for row in context] + [
+                    {"role": "user", "content": "Do the task."},
+                ] + _tool_rows(),
+            }
+
+    scene.on_run = on_run
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the silent turn must have been retried"
+    text = _session_text(scene)
+    for earlier in ("First question.", "First answer.",
+                    "Second question.", "Second answer."):
+        assert earlier in text, (
+            "display-only history was lost when settlement returned raw "
+            f"context rows ({earlier!r} missing)"
+        )
+    assert text.count("Do the task.") == 1, (
+        "the current prompt must be saved exactly once"
+    )
+    tool_rows = [row for row in scene.session.messages if row.get("role") == "tool"]
+    assert [row.get("content") for row in tool_rows] == ["done"], (
+        "the retry's tool outcome must survive the failure"
+    )
+
+
+# ── A Stop that lands while the retry runs is a cancel, not a failure ───────
+
+
+def test_stop_during_the_retry_is_saved_as_a_cancel(worker_scene):
+    """The pre-retry cancel check cannot see a Stop that lands during the retry.
+
+    Nothing looked at ``cancel_event`` between the retry returning (or raising)
+    and settlement, so the turn was saved as the retry's provider error: an
+    ``apperror`` card and a journal ``apperror`` terminal instead of a cancel.
+    """
+    scene = worker_scene
+    # A real Stop signals this event from the request thread; the worker picks
+    # the registered flag up at admission. Signal it here the same way so the
+    # Stop lands while the retry is in flight without re-entering the worker's
+    # own per-session lock (cancel_stream runs the whole cleanup, which would
+    # deadlock against the worker holding that lock).
+    stop = threading.Event()
+    config.CANCEL_FLAGS["run"] = stop
+
+    def on_run():
+        if _runs(scene) == 1:
+            scene.result = {"messages": [
+                {"role": "user", "content": "Do the task."},
+            ]}
+            return
+        # The retry is running when the user hits Stop; its own result is a 429.
+        stop.set()
+        scene.result = {
+            "error": "429 rate limit exceeded",
+            "messages": [{"role": "user", "content": "Do the task."}],
+        }
+
+    scene.on_run = on_run
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the turn must have reached the retry"
+    emitted = [event for event, _payload in list(scene.events.queue)]
+    assert "cancel" in emitted, (
+        "a Stop during the retry must end the turn as a cancel"
+    )
+    assert "apperror" not in emitted, (
+        "the retry's 429 must not be reported as the outcome of a cancelled turn"
+    )
+    assert _error_rows(scene) == [], (
+        "a cancelled turn must not persist the retry's provider error card"
+    )
+
+
+# ── Compression inside the retry is migrated like the first attempt ────────
+
+
+def test_retry_rotation_is_migrated_to_the_continuation_session(worker_scene):
+    """The retry runs after the pre-turn compression migration.
+
+    If it rotates ``agent.session_id``, the turn was still saved under the old
+    id while the Agent had moved on, and no ``compressed`` event was emitted.
+    """
+    scene = worker_scene
+
+    def on_run():
+        if _runs(scene) == 1:
+            scene.result = {"messages": [
+                {"role": "user", "content": "Do the task."},
+            ]}
+            return
+        scene.agent.session_id = "continuation"
+        scene.result = {"messages": [
+            {"role": "user", "content": "Do the task."},
+            {"role": "assistant", "content": "Answered."},
+        ]}
+
+    scene.on_run = on_run
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the silent turn must have been retried"
+    assert scene.session.session_id == "continuation", (
+        "the retry rotated the session: the turn must be saved on the "
+        "continuation, not the stale parent"
+    )
+    emitted = list(scene.events.queue)
+    names = [event for event, _payload in emitted]
+    assert "compressed" in names, (
+        "the client must be told the session id rotated during the retry"
+    )
+    compressed = next(payload for event, payload in emitted if event == "compressed")
+    assert compressed.get("new_session_id") == "continuation"
+    done = next(payload for event, payload in emitted if event == "done")
+    assert done["session"]["session_id"] == "continuation", (
+        "the done event must report the continuation session"
+    )
