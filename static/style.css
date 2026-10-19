@@ -3446,11 +3446,15 @@
     .composer-divider{display:none;}
     .composer-status{flex:0 1 auto;min-width:0;max-width:96px;font-size:10px;text-align:right;}
     /* On a phone the focused disclosure must share the row with Send, not
-       displace it. `100%` is the `.composer-right` content box (bounded by
-       `max-width:100%` in the base rule), so the cap subtracts the 44px Send
-       tap target, the 6px row gap and slack for the composer padding: the
-       button can never be pushed past the right edge, at 390px or narrower. */
-    .composer-status:focus{max-width:calc(100% - 120px);overflow-wrap:anywhere;word-break:break-word;}
+       displace it. The cap must resolve against the COMPOSER ROW, not against
+       `.composer-right`: that box is `width:auto`, i.e. content-sized, so a
+       percentage there shrinks with the label and a short one collapses to
+       0px (invisible row, inflated footer). `.composer-footer` is the
+       inline-size container, so `100cqw` is the full row width; subtracting
+       the 44px Send tap target, the 6px row gap and the composer padding
+       keeps the button inside the right edge at 390px or narrower while any
+       label — short or long — still gets a usable width. */
+    .composer-status:focus{max-width:max(72px,calc(100cqw - 120px));overflow-wrap:anywhere;word-break:break-word;}
     .send-btn{width:44px;height:44px;}
     .ctx-indicator-wrap{display:none!important;}
     .ctx-indicator{width:44px;height:44px;}

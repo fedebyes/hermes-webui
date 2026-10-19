@@ -53,6 +53,12 @@ SETTLE_SECONDS = 1.2
 # Spaced name (~55 chars) and an unbroken one, both plausible prefill labels.
 LABEL_SPACED = "Production emergency guardrails review staging"
 LABEL_UNBROKEN = "ProductionEmergencyGuardrailsWithoutSpaces" * 3
+# A short label and a medium one. Long labels are the case that displaces Send;
+# short ones are the case a percentage cap resolved against the content-sized
+# `.composer-right` collapses to 0px — the row then renders as an empty column
+# and the footer grows. Both must stay readable once focused.
+LABEL_SHORT = "prefill: dev"
+LABEL_MEDIUM = "production staging guardrails"
 
 VIEWPORTS = ((390, 844), (360, 740), (320, 700))
 FOCUS_MODES = ("tap", "tab")
@@ -349,6 +355,8 @@ def main():
             )
             for width, height in VIEWPORTS:
                 for label, label_name in (
+                    (LABEL_SHORT, "short"),
+                    (LABEL_MEDIUM, "medium"),
                     (LABEL_SPACED, "spaced"),
                     (LABEL_UNBROKEN, "unbroken"),
                 ):
