@@ -465,6 +465,72 @@ def test_budgeted_prefix_without_layout_marker_takes_the_full_read(session_store
     assert DB._metadata_row("subset", source) == DB._metadata_row("subset", full)
 
 
+def test_oversized_reordered_prefix_takes_the_full_read(session_store, monkeypatch):
+    """An oversized prefix without a valid layout proof must fall back whole.
+
+    ``test_oversized_metadata_prefix_uses_budgeted_reader`` covers the admitted
+    oversized case, where the projected fields already precede ``messages``.
+    This is the same window overflow reached by a payload whose six projected
+    fields were moved after the transcript: ``write_session()`` retires the
+    marker because it cannot vouch for the caller's remaining key order, so the
+    budgeted reader must decline the prefix too and the row must come from a
+    full read -- with every projected field intact.
+    """
+    session = models.Session(
+        session_id="fat-reordered",
+        title="Fat Reordered",
+        workspace=str(session_store.parent),
+        model="test-model",
+        profile="work",
+        pinned=True,
+        archived=True,
+        raw_source="telegram",
+        source_label="Telegram",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    session.save()
+    real = json.loads((session_store / "fat-reordered.json").read_text(encoding="utf-8"))
+
+    reordered = {key: value for key, value in real.items() if key != "messages"}
+    moved = {}
+    for field in ("title", "profile", "archived", "pinned", "raw_source", "source_label"):
+        if field in reordered:
+            moved[field] = reordered.pop(field)
+    # Overflow the head window so the head read declines on size alone.
+    reordered["compression_anchor_summary"] = "S" * (DB._METADATA_HEAD_BYTES + 16 * 1024)
+    reordered["messages"] = real["messages"]
+    reordered.update(moved)
+
+    db = DB(session_store)
+    written = db.write_session(reordered)
+    path = session_store / "fat-reordered.json"
+    assert DB._read_metadata_head(path) is None
+    # The generic writer preserves the caller's other key order, so it cannot
+    # vouch for this layout: the marker is retired, and no prefix may be served.
+    assert "_row_layout" not in written
+
+    source = db._read_metadata_row_source(path)
+    assert isinstance(source, dict)
+    # No prefix was admitted: this is the complete document, so it carries the
+    # transcript as well. That is the point -- order no longer matters once the
+    # row comes from the full read.
+    assert "messages" in source
+    assert "_row_layout" not in source
+
+    full = db._read_path(path)
+    assert isinstance(full, dict)
+    assert db._metadata_row("fat-reordered", source) == db._metadata_row("fat-reordered", full)
+
+    row = db.list_sessions()[0]
+    assert row["title"] == "Fat Reordered"
+    assert row["profile"] == "work"
+    assert row["archived"] is True
+    assert row["pinned"] is True
+    assert row["raw_source"] == "telegram"
+    assert row["source_label"] == "Telegram"
+    assert row["message_count"] == 1
+
+
 def test_unreadable_sidecar_falls_back_to_its_own_row(session_store, monkeypatch):
     """A sidecar that fails to open must skip its row, not raise out of the list.
 
