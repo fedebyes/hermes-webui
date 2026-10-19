@@ -247,6 +247,14 @@ class WebUIJsonSessionDB:
         data = self._read_writable_session(path)
         data.update(copy.deepcopy(fields))
         data["message_count"] = len(data["messages"])
+        # Same rule as ``write_session``: this writer keeps the caller's (i.e.
+        # the existing file's) key order and appends a field it did not have, so
+        # it cannot vouch that every projected key precedes ``messages``. A
+        # marker inherited from the input would promise an ordering this write
+        # did not produce -- measured on the generic writer: a reordered payload
+        # carrying the marker served a prefix that lost all six projected
+        # fields. The next ``Session.save`` re-mints it.
+        data.pop(_ROW_LAYOUT_KEY, None)
         self._atomic_write(path, data)
         return self._metadata_row(str(data.get("session_id") or sid), data)
 
@@ -285,7 +293,7 @@ class WebUIJsonSessionDB:
         return copy.deepcopy(payload)
 
     def _normalize_row_layout(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Re-emit every projected key ahead of ``messages``, caller order kept.
+        """Re-emit every head-contract key ahead of ``messages``, caller order kept.
 
         ``write_session`` copies the caller's dict, so a payload can serialize
         the six projected fields after ``messages``. Moving them ahead (and
@@ -293,14 +301,17 @@ class WebUIJsonSessionDB:
         true for this writer's own output, so the full reader sees the same
         values either way and a future reader cannot cut the fields away.
         ``message_count`` keeps its value; only its position moves with the
-        ordering values.
+        ordering values. ``_mc_v`` moves with it: the count marker promises
+        that the count it vouches for sits in the bounded prefix
+        (``_prefix_message_count``), so leaving it behind ``messages`` would
+        mint the same kind of unkept promise this writer is retiring.
         """
         if "messages" not in payload:
             return payload
         head: dict[str, Any] = {}
         tail: dict[str, Any] = {}
         for key, value in payload.items():
-            if key in _PROJECTED_FIELDS or key == _ROW_LAYOUT_KEY:
+            if key in _PROJECTED_FIELDS or key == "_mc_v":
                 head[key] = value
             else:
                 tail[key] = value

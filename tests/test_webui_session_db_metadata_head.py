@@ -26,6 +26,16 @@ import api.webui_session_db as session_db
 
 DB = session_db.WebUIJsonSessionDB
 
+#: The six projected fields the original reproduction moves after ``messages``.
+REORDERED_FIELDS = (
+    "title",
+    "profile",
+    "archived",
+    "pinned",
+    "raw_source",
+    "source_label",
+)
+
 
 @pytest.fixture
 def session_store(tmp_path, monkeypatch):
@@ -324,6 +334,7 @@ def test_write_session_normalizes_projected_keys_ahead_of_messages(session_store
         "created_at": 100.0,
         "updated_at": 200.0,
         "message_count": 1,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
     }
     written = db.write_session(payload)
 
@@ -334,6 +345,11 @@ def test_write_session_normalizes_projected_keys_ahead_of_messages(session_store
     ))
     assert written["message_count"] == 2
     assert written["messages"] == messages
+    # The count marker keeps its own positional promise: bounded prefix readers
+    # (``_prefix_message_count``) must still find ``_mc_v`` ahead of messages.
+    if "_mc_v" in written:
+        assert keys.index("_mc_v") < keys.index("messages")
+        assert models._prefix_message_count(session_store / "ordered.json") == 2
 
     # A hand-written marker on a payload this writer reordered is retired, so no
     # prefix can be admitted on a promise the writer did not make.
@@ -350,18 +366,79 @@ def test_write_session_normalizes_projected_keys_ahead_of_messages(session_store
     assert row["message_count"] == 2
 
 
+def test_ordinary_writer_fast_path_never_full_parses(session_store, monkeypatch):
+    """The ordinary ``Session.save()`` sidecar still serves rows from the head."""
+    _save_modern_session(
+        session_store, sid="fast", messages=[{"role": "user", "content": "hi"}]
+    )
+
+    def _no_full_parse(_path):
+        raise AssertionError("a marked writer layout must be served from the head")
+
+    monkeypatch.setattr(DB, "_read_path", staticmethod(_no_full_parse))
+    row = DB(session_store).list_sessions()[0]
+    assert row["title"] == "Metadata Head"
+    assert row["message_count"] == 1
+
+
+def test_update_metadata_retires_a_marker_it_cannot_vouch_for(session_store):
+    """The in-place metadata writer must not preserve a layout promise.
+
+    ``update_metadata`` rewrites the file in its existing key order and can
+    append a projected field it did not have, so it cannot vouch that every
+    projected key precedes ``messages``. A marker inherited from the input is
+    retired -- the same rule as ``write_session`` -- and the row stays complete
+    because it comes from the full read.
+    """
+    payload = {
+        "session_id": "upd",
+        "message_count": 2,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "_row_layout": models._ROW_LAYOUT_VERSION,
+        "messages": [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
+        "title": "Before",
+        "profile": "work",
+        "archived": True,
+        "pinned": True,
+        "raw_source": "telegram",
+        "source_label": "Telegram",
+        "created_at": 100.0,
+        "updated_at": 200.0,
+    }
+    path = session_store / "upd.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    db = DB(session_store)
+    db.update_metadata("upd", {"title": "Updated"})
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["title"] == "Updated"
+    assert "_row_layout" not in stored
+
+    row = db.list_sessions()[0]
+    assert row["title"] == "Updated"
+    assert row["profile"] == "work"
+    assert row["archived"] is True
+    assert row["pinned"] is True
+    assert row["raw_source"] == "telegram"
+    assert row["source_label"] == "Telegram"
+    assert row["message_count"] == 2
+
+
 def _reorder_real_writer_payload(session_store, sid, *, keep_anchor_scene_index):
     """Persist a real writer payload, then replay it through ``write_session()``
-    with every projected field moved AFTER ``messages``.
+    with only the six projected fields moved AFTER ``messages``.
 
-    Mirrors the review probe: the count marker, the timestamps and (optionally)
-    ``anchor_scene_index`` are retained, only the projected metadata order
-    changes. **Every other key of the real payload is carried over as well** --
-    including ``_row_layout`` -- because the round trip must replay what the
-    writer actually produced. Dropping the marker while building the input would
-    test a payload the reproduction never used, and would hide the case where a
-    generic writer preserves a marker it did not mint. Returns the sidecar path
-    and the payload that was written.
+    Mirrors the original oracle literally: step 1 reads the complete payload the
+    real writer produced through the public ``read_session()``; step 2 moves
+    **only** ``title``/``profile``/``archived``/``pinned``/``raw_source``/
+    ``source_label`` after ``messages`` and retains every other actual key in
+    its original position -- including ``_row_layout``, ``_mc_v``,
+    ``message_count``, the timestamps, ``tool_calls`` and the anchor bodies.
+    Dropping the marker while building the input would test a payload the
+    reproduction never used, and would hide the case where a generic writer
+    preserves a marker it did not mint. Returns the sidecar path and the
+    payload the writer actually produced.
     """
     session = models.Session(
         session_id=sid,
@@ -376,36 +453,25 @@ def _reorder_real_writer_payload(session_store, sid, *, keep_anchor_scene_index)
         messages=[{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
     )
     session.save()
-    real = json.loads((session_store / f"{sid}.json").read_text(encoding="utf-8"))
+    db = DB(session_store)
+    real = db.read_session(sid)
+    assert isinstance(real, dict)
     assert real["_row_layout"] == models._ROW_LAYOUT_VERSION
 
-    # Carry every actual key of the writer payload, then re-position only the
-    # projected ones after ``messages``. Nothing is dropped implicitly.
-    reordered = {key: value for key, value in real.items() if key != "messages"}
-    reordered.pop("tool_calls", None)
-    reordered.pop("anchor_activity_scenes", None)
+    # Carry every actual key of the writer payload in its writer position, then
+    # append only the six projected fields after ``messages``.
+    reordered = {
+        key: value
+        for key, value in real.items()
+        if key != "messages" and key not in REORDERED_FIELDS
+    }
     if not keep_anchor_scene_index:
         reordered.pop("anchor_scene_index", None)
     reordered["messages"] = real["messages"]
-    for field in (
-        "title",
-        "profile",
-        "archived",
-        "pinned",
-        "raw_source",
-        "source_label",
-        "workspace",
-        "model",
-        "session_source",
-    ):
-        if field in real:
-            reordered[field] = real[field]
-    written = DB(session_store).write_session(reordered)
-    # ``write_session`` rewrites the caller's order verbatim, so it cannot vouch
-    # for the layout marker: it must retire it rather than pass it through.
-    assert "_row_layout" not in written
-    assert "_row_layout" not in json.loads((session_store / f"{sid}.json").read_text(encoding="utf-8"))
-    return session_store / f"{sid}.json", real
+    for field in REORDERED_FIELDS:
+        reordered[field] = real[field]
+    written = db.write_session(reordered)
+    return session_store / f"{sid}.json", real, written
 
 
 @pytest.mark.parametrize("keep_anchor_scene_index", [True, False], ids=["anchor-retained", "anchor-removed"])
@@ -418,16 +484,18 @@ def test_reordered_real_payload_keeps_every_projected_field(session_store, keep_
     ``_row_layout``, so both must fall back to the full read.
     """
     sid = "reordered-real"
-    path, real = _reorder_real_writer_payload(
+    path, real, written = _reorder_real_writer_payload(
         session_store, sid, keep_anchor_scene_index=keep_anchor_scene_index
     )
 
-    assert DB._read_metadata_head(path) is None
-    assert DB._read_metadata_row_source(path) is not None
-
+    # Row correctness first: on a head/budgeted admission that trusts the
+    # surviving ``_row_layout``, this is where the six projected fields go
+    # missing.
     db = DB(session_store)
     source = db._read_metadata_row_source(path)
+    assert source is not None
     full = db._read_path(path)
+    assert isinstance(full, dict)
     assert db._metadata_row(sid, source) == db._metadata_row(sid, full)
 
     row = db.list_sessions()[0]
@@ -440,6 +508,13 @@ def test_reordered_real_payload_keeps_every_projected_field(session_store, keep_
     assert row["message_count"] == 2
     assert row["created_at"] == real["created_at"]
     assert row["updated_at"] == real["updated_at"]
+
+    # Neither admission may serve a prefix for this layout: the head declines,
+    # and ``write_session`` preserved the caller's order verbatim, so it cannot
+    # vouch for the marker and must retire it rather than pass it through.
+    assert DB._read_metadata_head(path) is None
+    assert "_row_layout" not in written
+    assert "_row_layout" not in json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_budgeted_prefix_without_layout_marker_takes_the_full_read(session_store, monkeypatch):
@@ -470,14 +545,18 @@ def test_oversized_reordered_prefix_takes_the_full_read(session_store, monkeypat
 
     ``test_oversized_metadata_prefix_uses_budgeted_reader`` covers the admitted
     oversized case, where the projected fields already precede ``messages``.
-    This is the same window overflow reached by a payload whose six projected
-    fields were moved after the transcript: ``write_session()`` retires the
-    marker because it cannot vouch for the caller's remaining key order, so the
-    budgeted reader must decline the prefix too and the row must come from a
-    full read -- with every projected field intact.
+    This is the same 80,000-byte metadata overflow reached by the original
+    reproduction: the real writer payload is read through public
+    ``read_session()``, only the six projected fields move after the transcript,
+    and it is persisted through public ``write_session()``. The head really
+    declines on size, and the budgeted reader really admits the oversized
+    prefix -- but the generic writer retired ``_row_layout``, so that admission
+    must decline too and the row must come from a full read with every projected
+    field intact.
     """
+    sid = "fat-reordered"
     session = models.Session(
-        session_id="fat-reordered",
+        session_id=sid,
         title="Fat Reordered",
         workspace=str(session_store.parent),
         model="test-model",
@@ -489,27 +568,51 @@ def test_oversized_reordered_prefix_takes_the_full_read(session_store, monkeypat
         messages=[{"role": "user", "content": "hi"}],
     )
     session.save()
-    real = json.loads((session_store / "fat-reordered.json").read_text(encoding="utf-8"))
-
-    reordered = {key: value for key, value in real.items() if key != "messages"}
-    moved = {}
-    for field in ("title", "profile", "archived", "pinned", "raw_source", "source_label"):
-        if field in reordered:
-            moved[field] = reordered.pop(field)
-    # Overflow the head window so the head read declines on size alone.
-    reordered["compression_anchor_summary"] = "S" * (DB._METADATA_HEAD_BYTES + 16 * 1024)
-    reordered["messages"] = real["messages"]
-    reordered.update(moved)
-
     db = DB(session_store)
+    real = db.read_session(sid)
+    assert isinstance(real, dict)
+
+    reordered = {
+        key: value
+        for key, value in real.items()
+        if key != "messages" and key not in REORDERED_FIELDS
+    }
+    # 80,000 bytes of metadata: past the 64 KiB head window, inside the 1 MiB
+    # budgeted window -- the actual oversized shared-prefix admission.
+    reordered["compression_anchor_summary"] = "S" * 80_000
+    reordered["messages"] = real["messages"]
+    for field in REORDERED_FIELDS:
+        reordered[field] = real[field]
+
     written = db.write_session(reordered)
-    path = session_store / "fat-reordered.json"
+    path = session_store / f"{sid}.json"
     assert DB._read_metadata_head(path) is None
     # The generic writer preserves the caller's other key order, so it cannot
     # vouch for this layout: the marker is retired, and no prefix may be served.
     assert "_row_layout" not in written
 
+    # Prove the budgeted reader was really reached and really admitted a prefix
+    # (not that the head quietly served the row, and not that the helper that
+    # opens the file failed): the shape it gets carries the count marker this
+    # writer did relocate, but no layout marker.
+    seen: list[str] = []
+    real_budgeted = models._read_metadata_json_prefix
+
+    def _spy(p, *args, **kwargs):
+        raw = real_budgeted(p, *args, **kwargs)
+        seen.append(raw or "")
+        return raw
+
+    monkeypatch.setattr(models, "_read_metadata_json_prefix", _spy)
     source = db._read_metadata_row_source(path)
+    monkeypatch.setattr(models, "_read_metadata_json_prefix", real_budgeted)
+
+    assert len(seen) == 1
+    admitted_prefix = json.loads(seen[0])
+    assert "_mc_v" in admitted_prefix
+    assert "message_count" in admitted_prefix
+    assert "_row_layout" not in admitted_prefix
+
     assert isinstance(source, dict)
     # No prefix was admitted: this is the complete document, so it carries the
     # transcript as well. That is the point -- order no longer matters once the
@@ -519,7 +622,7 @@ def test_oversized_reordered_prefix_takes_the_full_read(session_store, monkeypat
 
     full = db._read_path(path)
     assert isinstance(full, dict)
-    assert db._metadata_row("fat-reordered", source) == db._metadata_row("fat-reordered", full)
+    assert db._metadata_row(sid, source) == db._metadata_row(sid, full)
 
     row = db.list_sessions()[0]
     assert row["title"] == "Fat Reordered"
