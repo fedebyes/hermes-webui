@@ -132,6 +132,7 @@ def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypat
         "compression_anchor_summary": "S" * (DB._METADATA_HEAD_BYTES + 16 * 1024),
         "message_count": 3,
         "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "_row_layout": models._ROW_LAYOUT_VERSION,
         "anchor_scene_index": {},
         "messages": [{"role": "user", "content": "hi"}] * 3,
     }
@@ -166,6 +167,7 @@ def test_compact_sidecar_of_the_writer_contract_is_read_from_the_head(session_st
         "created_at": 100.0,
         "message_count": 2,
         "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "_row_layout": models._ROW_LAYOUT_VERSION,
         "anchor_scene_index": {},
         "messages": session.messages,
         "archived": False,
@@ -244,6 +246,103 @@ def test_write_session_round_trip_keeps_metadata_after_messages(session_store):
     assert row["archived"] is True
     assert row["pinned"] is True
     assert row["message_count"] == 2
+
+
+def _reorder_real_writer_payload(session_store, sid, *, keep_anchor_scene_index):
+    """Persist a real writer payload, then replay it through ``write_session()``
+    with every projected field moved AFTER ``messages``.
+
+    Mirrors the review probe: the count marker, the timestamps and (optionally)
+    ``anchor_scene_index`` are retained, only the projected metadata order
+    changes. Returns the sidecar path and the payload that was written.
+    """
+    session = models.Session(
+        session_id=sid,
+        title="Reordered Real",
+        workspace=str(session_store.parent),
+        model="test-model",
+        profile="work",
+        pinned=True,
+        archived=True,
+        raw_source="telegram",
+        source_label="Telegram",
+        messages=[{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
+    )
+    session.save()
+    real = json.loads((session_store / f"{sid}.json").read_text(encoding="utf-8"))
+    assert real["_row_layout"] == models._ROW_LAYOUT_VERSION
+
+    reordered = {
+        "session_id": sid,
+        "message_count": real["message_count"],
+        "_mc_v": real["_mc_v"],
+        "updated_at": real["updated_at"],
+        "created_at": real["created_at"],
+    }
+    if keep_anchor_scene_index:
+        reordered["anchor_scene_index"] = real.get("anchor_scene_index", {})
+    reordered["messages"] = real["messages"]
+    for field in ("title", "profile", "archived", "pinned", "raw_source", "source_label"):
+        reordered[field] = real[field]
+    DB(session_store).write_session(reordered)
+    return session_store / f"{sid}.json", real
+
+
+@pytest.mark.parametrize("keep_anchor_scene_index", [True, False], ids=["anchor-retained", "anchor-removed"])
+def test_reordered_real_payload_keeps_every_projected_field(session_store, keep_anchor_scene_index):
+    """Both admissions must refuse a row that lacks the complete-row guarantee.
+
+    A retained ``anchor_scene_index`` used to admit the head cut; without it the
+    ``_ROW_FIELDS`` subset admitted the budgeted fallback. Both dropped the six
+    projected fields moved after ``messages``. Neither prefix carries the writer's
+    ``_row_layout``, so both must fall back to the full read.
+    """
+    sid = "reordered-real"
+    path, real = _reorder_real_writer_payload(
+        session_store, sid, keep_anchor_scene_index=keep_anchor_scene_index
+    )
+
+    assert DB._read_metadata_head(path) is None
+    assert DB._read_metadata_row_source(path) is not None
+
+    db = DB(session_store)
+    source = db._read_metadata_row_source(path)
+    full = db._read_path(path)
+    assert db._metadata_row(sid, source) == db._metadata_row(sid, full)
+
+    row = db.list_sessions()[0]
+    assert row["title"] == "Reordered Real"
+    assert row["profile"] == "work"
+    assert row["archived"] is True
+    assert row["pinned"] is True
+    assert row["raw_source"] == "telegram"
+    assert row["source_label"] == "Telegram"
+    assert row["message_count"] == 2
+    assert row["created_at"] == real["created_at"]
+    assert row["updated_at"] == real["updated_at"]
+
+
+def test_budgeted_prefix_without_layout_marker_takes_the_full_read(session_store, monkeypatch):
+    """``_ROW_FIELDS`` + a count are not proof: the fallback needs the marker too."""
+    payload = {
+        "session_id": "subset",
+        "message_count": 1,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "messages": [{"role": "user", "content": "hi"}],
+        "title": "After Messages",
+        "profile": "work",
+    }
+    path = session_store / "subset.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(DB, "_read_metadata_head", classmethod(lambda cls, p: None))
+    source = DB._read_metadata_row_source(path)
+    full = DB._read_path(path)
+    assert isinstance(source, dict) and isinstance(full, dict)
+    assert source.get("title") == "After Messages"
+    assert DB._metadata_row("subset", source) == DB._metadata_row("subset", full)
 
 
 def test_unreadable_sidecar_falls_back_to_its_own_row(session_store, monkeypatch):
