@@ -178,6 +178,11 @@ _METADATA_FIELDS = frozenset({
         "read_only",
         "enabled_toolsets",
         "composer_draft",
+        # Written by the eager hidden-checkpoint path (#7882 / PR #8368). A
+        # head-derived sidebar row that drops it reports the pending hidden
+        # wakeup as not-yet-excluded and discounts it a second time, which is
+        # the exact undercount that field exists to prevent.
+        "_pending_hidden_wakeup_at",
     }
 )
 
