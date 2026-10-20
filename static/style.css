@@ -1697,6 +1697,21 @@
   .session-attention-indicator{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:26px;height:26px;z-index:1;pointer-events:none;transition:opacity .15s ease,visibility .15s ease;}
   .session-item:hover .session-attention-indicator,.session-item:has(:focus-visible) .session-attention-indicator,.session-item.menu-open .session-attention-indicator{opacity:0;visibility:hidden;}
   .session-state-indicator.is-done{visibility:visible;color:var(--success,#22c55e);opacity:.65;}
+  /* Done check, rendered beside the timestamp (right cluster) instead of in the
+     far-left state slot: small, green, calm — a resting marker, never an alert. */
+  .session-done-check{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:11px;height:11px;margin:0 3px 0 0;color:var(--success,#22c55e);opacity:.85;pointer-events:none;}
+  /* Right-aligned cluster holding the done check + timestamp. `margin-left:auto`
+     moves from .session-time to the group so the two never split apart. */
+  .session-right-group{display:inline-flex;align-items:center;gap:4px;margin-left:auto;flex-shrink:0;}
+  .session-done-check::before{
+    width:10px;
+    height:10px;
+    content:"";
+    background:currentColor;
+    -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpolyline points='3 8.5 6.5 12 13 4.5' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/contain no-repeat;
+    mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpolyline points='3 8.5 6.5 12 13 4.5' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/contain no-repeat;
+  }
+  .session-item:hover .session-done-check{opacity:1;}
   .session-state-indicator.is-done::before{
     width:9px;
     height:9px;
@@ -1759,6 +1774,9 @@
   @media (hover:hover){
     .session-item:hover .session-time{display:none;}
   }
+  /* The done check yields with the timestamp: on hover the row belongs to the
+     action button, and a marker that stays put just competes with it. */
+  .session-item:hover .session-done-check,.session-item:focus-within .session-done-check,.session-item.menu-open .session-done-check{display:none;}
   /* ── Session action trigger + dropdown ── */
   .session-actions{position:absolute;right:6px;top:50%;transform:translateY(-50%);display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .15s ease;}
   .session-item:hover .session-actions,.session-item:has(:focus-visible) .session-actions,.session-item.menu-open .session-actions{opacity:1;pointer-events:auto;}
