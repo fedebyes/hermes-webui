@@ -13997,6 +13997,21 @@ def _close_cached_agent_entry_at_session_boundary(session_id: str, cache_entry) 
     return _close_evicted_agent_at_session_boundary(session_id, agent)
 
 
+def _session_session_id_moved(session, turn_session_id) -> bool:
+    """True when the turn's session id already rotated off ``turn_session_id``.
+
+    A first attempt that rotated through compression leaves ``session.session_id``
+    at the continuation while ``turn_session_id`` still names the id the stream
+    started under. The retry must not treat that as a fresh rotation: replaying
+    the original id would migrate *backwards* and raise, discarding the retry's
+    answer.
+    """
+    current = getattr(session, 'session_id', None)
+    if not current or not turn_session_id:
+        return False
+    return str(current) != str(turn_session_id)
+
+
 def _migrate_compression_rotation(session, agent, session_id, resolved_profile_name, agent_lock):
     """Move the turn's ownership and cached agent onto a compression continuation.
 
@@ -17094,6 +17109,7 @@ def _run_agent_streaming(
                         tool_limit_reached=bool(_tool_limit_reached),
                         compression_rotated=(
                             _compression_continuation_session_id is not None
+                            or _session_session_id_moved(s, session_id)
                         ),
                         echoed_context=not _current_turn_produced_a_row(
                             _previous_context_messages, _all_result_messages,
@@ -17220,6 +17236,20 @@ def _run_agent_streaming(
                                 _agent_kwargs['acp_args'] = _runtime_bundle['acp_args']
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
+                            # The rebuilt agent must be constructed on the
+                            # session's CURRENT canonical identity, not the one
+                            # captured before the first attempt. A first attempt
+                            # that already rotated through compression leaves
+                            # `s.session_id` at the continuation while this kwargs
+                            # dict still names the original: the new agent then
+                            # registers under a stale constructor id, and the
+                            # post-retry rotation below reads that stale id as a
+                            # SECOND rotation and raises with the retry's real
+                            # answer discarded (#8162-class re-gate finding).
+                            if 'session_id' in _agent_params and _agent_kwargs.get('session_id'):
+                                _agent_kwargs['session_id'] = (
+                                    getattr(s, 'session_id', None) or session_id
+                                )
                             _replaced_agent = agent
                             agent, _heal_cacheable = construct_profile_scoped_agent(
                                 _AIAgent, _agent_kwargs, profile_home=_profile_home,
@@ -17422,15 +17452,47 @@ def _run_agent_streaming(
                             # rotated leaves s.session_id at the continuation, so
                             # migrating "original" again fails the ownership check
                             # and raises with the retry's real answer discarded.
-                            _compression_origin_session_id, _compression_continuation_session_id, _compression_retry_rotated = (
-                                _migrate_compression_rotation(
-                                    s,
-                                    agent,
-                                    s.session_id,
-                                    _resolved_profile_name,
-                                    _agent_lock,
-                                )
+                            _compression_retry_rotated = False
+                            # Rename the (possibly rotated) first attempt's
+                            # session so the retry's rebuild sees the CURRENT
+                            # canonical identity instead of the pre-turn one.
+                            _canonical_session_id = (
+                                getattr(s, 'session_id', None) or session_id
                             )
+                            if _session_session_id_moved(s, session_id):
+                                # The first attempt already published the
+                                # continuation: adopt it for this turn so the
+                                # saved snapshot and the rebuilt agent agree.
+                                try:
+                                    _preserve_pre_compression_snapshot(
+                                        s, session_id, _canonical_session_id,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to preserve the first-attempt "
+                                        "compression snapshot", exc_info=True,
+                                    )
+                            if (
+                                not _session_session_id_moved(s, session_id)
+                                or not _heal_ok
+                            ):
+                                # Only a retry that ran on the turn's ORIGINAL
+                                # identity can legitimately rotate. A first
+                                # attempt that already rotated leaves the
+                                # session at the continuation: the rebuilt agent
+                                # carries that same id, so there is nothing to
+                                # migrate and re-migrating would replay the
+                                # stale turn id backwards and raise, discarding
+                                # the retry's real answer (#8011 re-gate).
+                                _compression_origin_session_id, _compression_continuation_session_id, _compression_retry_rotated = (
+                                    _migrate_compression_rotation(
+                                        s,
+                                        agent,
+                                        _canonical_session_id,
+                                        _resolved_profile_name,
+                                        _agent_lock,
+                                    )
+                                )
                             if _compression_retry_rotated:
                                 _compressed = True
                             if _heal_ok and _heal_result is not None:
