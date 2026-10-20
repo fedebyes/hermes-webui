@@ -10247,7 +10247,24 @@ function renderSessionListFromCache(){
     const hasAttentionState=isStreaming||hasUnread||Boolean(attention);
     ts.className='session-time'+(hasAttentionState?' is-hidden':'');
     ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
+    // Done marker lives in the right group beside the timestamp (built below);
+    // the state slot now carries live signals only. Live always wins: a
+    // streaming/unread/attention row must never look closed.
+    const _doneHere=!!s.done_at&&!hasAttentionState;
     titleRow.appendChild(title);
+    // Done check + timestamp share one right-aligned group: `.session-time`
+    // carries `margin-left:auto`, so a bare sibling inserted before it would be
+    // pushed to the LEFT of the title. Grouping them keeps the row reading
+    // "...  ✓ 5m" at the right edge, which is where the eye already looks.
+    const _rightGroup=document.createElement('span');
+    _rightGroup.className='session-right-group';
+    if(_doneHere){
+      const doneEl=document.createElement('span');
+      doneEl.className='session-done-check';
+      doneEl.setAttribute('aria-hidden','true');
+      doneEl.title=t('session_done_tooltip', _formatRelativeSessionTime(Number(s.done_at)*1000));
+      _rightGroup.appendChild(doneEl);
+    }
     // Project color dot: placed BETWEEN title and timestamp, not inside the
     // title span. Inside the title span it would be clipped by the ellipsis
     // truncation, becoming invisible exactly when the title is long enough
@@ -10361,7 +10378,8 @@ function renderSessionListFromCache(){
       chip.dataset.sourceKey=_sourceKeyForSession(s)||'cli';
       titleRow.appendChild(chip);
     }
-    titleRow.appendChild(ts);
+    titleRow.appendChild(_rightGroup);
+    _rightGroup.appendChild(ts);
     sessionText.appendChild(titleRow);
     if(density==='detailed'){
       const metaBits=[];
@@ -10782,8 +10800,8 @@ function renderSessionListFromCache(){
     // mistaken for a closed one, so `is-done` is only applied when the row has
     // no state class of its own.
     const _hasLiveState=isStreaming||hasUnread||!!attention;
-    const _isDone=!!s.done_at&&!_hasLiveState;
-    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''))+attentionDotClass+(_isDone?' is-done':'');
+    const _isDone=false; // done now renders as .session-done-check, beside the timestamp
+    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''))+attentionDotClass;
     state.setAttribute('aria-hidden','true');
     // Tooltip precedence: a localized attention title (pending approval/clarify,
     // from the attention-indicator feature) is more specific and actionable than
