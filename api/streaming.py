@@ -17246,7 +17246,13 @@ def _run_agent_streaming(
                             # post-retry rotation below reads that stale id as a
                             # SECOND rotation and raises with the retry's real
                             # answer discarded (#8162-class re-gate finding).
-                            if 'session_id' in _agent_params and _agent_kwargs.get('session_id'):
+                            # The rebuilt agent is constructed on the current
+                            # canonical identity, so its constructor id is never
+                            # a rotation; only its own movement during the retry
+                            # counts. A stale id it was constructed with is not a
+                            # new compression and must not be migrated backwards.
+                            _agent_kwargs_session_id = _agent_kwargs.get('session_id')
+                            if 'session_id' in _agent_params and _agent_kwargs_session_id:
                                 _agent_kwargs['session_id'] = (
                                     getattr(s, 'session_id', None) or session_id
                                 )
@@ -17496,6 +17502,18 @@ def _run_agent_streaming(
                                 _retry_agent_sid
                                 and str(_retry_agent_sid) != str(_current_owner_sid)
                                 and str(_retry_agent_sid) != str(session_id)
+                                # A rebuilt agent keeps the id it was constructed
+                                # with until it rotates itself; that id is also
+                                # newer than the session's pre-turn id (a first
+                                # attempt that already compressed), so comparing
+                                # against the turn's start would read it as a
+                                # rotation of its own and migrate backwards,
+                                # discarding the retry's real answer.
+                                and not (
+                                    _agent_kwargs_session_id
+                                    and str(_retry_agent_sid)
+                                    == str(_agent_kwargs_session_id)
+                                )
                             )
                             if _retry_rotated_on_its_own:
                                 _compression_origin_session_id, _compression_continuation_session_id, _compression_retry_rotated = (
