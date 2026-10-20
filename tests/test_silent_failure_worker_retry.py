@@ -107,6 +107,7 @@ class _LiveToolProgressAgent:
     def __init__(self, **kwargs):
         self.session_id = kwargs.get("session_id")
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.status_callback = kwargs.get("status_callback")
         self.context_compressor = None
         self.session_prompt_tokens = 0
         self.session_completion_tokens = 0
@@ -498,6 +499,7 @@ class _RaisingRetryAgent:
     def __init__(self, **kwargs):
         self.session_id = kwargs.get("session_id")
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.status_callback = kwargs.get("status_callback")
         self.context_compressor = None
         self.session_prompt_tokens = self.session_completion_tokens = 0
         self.session_cache_read_tokens = self.session_cache_write_tokens = 0
@@ -1084,4 +1086,101 @@ def test_retry_rotation_is_migrated_to_the_continuation_session(worker_scene):
     done = next(payload for event, payload in emitted if event == "done")
     assert done["session"]["session_id"] == "continuation", (
         "the done event must report the continuation session"
+    )
+
+
+class _RotatingHealAgent:
+    """First attempt rotates the session id then raises a 401; retry answers.
+
+    The credential self-heal builds a FRESH agent from the turn's kwargs, so a
+    per-instance counter cannot tell the attempts apart: the counter is
+    class-level, as in ``_RaisingRetryAgent``.
+    """
+
+    instances = []
+    calls = 0
+    answer = "Fresh retry answer."
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.status_callback = kwargs.get("status_callback")
+        self.context_compressor = None
+        self.session_prompt_tokens = self.session_completion_tokens = 0
+        self.session_cache_read_tokens = self.session_cache_write_tokens = 0
+        self.session_estimated_cost_usd = None
+        self.reasoning_config = self.ephemeral_system_prompt = self._last_error = None
+        self.pending = []
+        self.pending_lock = threading.Lock()
+        _RotatingHealAgent.instances.append(self)
+
+    def run_conversation(self, **kwargs):
+        _RotatingHealAgent.calls += 1
+        if _RotatingHealAgent.calls == 1:
+            # The first attempt already rotated through compression, then the
+            # provider returned a 401 as a result (not as a raised exception).
+            self.session_id = "continuation-one"
+            return {"messages": list(kwargs.get("conversation_history") or []),
+                    "error": "401 Unauthorized: credential expired"}
+        history = list(kwargs.get("conversation_history") or [])
+        return {
+            "messages": history
+            + [
+                {"role": "user", "content": "Do the task."},
+                {"role": "assistant", "content": _RotatingHealAgent.answer},
+            ],
+        }
+
+    def interrupt(self, _message):
+        return None
+
+    def steer(self, _text):
+        return True
+
+    def _drain_pending_steer(self):
+        return None
+
+
+def test_the_401_self_heal_rebuilds_on_the_current_continuation_identity(
+    worker_scene, monkeypatch,
+):
+    """The rebuilt agent must not be constructed on the turn's stale session id.
+
+    The first attempt rotates ``original`` -> ``continuation-one`` and then
+    returns a 401. The self-heal rebuilt the Agent from the turn's kwargs, which
+    still named ``original``; the post-retry migration then read that stale
+    constructor id as a SECOND rotation (``continuation-one -> original``),
+    raised ``Failed to migrate compressed-session ownership`` and discarded the
+    successful retry's answer (no answer saved, ``apperror`` terminal).
+    """
+    scene = worker_scene
+    _RotatingHealAgent.instances = []
+    _RotatingHealAgent.calls = 0
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: _RotatingHealAgent)
+
+    # A resolved runtime is required for the credential heal to rebuild.
+    monkeypatch.setattr(
+        streaming, "_attempt_credential_self_heal",
+        lambda *a, **kw: {"api_key": "fresh-key", "provider": "test-provider",
+                          "base_url": "https://api.test/v1"},
+    )
+
+    scene.run()
+
+    assert _RotatingHealAgent.calls == 2, "the 401 must have reached the retry"
+    built = [agent.session_id for agent in _RotatingHealAgent.instances]
+    assert "continuation-one" in built, (
+        "the rebuilt agent must be constructed on the session's CURRENT "
+        f"continuation identity, not the pre-turn one; built {built}"
+    )
+    assert scene.session.session_id == "continuation-one", (
+        "the retry must not migrate the continuation back to the stale id"
+    )
+    saved = [str(row.get("content") or "") for row in scene.session.messages]
+    assert saved.count(_RotatingHealAgent.answer) == 1, (
+        f"the successful retry's answer must be saved exactly once, got {saved}"
+    )
+    emitted = [event for event, _payload in list(scene.events.queue)]
+    assert "apperror" not in emitted, (
+        "a successful retry must not end with a migration error card"
     )
