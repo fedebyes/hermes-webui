@@ -17202,23 +17202,37 @@ def _run_agent_streaming(
                                         "Failed to preserve the first-attempt "
                                         "compression snapshot", exc_info=True,
                                     )
-                            if (
-                                not _session_session_id_moved(s, session_id)
-                                or not _heal_ok
-                            ):
-                                # Only a retry that ran on the turn's ORIGINAL
-                                # identity can legitimately rotate. A first
-                                # attempt that already rotated leaves the
-                                # session at the continuation: the rebuilt agent
-                                # carries that same id, so there is nothing to
-                                # migrate and re-migrating would replay the
-                                # stale turn id backwards and raise, discarding
-                                # the retry's real answer (#8011 re-gate).
+                            # Migrate only when the retry agent ended on an id
+                            # that is NEW for this turn — a rotation of its own.
+                            # The three shapes on this path:
+                            #  * first attempt rotated, retry did NOT: the agent
+                            #    still carries the pre-turn id, the session owns
+                            #    the continuation. Migrating would replay
+                            #    `continuation -> original` backwards and raise,
+                            #    discarding the answer (#8011 re-gate);
+                            #  * first attempt rotated, retry rotated again: the
+                            #    agent id is a continuation the session does not
+                            #    own yet -> migrate instead of the old shape that
+                            #    skipped every migration once the first attempt
+                            #    had moved, saving under the intermediate id with
+                            #    no continuation-two sidecar
+                            #    (review 5579083178 follow-up);
+                            #  * no rotation at all: agent id equals the owner.
+                            _retry_agent_sid = getattr(agent, 'session_id', None)
+                            _current_owner_sid = (
+                                getattr(s, 'session_id', None) or session_id
+                            )
+                            _retry_rotated_on_its_own = bool(
+                                _retry_agent_sid
+                                and str(_retry_agent_sid) != str(_current_owner_sid)
+                                and str(_retry_agent_sid) != str(session_id)
+                            )
+                            if _retry_rotated_on_its_own:
                                 _compression_origin_session_id, _compression_continuation_session_id, _compression_retry_rotated = (
                                     _migrate_compression_rotation(
                                         s,
                                         agent,
-                                        _canonical_session_id,
+                                        _current_owner_sid,
                                         _resolved_profile_name,
                                         _agent_lock,
                                     )
