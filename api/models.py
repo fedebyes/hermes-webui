@@ -12584,22 +12584,24 @@ def get_state_db_session_summary(sid, *, profile=None) -> dict:
             available = {str(row['name']) for row in cur.fetchall()}
             if 'session_id' not in available:
                 return {"message_count": 0, "last_message_at": 0.0}
-            # #7882: the summary aggregate feeds the sidebar growth guard, which
-            # compares it against the DETAILED reader's count. The detailed
-            # reader excludes inactive archive rows by default
-            # (`include_inactive=False`), so counting them here would compare
-            # two different row domains: a static store with two active rows
-            # and four `active=0` archives looked like a concurrent append on
-            # every poll, sending the overlay down the raw-growth fallback and
-            # reporting 6 instead of 2. Mirror the reader's clause exactly, and
-            # keep the unfiltered count only when the column is absent.
-            active_clause = ""
-            if 'active' in available:
-                active_clause = " AND (active IS NULL OR active != 0)"
+            # #7882 re-gate: this aggregate is a GROWTH signal, not a display
+            # count, so it must stay in the RAW row domain. Both of its
+            # consumers compare it with a count that spans every persisted
+            # row -- `_metadata_only_message_summary()` against the sidecar's
+            # message count, `_maybe_sync_newer_sidecar_from_state_db()`
+            # against `len(session.messages)` -- and require `state >
+            # sidecar` before exposing a newer transcript. Filtering
+            # `active = 0` here changed the count domain without changing
+            # theirs: a six-row sidecar whose first four state.db rows were
+            # archived reported 6 and the old timestamp on the metadata poll
+            # while the full load reported 8 and the new reply, i.e. the
+            # growth signal died after a compaction. The sidebar overlay's
+            # active-domain need is served separately by the batch
+            # aggregate's `active_message_count`.
             if 'timestamp' in available:
                 cur.execute(
                     "SELECT COUNT(*) AS message_count, MAX(timestamp) AS last_message_at "
-                    "FROM messages WHERE session_id = ?" + active_clause,
+                    "FROM messages WHERE session_id = ?",
                     (str(sid),),
                 )
                 row = cur.fetchone()

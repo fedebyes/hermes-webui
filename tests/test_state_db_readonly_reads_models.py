@@ -227,13 +227,15 @@ def test_get_state_db_session_summary_opens_read_only(tmp_path, monkeypatch):
     _assert_read_only(calls)
 
 
-def test_summary_counts_the_same_row_domain_as_the_detailed_reader(tmp_path, monkeypatch):
-    """Archive rows stay out of the summary, exactly as they stay out of the reader.
+def test_summary_keeps_the_raw_row_domain_for_the_growth_guard(tmp_path, monkeypatch):
+    """The summary aggregate stays RAW; the reader's active filter is display-only.
 
-    The sidebar growth guard compares the summary aggregate with the detailed
-    reader's count. The reader excludes ``active = 0`` archive rows by default;
-    counting them in the summary made a static store with two active rows and
-    four archives look like a concurrent append on every poll (#7882 re-gate).
+    Both consumers of this aggregate compare it with a count that spans every
+    persisted row (the sidecar's message count) and require ``state > sidecar``
+    before exposing a newer transcript, so filtering ``active = 0`` here kills
+    the growth signal after a compaction (#8368 re-gate). The sidebar overlay's
+    active-domain need is served by the batch aggregate's
+    ``active_message_count``, not by this per-session summary.
     """
     db = tmp_path / "state.db"
     conn = sqlite3.connect(str(db))
@@ -268,12 +270,12 @@ def test_summary_counts_the_same_row_domain_as_the_detailed_reader(tmp_path, mon
     summary = models.get_state_db_session_summary("sess-arch")
     detailed = models.get_state_db_session_messages("sess-arch")
 
-    assert summary["message_count"] == 2
-    assert len(detailed) == 2
-    assert summary["message_count"] == len(detailed), (
-        "the growth guard reads both; counting archives in one domain and not "
-        "the other reports a static store as a concurrent append"
+    assert summary["message_count"] == 6, (
+        "the growth signal must span every persisted row; the active-only "
+        "domain hid a post-compaction append from the metadata poll"
     )
+    assert summary["last_message_at"] == 1001.0
+    assert len(detailed) == 2, "the display reader keeps excluding archive rows"
 
 
 def test_count_conversation_rounds_opens_read_only(tmp_path, monkeypatch):
