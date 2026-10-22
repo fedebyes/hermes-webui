@@ -55,16 +55,16 @@ _CHECKOUT_LISTING_DEPTH = 16
 # it must never be read as ownership.
 _CHECKOUT_SEARCH_MAX_DIRS = 8192
 
-# Directory names the claim search does not descend into. They hold dependency or
-# tooling trees, not a repository checkout, so skipping them keeps the search
-# cheap on ordinary working trees.
+# Directory names the claim search does not walk to completion. They hold
+# dependency or tooling trees, so walking them costs far more than it can be
+# worth on an ordinary working tree.
 #
-# Skipping is only a *sound* stop when the skipped directory lies inside the
-# plain-layout candidate itself (a repository's own ``node_modules`` or
-# ``.venv``). Outside the candidate it hides a place a claiming checkout can
-# live — ``<base>/node_modules/pkg/checkout`` next to ``<base>/storage/.git`` is
-# exactly the ``--separate-git-dir`` shape — so such a skip makes the claim
-# search incomplete and the plain layout unknown. See ``_claiming_checkout``.
+# A skip is a cost decision and never evidence either way: ``_skip_claim_probe``
+# looks inside the tree for a claim on this metadata before the search moves on.
+# A ``--separate-git-dir`` checkout parks two levels inside one of these
+# (``node_modules/pkg/checkout``, ``.venv/src/checkout``), both beside the
+# storage dir and inside the plain candidate, so "we chose not to walk it" must
+# never become "there is nothing in it". See ``_claiming_checkout``.
 _CHECKOUT_SKIP_DESCENT = frozenset(
     {
         ".mypy_cache",
@@ -78,6 +78,15 @@ _CHECKOUT_SKIP_DESCENT = frozenset(
         "venv",
     }
 )
+
+# How deep the claim probe looks inside one skipped dependency directory. A
+# ``--separate-git-dir`` checkout parked in a dependency tree sits two levels
+# below it (``node_modules/pkg/checkout``), and a real dependency tree is far
+# too large to walk, so the probe is bounded and *truncation* is reported back
+# as such by ``_skip_claim_probe``. Neither inside nor outside the plain
+# candidate is a skip taken on faith: skipping is a cost decision, and a
+# decision to stop looking is not evidence that nothing is there.
+_CHECKOUT_SKIP_PROBE_DEPTH = 4
 
 
 def _run_git(args: list[str], cwd: str | Path, timeout: float = 2) -> subprocess.CompletedProcess:
@@ -478,8 +487,11 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     When no claim exists the layout is ambiguous — a ``--separate-git-dir``
     storage dir is shaped exactly like a plain checkout — and the plain layout
     is accepted only when the claim search *finished*: no unreadable level, no
-    listing budget exhausted, no depth cut, and no directory skipped outside the
-    candidate itself. Any such gap leaves ownership **unknown** and the answer
+    listing budget exhausted and no depth cut below an ancestor level. A skipped
+    dependency directory is not a gap on faith: the search probes inside it for a
+    claim (see ``_skip_claim_probe``) before deciding, so a checkout parked at
+    ``node_modules/pkg/checkout`` is found instead of being read as "nothing
+    there". Any remaining gap leaves ownership **unknown** and the answer
     ``None``, so the caller keeps the workspace's own toplevel — which nests at
     worst, but never starts a session inside git's bookkeeping. The one
     documented limit of the search region is that a claim nested deeper than one
@@ -488,6 +500,11 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     gap, a plain layout is still accepted there: when the workspace is *not*
     inside the claiming checkout (a session opened on the storage dir itself),
     the metadata dir may be promoted as the repo root.
+
+    A claim found below the plain candidate is layout-ambiguous on its own — the
+    real checkout of separate storage, or a stale alias left inside the real
+    checkout — so ``_prefer_checkout_over_plain`` asks git which of the two
+    directories still carries the committed tree before answering.
     """
     ws = Path(workspace).expanduser().resolve()
     if not ws.is_dir():
@@ -506,14 +523,19 @@ def find_main_worktree_root(workspace: str | Path) -> Path | None:
     if not _is_linked_worktree(ws, common_path):
         owner = _checkout_from_ancestry(ws, common_resolved)
         if owner is not None:
-            return owner
+            # Same adjudication as below: the workspace's own ancestors can
+            # hold either the real checkout or a stale alias of the plain one.
+            return _prefer_checkout_over_plain(owner, common_resolved)
 
     # The plain layout would crown the metadata's parent; that directory is the
     # scope every stop is judged against.
     scope = common_resolved.parent if common_resolved.name == ".git" else None
     owner, search_complete = _claiming_checkout(common_resolved, scope=scope)
     if owner is not None:
-        return owner
+        # A claim below the plain candidate is layout-ambiguous: real checkout
+        # of separate storage, or a stale alias inside the real checkout. Git's
+        # own view of which directory holds the committed tree decides.
+        return _prefer_checkout_over_plain(owner, common_resolved)
 
     # No gitfile claimed the metadata. Decide from recorded topology only, and
     # only when the claim search really finished: a truncated search — or one
@@ -631,13 +653,14 @@ def _claiming_checkout(
       look;
     * a level was cut by :data:`_CHECKOUT_LISTING_DEPTH`: a claim may sit below;
     * the ancestor probe ended before the filesystem root;
-    * a directory the search refused to enter lay **outside** *scope* (the
-      directory the plain layout would crown). Those are exactly the places a
-      ``--separate-git-dir`` checkout can hide while its metadata looks like
-      ``<scope>/.git``: ``<base>/node_modules/pkg/checkout``,
-      ``<base>/.venv/...``, ``<base>/vendor/otherrepo/...``. A stop *inside*
-      the candidate — its own ``node_modules``, ``.venv``, ``.worktrees`` — is
-      sound, which is what keeps ordinary repositories resolving.
+    * a skipped dependency directory could not be probed completely — the shared
+      listing budget ran out inside it.
+
+    Skipping a dependency directory is a cost decision, so it is never read as
+    evidence in either direction: :func:`_skip_claim_probe` looks inside it for a
+    claim and reports whether it covered the region it was given. That is what
+    keeps an ordinary repository resolving beside an unrelated ``node_modules``
+    while a checkout parked in one is still found.
 
     The region is fixed: the metadata's parent and its parent, each listed with
     bounded descent, then the **immediate children** of every ancestor up to the
@@ -692,7 +715,7 @@ def _claiming_checkout(
         # ``<super>/.git/modules/<name>``: the submodule lives in ``<super>/<name>``.
         roots.append((parent.parent.parent, _CHECKOUT_LISTING_DEPTH))
 
-    budget = _CHECKOUT_SEARCH_MAX_DIRS
+    budget = [_CHECKOUT_SEARCH_MAX_DIRS]
     for root, limit in roots:
         # A git metadata directory is never a container of checkouts (the
         # submodule or storage checkout lives beside it, not inside it), so
@@ -737,17 +760,25 @@ def _claiming_checkout(
                     depth + 1 < _CHECKOUT_LISTING_DEPTH and depth + 1 <= limit
                 )
                 if descendable:
-                    if budget <= 0:
+                    if budget[0] <= 0:
                         return None, False
-                    budget -= 1
+                    budget[0] -= 1
                 child = Path(child_str)
-                # Descend only past the dependency trees and outside other
-                # checkouts; stopping there is a deliberate policy, not an
-                # unfinished search — but only where the stop cannot hide a
-                # claim on this metadata. Outside the plain candidate it can.
+                # Dependency and tooling trees are not walked to completion, but
+                # a skip is a cost decision, never evidence: a
+                # ``--separate-git-dir`` checkout parks two levels inside one of
+                # them (``node_modules/pkg/checkout``), inside the plain
+                # candidate as well as beside it. Probe the tree instead of
+                # guessing, and let the probe say whether stopping left a gap.
                 if entry.name in _CHECKOUT_SKIP_DESCENT:
-                    if descendable and not _within_scope(child, scope):
-                        incomplete = True
+                    if descendable:
+                        skip_claim, exhausted = _skip_claim_probe(
+                            child, common_resolved, budget
+                        )
+                        if skip_claim is not None:
+                            return skip_claim, True
+                        if exhausted:
+                            incomplete = True
                     continue
                 if has_git:
                     # A checkout of some repository: not a container of one.
@@ -769,6 +800,113 @@ def _claiming_checkout(
             stack.extend(reversed(children))
 
     return None, not incomplete
+
+
+def _skip_claim_probe(
+    root: Path, common_resolved: Path, budget: list[int]
+) -> tuple[Path | None, bool]:
+    """Look for a gitfile claim inside a skipped dependency directory.
+
+    Returns ``(owner, exhausted)``. A dependency tree is never walked to
+    completion, so the probe stops at :data:`_CHECKOUT_SKIP_PROBE_DEPTH`; that
+    depth is a documented region limit rather than a gap, because a checkout
+    parked in a dependency tree sits two levels below it and every real
+    ``node_modules`` nests far deeper than any checkout does. Running out of the
+    shared listing *budget* is different: it means the probe stopped before the
+    region it was given was covered, and it answers ``exhausted=True`` so the
+    caller reports unknown ownership instead of "no claim".
+    """
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+        except OSError:
+            return None, True
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            if entry.name == ".git":
+                continue
+            child = Path(entry.path)
+            if os.path.lexists(os.path.join(entry.path, ".git")):
+                # A checkout of some repository: the claim, or not ours.
+                owner = _gitfile_owner(child, common_resolved)
+                if owner is not None:
+                    return owner, False
+                continue
+            if depth + 1 >= _CHECKOUT_SKIP_PROBE_DEPTH:
+                continue
+            if budget[0] <= 0:
+                return None, True
+            budget[0] -= 1
+            stack.append((child, depth + 1))
+    return None, False
+
+
+def _holds_its_committed_tree(checkout: Path) -> bool | None:
+    """True when *checkout*'s working tree still carries its committed paths.
+
+    Decided by git, not by this module: ``status`` with untracked files ignored
+    reports a committed path that is missing or modified on disk. A
+    ``--separate-git-dir`` storage dir, a stale gitfile alias and an operator's
+    note dump all report deleted committed paths, while the directory that
+    really holds the files does not. Untracked content is ignored on purpose —
+    every working tree carries build output and dependency trees — and ``None``
+    means git could not answer, which is not evidence either way.
+    """
+    try:
+        result = _run_git(
+            ["status", "--porcelain", "--untracked-files=no"], checkout, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return not result.stdout.strip()
+
+
+def _prefer_checkout_over_plain(claimant: Path, common_resolved: Path) -> Path | None:
+    """Pick between a gitfile claimant and a plain layout that owns the metadata.
+
+    When the plain candidate's own ``.git`` *is* this metadata and a gitfile
+    below it also names this metadata, the two layouts are identical on disk
+    and mean opposite things:
+
+    * the claimant is the real checkout of a ``--separate-git-dir`` repository
+      whose storage dir sits above it — ``storage-only/node_modules/pkg/checkout``
+      (the plain candidate is then just the storage dir);
+    * the claimant is a stale alias left inside the real checkout —
+      ``primary/new/deep/.git`` pointing at ``primary/.git`` (the plain
+      candidate is then the real checkout).
+
+    Layout cannot tell them apart, so the question asked is the one git can
+    answer: which directory still holds the committed tree. The other is
+    bookkeeping. When neither or both answer, ownership stays unknown and the
+    caller keeps its own checkout — never a session inside git's bookkeeping.
+    """
+    parent = _as_dir(common_resolved.parent)
+    if (
+        parent is None
+        or common_resolved.name != ".git"
+        or not _plain_git_dir_owner(parent, common_resolved)
+    ):
+        # No plain layout to weigh against: the claim is the only evidence.
+        return claimant
+    if parent == claimant:
+        return claimant
+    claim_holds = _holds_its_committed_tree(claimant)
+    plain_holds = _holds_its_committed_tree(parent)
+    if claim_holds is None or plain_holds is None:
+        return claimant
+    if claim_holds == plain_holds:
+        # Both hold it (a duplicate export) or neither does (an empty
+        # repository): nothing separates them, so do not guess.
+        return None
+    return claimant if claim_holds else parent
 
 
 def _nested_claim(checkout: Path, common_resolved: Path) -> Path | None:
@@ -832,14 +970,16 @@ def _topology_candidate(
     (``claim_search_complete``): a ``--separate-git-dir`` storage dir named
     ``.git`` has exactly the same shape as a plain checkout, so its ownership is
     decided by the claim its real checkout makes elsewhere — and when that claim
-    was not found because the search was truncated *or* because it had to skip
-    directories outside this candidate (``<base>/node_modules/…``,
-    ``<base>/vendor/otherrepo/…``), the answer is ``None``. Unknown ownership
+    was not found because the search was truncated (budget exhausted, a level
+    unreadable, an ancestor unprobed), the answer is ``None``. Unknown ownership
     stays unknown, and the caller keeps the checkout it has: nesting at worst,
     never a session inside git's bookkeeping. The exception is the documented
     search-region boundary (see ``find_main_worktree_root``): a claim that lives
     beyond the region is not a gap, so the plain layout is accepted there while
-    the workspace is not inside the claiming checkout.
+    the workspace is not inside the claiming checkout. When a claim *is* found
+    and the plain layout also owns the metadata, this function has already been
+    preceded by ``_prefer_checkout_over_plain``, so the ambiguous pair never
+    reaches here unresolved.
     """
     recorded = _core_worktree(common_path)
     if recorded is not None:

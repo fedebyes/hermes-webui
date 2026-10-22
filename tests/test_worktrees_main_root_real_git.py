@@ -761,7 +761,7 @@ def test_inside_and_outside_the_search_boundary(git_env):
 def _separate_git_dir_checkout(base, checkout, metadata):
     """``git init --separate-git-dir=<metadata>/.git <checkout>`` with one commit."""
     checkout.mkdir(parents=True)
-    metadata.mkdir(parents=True)
+    metadata.mkdir(parents=True, exist_ok=True)
     _git("init", "-q", "-b", "main", f"--separate-git-dir={metadata / '.git'}", cwd=checkout)
     (checkout / "tracked.txt").write_text("committed\n", encoding="utf-8")
     _git("add", "tracked.txt", cwd=checkout)
@@ -770,16 +770,17 @@ def _separate_git_dir_checkout(base, checkout, metadata):
 
 
 @pytest.mark.parametrize("skipped", ["node_modules", ".venv", "site-packages"])
-def test_checkout_under_a_skipped_directory_is_unknown_not_storage(
+def test_checkout_under_a_skipped_directory_resolves_not_storage(
     git_env, monkeypatch, skipped
 ):
-    """A checkout inside a skipped dir makes the plain layout unknown.
+    """A checkout inside a skipped dir is found, never rounded up to storage.
 
     The metadata is ``<base>/storage/.git``; the real checkout is
-    ``<base>/<skipped>/pkg/checkout``. Skipping ``<skipped>`` is a deliberate
-    cost decision, but it hides the claim, so the search is *not* complete and
-    the metadata's parent must never be crowned. The allocation control then
-    keeps the caller's own checkout.
+    ``<base>/<skipped>/pkg/checkout``. Skipping ``<skipped>`` is a cost
+    decision, not evidence, so the probe looks inside it: the claim is found and
+    the real checkout is answered. The metadata's parent is never crowned, and
+    the allocation control keeps the caller's own checkout when the claim is out
+    of reach.
     """
     base = git_env / f"skipped-{skipped.strip('.')}"
     storage = base / "storage"
@@ -794,7 +795,7 @@ def test_checkout_under_a_skipped_directory_is_unknown_not_storage(
         root = find(workspace)
         assert root != storage.resolve(), f"{workspace}: storage must never be answered"
 
-    assert find(linked) is None, "a skip outside the candidate is unknown ownership"
+    assert find(linked) == checkout.resolve(), "a skip must not hide the real checkout"
 
     created = []
     seen = _stub_agent_setup(monkeypatch, created)
@@ -806,11 +807,12 @@ def test_checkout_under_a_skipped_directory_is_unknown_not_storage(
     assert not Path(info["path"]).resolve().is_relative_to(storage.resolve())
 
 
-def test_checkout_zero_colliding_content_still_unknown_not_storage(git_env):
+def test_checkout_zero_colliding_content_still_resolves_not_storage(git_env):
     """Same layout with nothing in common between storage and the checkout.
 
-    Pins the layout rule to the *skip*, not to any content coincidence: with no
-    colliding file at all the answer must still refuse storage.
+    Pins the rule to the *claim*, not to any content coincidence: the checkout
+    is answered because its gitfile names this metadata, and the metadata's
+    parent is never crowned.
     """
     base = git_env / "skipped-empty"
     storage = base / "storage"
@@ -822,7 +824,7 @@ def test_checkout_zero_colliding_content_still_unknown_not_storage(git_env):
 
     assert list(storage.iterdir()) == [storage / ".git"]
     find = _import()
-    assert find(linked) is None
+    assert find(linked) == checkout.resolve()
     assert find(linked) != storage.resolve()
 
 
@@ -925,4 +927,91 @@ def test_plain_repo_deep_under_home_like_nesting_resolves(git_env):
 
     find = _import()
     assert find(linked) == primary.resolve()
+
+
+def test_checkout_inside_the_candidate_own_dependency_tree_is_the_real_checkout(
+    git_env, monkeypatch
+):
+    """A claim parked in the *candidate's own* dependency tree still wins.
+
+    Re-gate case 1: the metadata is ``<storage>/.git`` and the real checkout is
+    ``<storage>/node_modules/pkg/checkout``. The skip is inside the plain
+    candidate, so treating it as sound crowns storage; treating it as a gap
+    makes the layout unknown. Neither is right -- the claim is simply there, at
+    the depth a checkout parks at, and the probe finds it. The allocation
+    control asserts the Agent is never handed storage.
+    """
+    base = git_env / "candidate-own-dep"
+    storage = base / "storage-only"
+    checkout = _separate_git_dir_checkout(
+        base, storage / "node_modules" / "pkg" / "checkout", storage
+    )
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "linked", str(linked), cwd=checkout)
+
+    find = _import()
+    for workspace in (linked, checkout):
+        assert find(workspace) == checkout.resolve(), f"{workspace}: storage was crowned"
+    assert find(linked) != storage.resolve()
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+    from api.worktrees import create_worktree_for_workspace
+
+    create_worktree_for_workspace(linked)
+    assert Path(seen["repo_root"]).resolve() == checkout.resolve()
+
+
+def test_plain_primary_resolves_beside_an_unrelated_sibling_dependency_dir(
+    git_env, monkeypatch
+):
+    """Re-gate case 2: an ordinary primary is not made unknown by a neighbour.
+
+    ``<base>/node_modules`` sits beside ``<base>/primary``. The skip is probed
+    and holds no claim, so the search is complete and the ordinary primary keeps
+    resolving -- the behaviour this PR exists to restore. The allocation lands
+    under the primary, not under the caller's own checkout.
+    """
+    base = git_env / "sibling-dep"
+    primary = _init_repo(base / "primary")
+    (base / "node_modules" / "dep" / "lib").mkdir(parents=True)
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
+
+    find = _import()
+    assert find(primary) == primary.resolve()
+    assert find(linked) == primary.resolve()
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+    from api.worktrees import create_worktree_for_workspace
+
+    info = create_worktree_for_workspace(linked)
+    assert Path(seen["repo_root"]).resolve() == primary.resolve()
+    assert Path(info["path"]).resolve().is_relative_to(primary.resolve())
+
+
+@pytest.mark.parametrize("entry", ["linked", "primary", "primary/new/deep"])
+def test_stale_gitfile_alias_inside_the_primary_is_not_the_checkout(git_env, entry):
+    """Re-gate case 3: a stale alias must not outrank the checkout holding the files.
+
+    ``primary/new/deep/.git`` is a leftover gitfile naming ``primary/.git``. Both
+    directories claim the same metadata, so the layout is ambiguous by
+    construction: git itself answers which of them carries the committed tree,
+    and that is the primary. Asked from the linked worktree, from the primary and
+    from the alias directory itself, the answer stays the primary.
+    """
+    base = git_env / "stale-alias"
+    primary = _init_repo(base / "primary")
+    stale = primary / "new" / "deep"
+    stale.mkdir(parents=True)
+    (stale / ".git").write_text(
+        f"gitdir: {primary / '.git'}\n", encoding="utf-8"
+    )
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
+
+    find = _import()
+    workspace = {"linked": linked, "primary": primary, "primary/new/deep": stale}[entry]
+    assert find(workspace) == primary.resolve()
 
