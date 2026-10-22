@@ -929,22 +929,24 @@ def test_plain_repo_deep_under_home_like_nesting_resolves(git_env):
     assert find(linked) == primary.resolve()
 
 
+@pytest.mark.parametrize("skipped", ["node_modules", ".venv"])
 def test_checkout_inside_the_candidate_own_dependency_tree_is_the_real_checkout(
-    git_env, monkeypatch
+    git_env, monkeypatch, skipped
 ):
     """A claim parked in the *candidate's own* dependency tree still wins.
 
-    Re-gate case 1: the metadata is ``<storage>/.git`` and the real checkout is
-    ``<storage>/node_modules/pkg/checkout``. The skip is inside the plain
+    Re-gate case 1, both candidate-owned skip directories: the metadata is
+    ``<storage>/.git`` and the real checkout is
+    ``<storage>/<skipped>/pkg/checkout``. The skip is inside the plain
     candidate, so treating it as sound crowns storage; treating it as a gap
     makes the layout unknown. Neither is right -- the claim is simply there, at
     the depth a checkout parks at, and the probe finds it. The allocation
     control asserts the Agent is never handed storage.
     """
-    base = git_env / "candidate-own-dep"
+    base = git_env / f"candidate-own-dep-{skipped.strip('.')}"
     storage = base / "storage-only"
     checkout = _separate_git_dir_checkout(
-        base, storage / "node_modules" / "pkg" / "checkout", storage
+        base, storage / skipped / "pkg" / "checkout", storage
     )
     linked = base / "linked"
     _git("worktree", "add", "-q", "-b", "linked", str(linked), cwd=checkout)
