@@ -228,3 +228,157 @@ def test_optional_status_failure_does_not_abort_creation(git_env, monkeypatch):
     info = create_worktree_for_workspace(nested)  # must not raise
     assert Path(seen["repo_root"]).resolve() == primary.resolve()
     assert Path(info["path"]).resolve().is_relative_to(primary.resolve())
+
+
+# --- re-gate 6d508a948: two ownership problems -------------------------------------
+#
+# 1. The cleanliness adjudicator was applied to EVERY claimant, although it only
+#    describes the ambiguous pair (claimant below the plain candidate). An
+#    ordinary external separate checkout lost its claim whenever the primary
+#    carried any modified/staged/deleted state, so allocation nested under the
+#    linked checkout instead of the real one.
+# 2. A failed `status` probe returned `None` from `_holds_its_committed_tree`,
+#    and the caller read unknown as "the claimant wins" -- reauthorizing a
+#    stale alias the moment git status misbehaved.
+
+
+def _external_separate(base):
+    """`base/checkout/.git -> base/storage-only/.git`, linked worktree at base/linked.
+
+    Two committed files so the "deleted" variant can remove a file *different*
+    from the modified one, exactly as the re-gate described.
+    """
+    storage = base / "storage-only"
+    checkout = base / "checkout"
+    storage.mkdir(parents=True)
+    checkout.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", f"--separate-git-dir={storage / '.git'}", cwd=checkout)
+    for name in ("tracked.txt", "second.txt"):
+        (checkout / name).write_text(f"committed {name}\n", encoding="utf-8")
+        _git("add", name, cwd=checkout)
+    _git("commit", "-q", "-m", "init", cwd=checkout)
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=checkout)
+    nested = linked / "nested"
+    nested.mkdir()
+    return checkout, storage, linked, nested
+
+
+def _make_dirty(checkout, kind):
+    if kind == "modified":
+        (checkout / "tracked.txt").write_text("modified content\n", encoding="utf-8")
+    elif kind == "staged":
+        (checkout / "tracked.txt").write_text("staged content\n", encoding="utf-8")
+        _git("add", "tracked.txt", cwd=checkout)
+    elif kind == "deleted":
+        (checkout / "second.txt").unlink()
+    else:  # pragma: no cover
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", ["modified", "staged", "deleted"])
+def test_external_separate_checkout_keeps_ownership_while_primary_is_dirty(
+    git_env, monkeypatch, kind
+):
+    """Ordinary working-tree state is not evidence the checkout stopped owning it."""
+    from api.worktrees import create_worktree_for_workspace
+
+    checkout, storage, linked, nested = _external_separate(git_env / f"dirty-ext-{kind}")
+    _make_dirty(checkout, kind)
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+    info = create_worktree_for_workspace(nested)
+
+    root = Path(seen["repo_root"]).resolve()
+    assert root == checkout.resolve(), (
+        f"{kind}: the real checkout still owns the repository; the cleanliness "
+        f"probe answered for a pair that is not ambiguous at all"
+    )
+    assert root != storage.resolve()
+    assert Path(info["path"]).resolve().is_relative_to(checkout.resolve())
+    assert not Path(info["path"]).resolve().is_relative_to(linked.resolve()), (
+        f"{kind}: allocation must not nest under the linked checkout"
+    )
+
+
+def test_external_separate_checkout_adjudicator_is_scoped_to_the_ambiguous_pair(monkeypatch):
+    """The unit rule: a claimant outside the plain candidate is never adjudicated."""
+    import api.worktrees as worktrees
+
+    storage = Path("/tmp/base/storage-only")
+    external = Path("/tmp/base/checkout")
+    ambiguous = storage / "node_modules" / "pkg" / "checkout"
+
+    calls = []
+
+    def _boom(*a, **kw):  # pragma: no cover - must never be consulted
+        calls.append(a)
+        return True
+
+    monkeypatch.setattr(worktrees, "_holds_its_committed_tree", _boom)
+    monkeypatch.setattr(worktrees, "_plain_git_dir_owner", lambda *a, **kw: True)
+    monkeypatch.setattr(worktrees, "_as_dir", lambda p: Path(p))
+
+    assert worktrees._prefer_checkout_over_plain(external, storage / ".git") == external
+    assert calls == [], "cleanliness was consulted for an unambiguous external checkout"
+
+    # The ambiguous pair still consults it.
+    worktrees._prefer_checkout_over_plain(ambiguous, storage / ".git")
+    assert calls, "the ambiguous pair must still be adjudicated by git"
+
+
+def _stale_alias(base):
+    """`primary/new/deep/.git -> primary/.git`: a stale alias inside the primary."""
+    primary = base / "primary"
+    primary.mkdir(parents=True)
+    _git("init", "-q", "-b", "main", cwd=primary)
+    for name in ("tracked.txt", "second.txt"):
+        (primary / name).write_text(f"committed {name}\n", encoding="utf-8")
+    _git("add", "tracked.txt", "second.txt", cwd=primary)
+    _git("commit", "-q", "-m", "init", cwd=primary)
+    linked = base / "linked"
+    _git("worktree", "add", "-q", "-b", "side", str(linked), cwd=primary)
+    deep = primary / "new" / "deep"
+    deep.mkdir(parents=True)
+    (deep / ".git").write_text(f"gitdir: {(primary / '.git').resolve()}\n", encoding="utf-8")
+    nested = linked / "nested"
+    nested.mkdir()
+    return primary, linked, deep, nested
+
+
+@pytest.mark.parametrize("failure", ["oserror", "timeout", "nonzero"])
+def test_unknown_status_probe_never_authorizes_the_stale_alias(
+    git_env, monkeypatch, failure
+):
+    """Unknown is not an affirmative ownership answer: keep our own checkout."""
+    import api.worktrees as worktrees
+    from api.worktrees import create_worktree_for_workspace
+
+    primary, linked, deep, nested = _stale_alias(git_env / f"stalestat-{failure}")
+    real_run = worktrees._run_git
+
+    def fake_run(args, cwd, timeout=2):
+        if list(args[:1]) == ["status"] and "--untracked-files=no" in args:
+            if failure == "oserror":
+                raise OSError("injected: status unavailable")
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(cmd="git", timeout=5)
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout="", stderr="boom"
+            )
+        return real_run(args, cwd, timeout=timeout)
+
+    monkeypatch.setattr(worktrees, "_run_git", fake_run)
+
+    created = []
+    seen = _stub_agent_setup(monkeypatch, created)
+    info = create_worktree_for_workspace(nested)
+
+    root = Path(seen["repo_root"]).resolve()
+    assert root != deep.resolve(), (
+        f"{failure}: an unproved stale alias was handed to the Agent just "
+        f"because the status probe failed"
+    )
+    assert not Path(info["path"]).resolve().is_relative_to(deep.resolve())
+    assert root in (primary.resolve(), linked.resolve()), failure

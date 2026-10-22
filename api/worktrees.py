@@ -885,8 +885,16 @@ def _prefer_checkout_over_plain(claimant: Path, common_resolved: Path) -> Path |
 
     Layout cannot tell them apart, so the question asked is the one git can
     answer: which directory still holds the committed tree. The other is
-    bookkeeping. When neither or both answer, ownership stays unknown and the
-    caller keeps its own checkout — never a session inside git's bookkeeping.
+    bookkeeping. When neither or both answer -- or when the probe itself fails
+    -- ownership stays unknown and the caller keeps its own checkout, never a
+    session inside git's bookkeeping.
+
+    Only that ambiguous pair is adjudicated. A claimant that is not below the
+    plain candidate is an ordinary external separate checkout: it is not
+    competing with the storage dir, so its claim stands whether or not the
+    primary happens to be dirty. Unknown probe results are likewise not an
+    affirmative ownership answer — treating them as one reauthorized a stale
+    alias the moment `git status` failed.
     """
     parent = _as_dir(common_resolved.parent)
     if (
@@ -898,10 +906,32 @@ def _prefer_checkout_over_plain(claimant: Path, common_resolved: Path) -> Path |
         return claimant
     if parent == claimant:
         return claimant
+    # Only the AMBIGUOUS pair is adjudicated: the shapes this function exists
+    # for both have the claimant BELOW the plain candidate -- a separate
+    # checkout nested in its storage dir, or a stale alias left inside the
+    # real checkout. An external separate checkout that sits elsewhere on
+    # disk is not ambiguous at all, and consulting cleanliness for it revoked
+    # a perfectly good checkout whenever the primary had any ordinary
+    # modified/staged/deleted state (both sides answer "does not hold", so
+    # resolution went unknown and creation nested under the linked checkout
+    # instead of the real one). Ordinariness is not evidence of ownership.
+    try:
+        claimant_resolved = claimant.resolve()
+    except OSError:
+        # Cannot prove the pair is ambiguous, so do not adjudicate it.
+        return claimant
+    if parent not in claimant_resolved.parents:
+        return claimant
     claim_holds = _holds_its_committed_tree(claimant)
     plain_holds = _holds_its_committed_tree(parent)
     if claim_holds is None or plain_holds is None:
-        return claimant
+        # Unknown is NOT an affirmative answer. Accepting the claim here
+        # reauthorized a stale alias whenever the status probe failed
+        # (OSError, timeout, or a nonzero exit): allocation then nested under
+        # `primary/new/deep`, the alias, instead of the real checkout. Keep
+        # ownership unknown so the caller keeps its own checkout, exactly as
+        # for the both/neither case below.
+        return None
     if claim_holds == plain_holds:
         # Both hold it (a duplicate export) or neither does (an empty
         # repository): nothing separates them, so do not guess.
