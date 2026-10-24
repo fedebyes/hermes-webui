@@ -10564,7 +10564,15 @@ function renderSessionListFromCache(){
     }
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
-    const hasAttentionState=isStreaming||hasUnread||Boolean(attention);
+    // One marker per row. Priority for the right-hand slot: a live turn
+    // (streaming) > a pending attention (the agent is blocked on a human
+    // answer, so the row is not closed) > done > unread. Done outranks unread
+    // because the dot says strictly less and shares the same slot: a finished
+    // conversation with unread replies kept losing its resting check to a
+    // neutral dot, which is exactly backwards — the check is the stronger fact.
+    const _doneHere=s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''&&!isStreaming&&!attention;
+    const _unreadDot=hasUnread&&!_doneHere;
+    const hasAttentionState=isStreaming||Boolean(attention)||_unreadDot;
     ts.className='session-time'+(hasAttentionState?' is-hidden':'');
     ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
     const titleGroup=document.createElement('div');
@@ -10592,8 +10600,8 @@ function renderSessionListFromCache(){
     // Done marker: `done_at` is workflow state written by the close/checkmark
     // scripts through POST /api/session/mark-done, never inferred from the
     // title or from silence. Distinct from `.archived` (storage): both can hold.
-    // Live always wins: a streaming/unread/attention row must never look closed.
-    const _doneHere=s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''&&!hasAttentionState;
+    // The predicate itself — and its priority over the unread dot — is decided
+    // above, next to the timestamp it shares the right-hand slot with.
     // Project color dot: placed BETWEEN title and timestamp, not inside the
     // title span. Inside the title span it would be clipped by the ellipsis
     // truncation, becoming invisible exactly when the title is long enough
@@ -11118,12 +11126,12 @@ function renderSessionListFromCache(){
     const attentionDotClass=attention?(attention.kind==='approval'?' is-attention-approval':(attention.kind==='clarify'?' is-attention-clarify':' is-attention-generic')):'';
     // Done is a RESTING state: a finished conversation with nothing live and
     // nothing asking for attention shows a check instead of the empty slot.
-    // Live signals always win — a streaming or attention row must never be
-    // mistaken for a closed one, so `is-done` is only applied when the row has
-    // no state class of its own.
+    // Streaming and a pending attention still win — neither row is closed, and
+    // the agent is live or blocked — while unread yields to the check (`_unreadDot`
+    // above), so the two markers can never fight over the same slot.
     const _hasLiveState=isStreaming||hasUnread||!!attention;
     const _isDone=false; // done now renders as .session-done-check, beside the timestamp
-    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''))+attentionDotClass;
+    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(_unreadDot?' is-unread':''))+attentionDotClass;
     state.setAttribute('aria-hidden','true');
     // Tooltip precedence: a localized attention title (pending approval/clarify,
     // from the attention-indicator feature) is more specific and actionable than
