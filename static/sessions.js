@@ -10589,23 +10589,11 @@ function renderSessionListFromCache(){
       titleGroup.appendChild(chip);
     }
     titleRow.appendChild(titleGroup);
-    // Done marker lives in the right group beside the timestamp (built below);
-    // the state slot now carries live signals only. Live always wins: a
-    // streaming/unread/attention row must never look closed.
+    // Done marker: `done_at` is workflow state written by the close/checkmark
+    // scripts through POST /api/session/mark-done, never inferred from the
+    // title or from silence. Distinct from `.archived` (storage): both can hold.
+    // Live always wins: a streaming/unread/attention row must never look closed.
     const _doneHere=s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''&&!hasAttentionState;
-    // Done check + timestamp share one right-aligned group: `.session-time`
-    // carries `margin-left:auto`, so a bare sibling inserted before it would be
-    // pushed to the LEFT of the title. Grouping them keeps the row reading
-    // "...  OK 5m" at the right edge, which is where the eye already looks.
-    const _rightGroup=document.createElement('span');
-    _rightGroup.className='session-right-group';
-    if(_doneHere){
-      const doneEl=document.createElement('span');
-      doneEl.className='session-done-check';
-      doneEl.setAttribute('aria-hidden','true');
-      doneEl.title=t('session_done_tooltip', _formatRelativeSessionTime(Number(s.done_at)*1000));
-      _rightGroup.appendChild(doneEl);
-    }
     // Project color dot: placed BETWEEN title and timestamp, not inside the
     // title span. Inside the title span it would be clipped by the ellipsis
     // truncation, becoming invisible exactly when the title is long enough
@@ -10620,6 +10608,17 @@ function renderSessionListFromCache(){
         dot.title=proj.name;
         titleRow.appendChild(dot);
       }
+    }
+    // The done check sits between the project dot and the timestamp: three
+    // ordered flex-row siblings, so `.session-time`'s `margin-left:auto` parks
+    // the pair "✓ 5m" at the right edge (a wrapper around both would split the
+    // free space between two auto margins and float the check mid-row).
+    if(_doneHere){
+      const doneEl=document.createElement('span');
+      doneEl.className='session-done-check';
+      doneEl.setAttribute('aria-hidden','true');
+      doneEl.title=t('session_done_tooltip', _formatRelativeSessionTime(Number(s.done_at)*1000));
+      titleRow.appendChild(doneEl);
     }
     const density=(window._sidebarDensity==='detailed'?'detailed':'compact');
     const showLineageMetadata=density==='detailed';
@@ -10719,8 +10718,7 @@ function renderSessionListFromCache(){
       chip.dataset.sourceKey=_sourceKeyForSession(s)||'cli';
       titleRow.appendChild(chip);
     }
-    titleRow.appendChild(_rightGroup);
-    _rightGroup.appendChild(ts);
+    titleRow.appendChild(ts);
     sessionText.appendChild(titleRow);
     if(density==='detailed'){
       const metaBits=[];

@@ -37,15 +37,15 @@ DONE_PREDICATE = "s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''"
 
 
 def _done_badge_block() -> str:
-    """The right-group fragment from the row renderer.
+    """The done-marker fragment from the row renderer.
 
     The marker moved out of the state slot: it is now a `.session-done-check`
-    appended to the right-aligned group that also holds the timestamp (so it can
+    flex-row sibling placed between the project dot and the timestamp (so it can
     never compete with the live-state dot, and it yields on hover).
     """
     start = SESSIONS_JS.find("const _doneHere=")
     assert start != -1, "done predicate not found in static/sessions.js"
-    prop = SESSIONS_JS.find("_rightGroup.appendChild(doneEl);", start)
+    prop = SESSIONS_JS.find("titleRow.appendChild(doneEl);", start)
     assert prop != -1, "done marker not found after the predicate"
     # the `if(_doneHere){ ... }` block closes on its own indented brace
     closing = SESSIONS_JS.find("\n    }\n", prop)
@@ -69,6 +69,7 @@ class FakeEl {{
   setAttribute(name, value) {{ this[name] = value; }}
 }}
 const document = {{ createElement: (tag) => new FakeEl(tag) }};
+const titleRow = new FakeEl('div');
 function t(key, ...args) {{
   const table = {{
     session_done_badge: 'Done',
@@ -87,7 +88,7 @@ for (const s of {json.dumps(rows)}) {{
   // never look closed, which is why the predicate carries the extra term.
   const hasAttentionState = false;
   {block}
-  out.push({{ isDone: _doneHere, children: _rightGroup.children.map(c => ({{
+  out.push({{ isDone: _doneHere, children: titleRow.children.map(c => ({{
     className: c.className,
     textContent: c.textContent,
     title: c.title,

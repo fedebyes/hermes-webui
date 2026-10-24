@@ -1697,12 +1697,11 @@
   .session-attention-indicator{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:26px;height:26px;z-index:1;pointer-events:none;transition:opacity .15s ease,visibility .15s ease;}
   .session-item:hover .session-attention-indicator,.session-item:has(:focus-visible) .session-attention-indicator,.session-item.menu-open .session-attention-indicator{opacity:0;visibility:hidden;}
   .session-state-indicator.is-done{visibility:visible;color:var(--success,#22c55e);opacity:.65;}
-  /* Done check, rendered beside the timestamp (right cluster) instead of in the
-     far-left state slot: small, green, calm — a resting marker, never an alert. */
+  /* Done check, rendered as a flex-row sibling between the project dot and the
+     timestamp (`.session-time` keeps its own `margin-left:auto`, so the pair
+     "check + time" stays parked at the right edge): small, green, calm — a
+     resting marker, never an alert. */
   .session-done-check{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:11px;height:11px;margin:0 3px 0 0;color:var(--success,#22c55e);opacity:.85;pointer-events:none;}
-  /* Right-aligned cluster holding the done check + timestamp. `margin-left:auto`
-     moves from .session-time to the group so the two never split apart. */
-  .session-right-group{display:inline-flex;align-items:center;gap:4px;margin-left:auto;flex-shrink:0;}
   .session-done-check::before{
     width:10px;
     height:10px;
