@@ -15301,6 +15301,117 @@ def _handle_plugins(handler, parsed) -> bool:
         )
 
 
+_LIVE_SUBAGENTS_CACHE_TTL_SECONDS = 3.0
+# A subagent child still counts as live while it is silent for less than this.
+# `ended_at IS NULL` is the authoritative signal; this window only bounds rows a
+# crashed run left open (a run that dies without `agent_close` keeps NULL
+# forever). It is a false-negative source for a genuinely live child stuck in a
+# long tool call, so it is kept generous rather than tight — 44 of ~790 real
+# runs exceed 15 minutes end to end. Degradation is acceptable here (a badge
+# missing for a while) but a stuck badge is not.
+_LIVE_SUBAGENTS_GRACE_SECONDS = 7200.0
+# Keyed by state.db path: the path is per-request (active profile), so a single
+# slot would serve profile A's counts to a profile B request inside the TTL.
+_live_subagents_cache: dict = {}
+_live_subagents_lock = threading.Lock()
+
+
+def _live_subagent_counts(now: float | None = None, db_path=None) -> dict:
+    """Return ``{parent_session_id: live_child_count}`` from the agent state.db.
+
+    "Live" is the delegate runner's own run/lifecycle: a child session is
+    created with ``source='subagent'`` and ``ended_at IS NULL``, and the runner
+    stamps ``ended_at``/``end_reason='agent_close'`` when the run finishes
+    (verified end-to-end against a real fan-out — the children carry NULL for
+    the whole run and close on exit). The recency bound only keeps a crashed
+    row (NULL forever, never closed) from inflating the badge.
+
+    Read-only, single aggregate query on the ``source`` index. Any failure
+    degrades to an empty map: the sidebar badge is decoration and must never
+    be able to break the session list.
+    """
+    now = time.time() if now is None else now
+    try:
+        from api.agent_sessions import open_state_db_readonly
+
+        db_path = db_path if db_path is not None else _active_state_db_path()
+        if not db_path.exists():
+            return {}
+        window_start = now - _LIVE_SUBAGENTS_GRACE_SECONDS
+        with closing(open_state_db_readonly(db_path)) as conn:
+            rows = conn.execute(
+                """
+                SELECT s.parent_session_id AS parent_id, COUNT(*) AS live_count
+                FROM sessions s
+                WHERE s.source = 'subagent'
+                  AND s.parent_session_id IS NOT NULL
+                  AND s.ended_at IS NULL
+                  AND (
+                        s.started_at >= ?
+                     OR COALESCE((
+                            SELECT MAX(m.timestamp) FROM messages m
+                            WHERE m.session_id = s.id
+                        ), 0) >= ?
+                  )
+                GROUP BY s.parent_session_id
+                """,
+                (window_start, window_start),
+            ).fetchall()
+    except Exception as exc:
+        logger.debug("live subagent probe failed: %s", exc)
+        return {}
+    return {
+        str(row[0]): int(row[1])
+        for row in rows
+        if row[0] and row[1]
+    }
+
+
+def _handle_live_subagents(handler, parsed) -> bool:
+    """GET /api/subagents/live — cheap map of parent session → live child count.
+
+    The selector repaints often, so the aggregate is cached briefly per state.db
+    (the path follows the active profile, so the key must too). The response
+    carries ``generated_at`` so a client can tell how old the number it renders
+    is, and the payload is built outside the lock: holding it during the socket
+    write would serialize every badge request behind one response.
+    """
+    now = time.time()
+    try:
+        db_path = _active_state_db_path()
+        cache_key = str(db_path)
+    except Exception:
+        # Shared "" slot only ever serves requests whose path resolution failed;
+        # the probe re-resolves and returns {} for them, so nothing leaks across
+        # profiles.
+        db_path, cache_key = None, ""
+    with _live_subagents_lock:
+        entry = _live_subagents_cache.get(cache_key)
+        hit = entry["payload"] if entry and (now - float(entry.get("at") or 0)) < _LIVE_SUBAGENTS_CACHE_TTL_SECONDS else None
+    if hit is not None:
+        # Serialize outside the lock: holding it through the socket write would
+        # make one slow client stall every other badge request.
+        return j(handler, hit)
+    try:
+        counts = _live_subagent_counts(now, db_path)
+    except Exception as exc:
+        logger.debug("live subagent handler degraded: %s", exc)
+        counts = {}
+    payload = {
+        "counts": counts,
+        "total": sum(counts.values()),
+        "generated_at": now,
+        # How long a child may be silent before the badge stops counting it.
+        "grace_seconds": _LIVE_SUBAGENTS_GRACE_SECONDS,
+        "cached_for_seconds": _LIVE_SUBAGENTS_CACHE_TTL_SECONDS,
+        "read_only": True,
+    }
+    with _live_subagents_lock:
+        # Bounded: one entry per profile the server has served this process.
+        _live_subagents_cache[cache_key] = {"at": now, "payload": payload}
+    return j(handler, payload)
+
+
 _SHELL_ERROR_HTML = """<!doctype html>
 <html lang=\"en\">
 <head>
@@ -16647,6 +16758,9 @@ def handle_get(handler, parsed) -> bool:
         from api.profiles import profile_env_for_active_request_readonly
         with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
+
+    if parsed.path == "/api/subagents/live":
+        return _handle_live_subagents(handler, parsed)
 
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
     if parsed.path == "/api/plugins":
