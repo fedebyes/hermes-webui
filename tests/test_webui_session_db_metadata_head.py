@@ -634,6 +634,151 @@ def test_oversized_reordered_prefix_takes_the_full_read(session_store, monkeypat
     assert row["message_count"] == 1
 
 
+def test_oversized_marked_prefix_missing_a_projected_key_takes_the_full_read(
+    session_store, monkeypatch
+):
+    """The budgeted admission needs the projected keys, not just the marker.
+
+    ``test_oversized_metadata_prefix_uses_budgeted_reader`` covers the admitted
+    oversized case and ``test_marker_without_the_projected_keys_is_not_admitted``
+    covers the head cut. The second admission has its own shape: past the 64 KiB
+    head window the marker and the count are inside the 1 MiB budgeted prefix
+    while title/profile/archived/pinned/raw_source/source_label sit after
+    ``messages``. The marker alone admits that prefix, so the projected-key check
+    is the only thing that keeps the six fields in the row.
+    """
+    payload = {
+        "session_id": "fat-marker-only",
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "message_count": 1,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "_row_layout": models._ROW_LAYOUT_VERSION,
+        "anchor_scene_index": {},
+        "compression_anchor_summary": "S" * 80_000,
+        "messages": [{"role": "user", "content": "hi"}],
+        "title": "Marker Only Fat",
+        "profile": "work",
+        "archived": True,
+        "pinned": True,
+        "raw_source": "telegram",
+        "source_label": "Telegram",
+    }
+    path = session_store / "fat-marker-only.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # The head really declines on size, so the budgeted reader is the admission
+    # under test -- and the prefix it returns really carries the marker.
+    assert DB._read_metadata_head(path) is None
+    seen: list[str] = []
+    real_budgeted = models._read_metadata_json_prefix
+
+    def _spy(p, *args, **kwargs):
+        raw = real_budgeted(p, *args, **kwargs)
+        seen.append(raw or "")
+        return raw
+
+    monkeypatch.setattr(models, "_read_metadata_json_prefix", _spy)
+    source = DB._read_metadata_row_source(path)
+    monkeypatch.setattr(models, "_read_metadata_json_prefix", real_budgeted)
+
+    assert len(seen) == 1
+    prefix = json.loads(seen[0])
+    assert prefix["_row_layout"] == models._ROW_LAYOUT_VERSION
+    assert "message_count" in prefix and "messages" not in prefix
+    assert "title" not in prefix, "the six projected fields must be past the cut"
+
+    # No prefix was admitted: the row comes from the complete document.
+    assert isinstance(source, dict)
+    assert "messages" in source
+    full = DB._read_path(path)
+    assert isinstance(full, dict)
+    assert DB._metadata_row("fat-marker-only", source) == DB._metadata_row("fat-marker-only", full)
+
+    row = DB(session_store).list_sessions()[0]
+    assert row["title"] == "Marker Only Fat"
+    assert row["profile"] == "work"
+    assert row["archived"] is True
+    assert row["pinned"] is True
+    assert row["raw_source"] == "telegram"
+    assert row["source_label"] == "Telegram"
+    assert row["message_count"] == 1
+
+
+def test_recovery_writer_neither_mints_nor_invalidates_the_row_layout(
+    session_store, monkeypatch
+):
+    """Audit of the other marker-carrying writer: recovery preserves positions.
+
+    ``api.session_recovery._with_marked_message_count`` re-emits the caller's
+    keys in place and only inserts ``message_count``/``_mc_v`` ahead of the
+    transcript, so it can neither mint a layout promise nor move a projected
+    field past the cut. A marked payload therefore keeps a promise that is
+    still true, and an unmarked one still earns no marker.
+    """
+    from api.session_recovery import _with_marked_message_count
+
+    db = DB(session_store)
+    messages = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}]
+    marked = {
+        "session_id": "rec-marked",
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "message_count": 2,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "_row_layout": models._ROW_LAYOUT_VERSION,
+        "anchor_scene_index": {},
+        "title": "Recovery Marked",
+        "profile": "work",
+        "archived": True,
+        "pinned": True,
+        "raw_source": "telegram",
+        "source_label": "Telegram",
+        "messages": messages,
+    }
+    written = _with_marked_message_count(marked)
+    keys = list(written)
+    assert written["_row_layout"] == models._ROW_LAYOUT_VERSION
+    assert keys.index("_row_layout") < keys.index("messages")
+    assert keys.index("_mc_v") < keys.index("messages")
+    for field in REORDERED_FIELDS:
+        assert keys.index(field) < keys.index("messages"), field
+
+    path = session_store / "rec-marked.json"
+    path.write_text(json.dumps(written, ensure_ascii=False, indent=2), encoding="utf-8")
+    # The promise survived, so the fast path still serves this row from the head.
+    assert DB._read_metadata_head(path) is not None
+    full = db._read_path(path)
+    assert isinstance(full, dict)
+    source = db._read_metadata_row_source(path)
+    assert isinstance(source, dict) and "messages" not in source
+    assert db._metadata_row("rec-marked", source) == db._metadata_row("rec-marked", full)
+    row = db.list_sessions()[0]
+    assert row["title"] == "Recovery Marked"
+    assert row["raw_source"] == "telegram"
+    assert row["message_count"] == 2
+
+    # A layout it did not produce gains no marker, and the row still comes whole.
+    reordered = {
+        key: value
+        for key, value in marked.items()
+        if key != "messages" and key not in REORDERED_FIELDS and key != "_row_layout"
+    }
+    reordered["messages"] = messages
+    for field in REORDERED_FIELDS:
+        reordered[field] = marked[field]
+    unmarked = _with_marked_message_count(reordered)
+    assert "_row_layout" not in unmarked
+    path = session_store / "rec-unmarked.json"
+    path.write_text(json.dumps(unmarked, ensure_ascii=False, indent=2), encoding="utf-8")
+    assert DB._read_metadata_head(path) is None
+    source = db._read_metadata_row_source(path)
+    full = db._read_path(path)
+    assert isinstance(source, dict) and isinstance(full, dict)
+    assert db._metadata_row("rec-unmarked", source) == db._metadata_row("rec-unmarked", full)
+    assert db._metadata_row("rec-unmarked", source)["title"] == "Recovery Marked"
+
+
 def test_unreadable_sidecar_falls_back_to_its_own_row(session_store, monkeypatch):
     """A sidecar that fails to open must skip its row, not raise out of the list.
 
