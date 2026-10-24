@@ -10592,7 +10592,7 @@ function renderSessionListFromCache(){
     // Done marker lives in the right group beside the timestamp (built below);
     // the state slot now carries live signals only. Live always wins: a
     // streaming/unread/attention row must never look closed.
-    const _doneHere=!!s.done_at&&!hasAttentionState;
+    const _doneHere=s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''&&!hasAttentionState;
     // Done check + timestamp share one right-aligned group: `.session-time`
     // carries `margin-left:auto`, so a bare sibling inserted before it would be
     // pushed to the LEFT of the title. Grouping them keeps the row reading

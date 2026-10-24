@@ -37,11 +37,20 @@ DONE_PREDICATE = "s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''"
 
 
 def _done_badge_block() -> str:
-    """The `if(<done predicate>){...}` fragment from the row renderer."""
-    pattern = r"^    if\(" + re.escape(DONE_PREDICATE) + r"\)\{.*?^    \}\n"
-    m = re.search(pattern, SESSIONS_JS, re.S | re.M)
-    assert m, "done badge block not found in static/sessions.js"
-    return m.group(0)
+    """The right-group fragment from the row renderer.
+
+    The marker moved out of the state slot: it is now a `.session-done-check`
+    appended to the right-aligned group that also holds the timestamp (so it can
+    never compete with the live-state dot, and it yields on hover).
+    """
+    start = SESSIONS_JS.find("const _doneHere=")
+    assert start != -1, "done predicate not found in static/sessions.js"
+    prop = SESSIONS_JS.find("_rightGroup.appendChild(doneEl);", start)
+    assert prop != -1, "done marker not found after the predicate"
+    # the `if(_doneHere){ ... }` block closes on its own indented brace
+    closing = SESSIONS_JS.find("\n    }\n", prop)
+    assert closing != -1, "done marker block not terminated"
+    return SESSIONS_JS[start:closing + len("\n    }\n")]
 
 
 def _run_render(rows):
@@ -57,6 +66,7 @@ class FakeEl {{
     this.children = [];
   }}
   appendChild(child) {{ this.children.push(child); return child; }}
+  setAttribute(name, value) {{ this[name] = value; }}
 }}
 const document = {{ createElement: (tag) => new FakeEl(tag) }};
 function t(key, ...args) {{
@@ -73,12 +83,11 @@ function _formatRelativeSessionTime(ms) {{ return ms ? '2h ago' : 'unknown'; }}
 
 const out = [];
 for (const s of {json.dumps(rows)}) {{
-  const titleRow = new FakeEl('span');
-  // The row-class predicate, verbatim from _renderOneSession (presence, not
-  // truthiness — a stored 0 is a valid timestamp).
-  const isDone = {DONE_PREDICATE};
+  // Live state always wins over "done": a streaming/unread/attention row must
+  // never look closed, which is why the predicate carries the extra term.
+  const hasAttentionState = false;
   {block}
-  out.push({{ isDone, children: titleRow.children.map(c => ({{
+  out.push({{ isDone: _doneHere, children: _rightGroup.children.map(c => ({{
     className: c.className,
     textContent: c.textContent,
     title: c.title,
@@ -93,12 +102,14 @@ console.log(JSON.stringify(out));
     return json.loads(proc.stdout)
 
 
-def test_row_with_done_at_renders_the_badge():
+def test_row_with_done_at_renders_the_check():
     out = _run_render([{"session_id": "a", "done_at": 1700000000.0}])
     assert len(out[0]["children"]) == 1, out
     badge = out[0]["children"][0]
-    assert badge["className"] == "session-done-badge"
-    assert badge["textContent"] == "Done"
+    # A resting check beside the timestamp, not a text pill beside the title:
+    # the pill competed with the live-subagent badge for the same row.
+    assert badge["className"] == "session-done-check"
+    assert badge["textContent"] == ""
     assert badge["title"] == "Marked done 2h ago"
     assert out[0]["isDone"] is True
 
