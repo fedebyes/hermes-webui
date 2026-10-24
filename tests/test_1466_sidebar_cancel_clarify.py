@@ -33,8 +33,9 @@ class TestSidebarCancelAction:
         # through the picker-aware wrappers added the last few bytes (#6713).
         # #7731 keeps 8000 over #6713's 7900: the window is a prefix read, so
         # the larger value is a superset that still covers the all-profiles
-        # archive payload this test needs to see.
-        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 8000)
+        # archive payload this test needs to see, then to 9600 in #8516 for the
+        # Mark-as-done / Reopen action inserted before the pin block.
+        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 9600)
         assert "session.active_stream_id" in body, (
             "sidebar action menu must detect per-session active_stream_id instead of S.activeStreamId"
         )
@@ -86,8 +87,9 @@ class TestSidebarCancelAction:
         # to 6400 in #2294 for the "Hide from list" action on external sessions,
         # then to 7200 in #3223 for the "Regenerate title" action (gated on
         # !session.is_imported) added between Stop-response and the worktree/delete block,
-        # then to 8000 in #3199 for the manual status picker before the danger block.
-        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 8000)
+        # then to 8000 in #3199 for the manual status picker before the danger block,
+        # then to 9600 in #8516 for the Mark-as-done / Reopen action.
+        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 9600)
         assert "const isCliSession = _isCliSession(session);" in body
         assert "const isExternalSession = isMessagingSession || isCliSession;" in body
         assert "if(!isExternalSession)" in body
@@ -99,7 +101,8 @@ class TestSidebarCancelAction:
 
     def test_menu_delete_optimistically_removes_sidebar_row_before_backend_cleanup(self):
         """Context-menu Delete should not keep the row visible while slow DELETE cleanup runs."""
-        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 8400)
+        # 9600 covers the delete block after the #8516 done-toggle action.
+        body = _function_body(SESSIONS_JS, "_openSessionActionMenu", 9600)
         compact_body = "".join(body.split())
         assert "awaitdeleteSession(session.session_id,()=>Promise.resolve())" in compact_body, (
             "menu Delete must pass an immediate beforeDelete hook so deleteSession() "
