@@ -13,6 +13,15 @@ on:
 # running and reporting green, but SHORT-CIRCUIT their expensive work when every changed
 # path is documentation. Detection FAILS SAFE: if anything is uncertain (no base to diff,
 # any non-doc path touched), docs_only=false and the full suite runs.
+# Superseded runs on the same ref are billed but never read: a force-push or a
+# rapid follow-up commit replaces the result, so cancel them instead of paying for
+# both. `github.event_name` is in the key so a manual dispatch never cancels a
+# PR/tag run on the same ref. A cancelled run's checks are replaced by the newer
+# run's, so required-status-check combinations still resolve.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
 jobs:
   changes:
     runs-on: ubuntu-latest
