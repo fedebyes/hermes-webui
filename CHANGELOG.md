@@ -26,12 +26,12 @@
 - **The sidebar transcript reconcile no longer re-reads every settled session on every poll.** `GET /api/sessions`
   reconciles the visible message count of each session whose state.db has grown by loading its sidecar and merging the
   state.db transcript. On a board of a few hundred settled sessions that was one merge per row per poll, every poll.
-  The merge now memoises its answer by (session, state.db message count) for the duration of one payload, so a board
-  that has not moved pays one state.db read per row instead of one per poll, and it refuses a transcript that no longer
-  answers the count the caller aggregated. The transcript window is bounded separately
-  (`HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N`, default 60) plus every session carrying a truncation cutoff, while
-  the count/latest-timestamp tier keeps its documented top-300 default (`HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N`), so
-  settled conversations still sort by their newest reply. Reported by @b3nw. (#8368)
+  The merge now memoises its answer by (session, state.db message count) for the duration of one payload, so a
+  repeated row in the same payload is merged once, and it refuses a transcript that no longer answers the count the
+  caller aggregated. The growth guard is unchanged: a row is reconciled only when state.db carries both a higher
+  message count and a newer timestamp than the sidecar, so a settled board pays no merge at all. The walk itself is
+  not windowed — only the walk can tell a display row from a tool row — while the count/latest-timestamp SQL tier
+  keeps its documented top-300 default (`HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N`). Reported by @b3nw. (#8368)
 
 - **Fork a scheduled-job (cron) conversation into your own editable chat.** Cron-run sessions are read-only (the scheduler owns them), so you couldn't continue one. You can now branch/fork a cron session into a new WebUI-owned conversation — the original read-only session is never modified, and the fork picks up its history so you can carry on. Only genuine cron sessions qualify (verified by the server-side source, not a guessable id), and every other read-only session stays unbranchable. Thanks @rodboev. (#5555, #5477)
 

@@ -8337,7 +8337,7 @@ def _apply_sidebar_state_db_override_metadata(
     # filter depends on them.
     memo_token = _SIDEBAR_RECONCILE_MEMO.set({})
     try:
-        _apply_sidebar_state_db_override_rows(sessions, metadata, count_session_ids)
+        _apply_sidebar_state_db_override_rows(sessions, metadata)
     finally:
         _SIDEBAR_RECONCILE_MEMO.reset(memo_token)
 
@@ -8345,7 +8345,6 @@ def _apply_sidebar_state_db_override_metadata(
 def _apply_sidebar_state_db_override_rows(
     sessions: list[dict],
     metadata: dict[str, dict],
-    count_session_ids: set[str] | None,
 ) -> None:
     for session in sessions:
         sid = session.get('session_id')
@@ -8439,22 +8438,14 @@ def _apply_sidebar_state_db_override_rows(
             # sidecar+state.db merge per grown row: measured 98 rows x 0.19 s
             # = 18.8 s of a 20 s build, 307k _cached_message_key calls), so
             # only that call is bounded by ``reconcile_ids``.
-            latest_replaceable = (
-                state_last > 0
-                and state_count >= current_count
-                and state_last > current_last
-            )
-            if latest_replaceable and state_count <= current_count:
-                try:
-                    existing_actual = max(0, int(session.get('actual_message_count') or 0))
-                except (TypeError, ValueError):
-                    existing_actual = 0
-                session['actual_message_count'] = max(state_count, existing_actual)
-                session['last_message_at'] = float(state_last)
-                session['updated_at'] = max(
-                    float(session.get('updated_at') or 0), float(state_last)
-                )
-            if state_count > current_count:
+            #
+            # The timestamp guard is kept from master (#8368 re-gate): a
+            # count-only comparison admits stale state.db rows of a
+            # conversation the sidecar truncated, and an equal-count replay
+            # re-stamp would move ``last_message_at`` forward without proven
+            # transcript growth. Growth is only credited when state.db also
+            # carries a newer timestamp than the sidecar's own activity time.
+            if state_count > current_count and (state_last <= 0 or state_last > current_last):
                 try:
                     existing_actual = max(0, int(session.get('actual_message_count') or 0))
                 except (TypeError, ValueError):

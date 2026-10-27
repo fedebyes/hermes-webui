@@ -322,7 +322,7 @@ def test_capped_out_grown_row_takes_the_walk_not_the_raw_delta(monkeypatch):
     metadata["TOOLUSER"] = {
         "_state_db_source": "webui",
         "_state_db_message_count": 8,
-        "_state_db_last_message_at": 1003.5,
+        "_state_db_last_message_at": 1004.0,
     }
     walked = []
 
@@ -1130,7 +1130,13 @@ def test_walk_refuses_a_revision_the_row_did_not_overlay(monkeypatch):
 
 
 def test_reconcile_cap_leaves_the_latest_timestamp_tier_alone(monkeypatch):
-    """A row past the reconcile window still sees a newer latest-message time."""
+    """A row past the reconcile window still sees a newer latest-message time.
+
+    Only a row whose state.db count actually grew takes the newer timestamp:
+    an equal-count replay re-stamp is not activity (#8368 re-gate, see the
+    ``same two messages re-stamped`` finding), so ``s2`` keeps the sidecar's
+    own time while the grown ``s1`` rises without paying the merge.
+    """
     sessions = _grown_sessions(3)
     for index, row in enumerate(sessions):
         row["visible_message_count"] = 1
@@ -1146,6 +1152,7 @@ def test_reconcile_cap_leaves_the_latest_timestamp_tier_alone(monkeypatch):
     }
     metadata["s0"]["_state_db_message_count"] = 3
     metadata["s0"]["_state_db_last_message_at"] = 1100.0
+    metadata["s1"]["_state_db_message_count"] = 2
     metadata["s1"]["_state_db_last_message_at"] = 1200.0
     monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", "1")
@@ -1158,10 +1165,15 @@ def test_reconcile_cap_leaves_the_latest_timestamp_tier_alone(monkeypatch):
 
     models._apply_sidebar_state_db_overrides(sessions)
 
-    assert reconciled == ["s0"], "only the paint window pays the transcript merge"
-    assert sessions[2]["last_message_at"] == 902.0, (
-        "the latest-message tier keeps the documented top-300 default, so a "
-        "settled conversation still rises to the top"
+    assert reconciled == ["s0", "s1"], (
+        "every grown row walks; the equal-count replay does not"
+    )
+    assert sessions[1]["last_message_at"] == 1200.0, (
+        "a grown row past the window keeps the newer state.db activity time"
+    )
+    assert sessions[1]["message_count"] == 2, "and the grown raw count"
+    assert sessions[2]["last_message_at"] == 100.0, (
+        "an equal-count re-stamp is a replay, not new activity: keep the sidecar time"
     )
 
 
@@ -1319,3 +1331,100 @@ def test_genuine_concurrent_append_still_refuses_the_walk(monkeypatch, tmp_path)
         "a transcript that answers a different revision must not be cached as "
         "the row's visible count"
     )
+
+
+# --- the timestamp guard decides whether state.db rows are growth at all -----------
+#
+# #8368 re-gate must-fix: dropping the ``state_last > current_last`` condition
+# credited state.db rows the sidecar had already answered. state.db is
+# append-only, so a conversation truncated in the WebUI keeps its old rows
+# there, and a replayed transcript can carry a restamped timestamp without a
+# single new message. Neither is activity in the sidebar.
+
+
+def test_truncated_conversation_does_not_resurrect_state_db_rows(monkeypatch):
+    """A conversation truncated to zero must not be refilled from stale rows."""
+    sessions = [
+        {
+            "session_id": "TRUNC",
+            "title": "named chat",
+            "message_count": 0,
+            "visible_message_count": 0,
+            "actual_message_count": 0,
+            "last_message_at": 2000.0,
+            "updated_at": 2000.0,
+        }
+    ]
+    metadata = {
+        "TRUNC": {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 2,
+            "_state_db_last_message_at": 1500.0,
+        }
+    }
+    walked = []
+
+    def _fake_walk(session_id, **_bounds):
+        walked.append(str(session_id))
+        return 2
+
+    monkeypatch.setattr(models, "_reconciled_visible_count_for_sidebar", _fake_walk)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    row = sessions[0]
+    assert row["message_count"] == 0, (
+        "an older state.db row set is not growth: the truncation stands"
+    )
+    assert row["visible_message_count"] == 0
+    assert row["last_message_at"] == 2000.0, (
+        "and the stale rows must not drag the row back down the list"
+    )
+    assert walked == [], "no walk for growth the sidecar already refuted"
+
+
+def test_replayed_equal_count_restamp_is_not_sidebar_activity(monkeypatch):
+    """Equal counts with a newer state.db time is a replay, not new activity."""
+    sessions = [
+        {
+            "session_id": "REPLAY",
+            "message_count": 2,
+            "visible_message_count": 2,
+            "actual_message_count": 2,
+            "last_message_at": 1001.0,
+            "updated_at": 1001.0,
+        }
+    ]
+    metadata = {
+        "REPLAY": {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 2,
+            "_state_db_last_message_at": 2001.0,
+        }
+    }
+    walked = []
+
+    def _fake_walk(session_id, **_bounds):
+        walked.append(str(session_id))
+        return 2
+
+    monkeypatch.setattr(models, "_reconciled_visible_count_for_sidebar", _fake_walk)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    row = sessions[0]
+    assert row["last_message_at"] == 1001.0, (
+        "a restamped replay must not jump an old chat above newer ones"
+    )
+    assert row["message_count"] == 2
+    assert walked == [], "nothing grew, so nothing walks"
