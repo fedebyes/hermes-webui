@@ -1242,28 +1242,68 @@ def _include_entries(root: Path) -> list[str]:
     return entries
 
 
-def _include_target(root: Path, entry: str) -> Path | None:
-    """``root/entry`` resolved, or ``None`` when it would escape *root*."""
+def _include_target(root: Path, entry: str, follow_leaf: bool = True) -> Path | None:
+    """``root/entry`` resolved, or ``None`` when it would escape *root*.
+
+    ``follow_leaf=False`` keeps the last component as written: a path that is
+    itself a symlink — an include the Agent linked back to the checkout it came
+    from — is returned as the link, not as its target. Acting on include links
+    must never reach through them into another checkout.
+    """
     root_resolved = _resolve_path(root)
     if root_resolved is None:
         return None
+    candidate = root_resolved / entry
+    if not follow_leaf:
+        leaf = candidate.name
+        if leaf in ("", ".", ".."):
+            return None
+        try:
+            parent = candidate.parent.resolve(strict=False)
+        except (OSError, ValueError, RuntimeError):
+            return None
+        target = parent / leaf
+        return target if _is_within_root(target, root_resolved) else None
     try:
-        target = (root_resolved / entry).resolve(strict=False)
+        target = candidate.resolve(strict=False)
     except (OSError, ValueError, RuntimeError):
         return None
     return target if _is_within_root(target, root_resolved) else None
+
+
+def _head_tracks_entry(worktree: Path, entry: str) -> bool:
+    """True when *entry* is committed content of the tree's current ``HEAD``.
+
+    Alignment may have installed the selected commit in this tree, so a path a
+    manifest names can also be a committed file or directory. That content
+    belongs to the checkout: it is never scaffolding, so it is never dropped or
+    replaced. An unreadable git answer counts as tracked, so a failure never
+    licenses a delete.
+    """
+    path = entry.rstrip("/")
+    if not path:
+        return True
+    try:
+        result = _run_git(["cat-file", "-e", f"HEAD:{path}"], worktree)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode == 0
 
 
 def _drop_included_entry(worktree: Path, entry: str) -> None:
     """Remove one include the helper copied from the wrong checkout.
 
     Only ever called on a tree this process just created, and only for a path
-    its own manifest named, so the target is our copy — never user data.
+    its own manifest named, so the target is our copy — never user data. A path
+    the selected commit itself carries is not our copy: it stays. When the path
+    is a symlink the link is removed, never its target.
     """
-    target = _include_target(worktree, entry)
+    target = _include_target(worktree, entry, follow_leaf=False)
     if target is None:
         return
     if not target.exists() and not target.is_symlink():
+        return
+    if _head_tracks_entry(worktree, entry):
         return
     try:
         if target.is_symlink() or target.is_file():
@@ -1279,20 +1319,28 @@ def _copy_included_entry(source_root: Path, worktree: Path, entry: str) -> None:
 
     Files are copied with their metadata; directories are symlinked when the
     platform allows it (the Agent's own choice) and copied recursively when it
-    does not.
+    does not. Committed content of the tree's ``HEAD`` is left untouched, and an
+    existing Agent link is replaced as a link — never followed into the checkout
+    it points at, which is why directory includes used to keep reading primary.
     """
     source = _include_target(source_root, entry)
-    destination = _include_target(worktree, entry)
+    destination = _include_target(worktree, entry, follow_leaf=False)
     if source is None or destination is None:
         logger.warning("Skipping .worktreeinclude entry outside its root: %s", entry)
         return
+    if _head_tracks_entry(worktree, entry):
+        return
     try:
+        if destination.is_symlink():
+            destination.unlink()
+        elif destination.is_dir():
+            shutil.rmtree(destination, ignore_errors=True)
+        elif destination.exists() and source.is_dir():
+            destination.unlink()
         if source.is_file():
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(source), str(destination))
         elif source.is_dir():
-            if destination.exists() and not destination.is_symlink():
-                shutil.rmtree(destination, ignore_errors=True)
             destination.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.symlink(str(source), str(destination))
@@ -1302,14 +1350,48 @@ def _copy_included_entry(source_root: Path, worktree: Path, entry: str) -> None:
         logger.debug("Could not copy .worktreeinclude entry %s", entry)
 
 
+def _resolve_base_commit(root: Path) -> str | None:
+    """The commit the Agent would branch a tree from for *root*, or ``None``.
+
+    Same policy as the installed helper (``_resolve_worktree_base``): the
+    branch's own upstream first, then the remote default branch, then local
+    ``HEAD``. Only refs are read — the helper's own fetch already refreshed the
+    remote-tracking refs, which every checkout in a repository shares. Two
+    checkouts sharing a commit therefore still resolve their own base instead
+    of one being inferred from the other's head.
+    """
+    upstream = _git_answer(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root
+    )
+    if upstream and "/" in upstream:
+        resolved = _git_answer(
+            ["rev-parse", "--verify", "--quiet", f"{upstream}^{{commit}}"], root
+        )
+        if resolved:
+            return resolved
+    default_ref = _git_answer(
+        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], root
+    )
+    if default_ref and default_ref.startswith("refs/remotes/"):
+        short = default_ref[len("refs/remotes/"):]
+        resolved = _git_answer(
+            ["rev-parse", "--verify", "--quiet", f"{short}^{{commit}}"], root
+        )
+        if resolved:
+            return resolved
+    return _git_answer(["rev-parse", "HEAD"], root)
+
+
 def _align_worktree_source(worktree: Path, selected: Path, placement: Path) -> None:
     """Rebuild *worktree* from the checkout the session started in.
 
     *selected* is the checkout the session's workspace resolved to;
     *placement* is the main working tree the Agent nested the new tree under.
-    The base commit and ``.worktreeinclude`` content come from *selected*, and
-    any include the helper copied from *placement* that *selected* does not
-    list is dropped. Fail-soft throughout.
+    The base commit and ``.worktreeinclude`` content come from *selected*: the
+    tree is reset to the commit *selected*'s own base policy resolves to, and
+    every include is re-derived from *selected*, dropping only the paths the
+    helper copied from *placement* that are not committed content. Fail-soft
+    throughout.
     """
     try:
         if not Path(worktree).is_dir():
@@ -1318,19 +1400,22 @@ def _align_worktree_source(worktree: Path, selected: Path, placement: Path) -> N
             return
     except (OSError, RuntimeError):
         return
-    selected_head = _git_answer(["rev-parse", "HEAD"], selected)
-    placement_head = _git_answer(["rev-parse", "HEAD"], placement)
+    base = _resolve_base_commit(Path(selected))
     worktree_head = _git_answer(["rev-parse", "HEAD"], worktree)
-    if selected_head and placement_head and worktree_head:
-        # The helper resolved its base from the placement root. When that base
-        # is the placement checkout's own HEAD (a repository with no remote to
-        # sync from) the tree is built from the wrong commit; a shared remote
-        # tip is the same commit for both checkouts and is left alone.
-        if worktree_head == placement_head and selected_head != placement_head:
-            try:
-                _run_git(["reset", "--hard", selected_head], worktree, timeout=30)
-            except (OSError, subprocess.TimeoutExpired):
-                logger.debug("Could not rebuild worktree %s from %s", worktree, selected)
+    if base and worktree_head and base != worktree_head:
+        # The helper resolved its base from the placement root; *selected* may
+        # want a different commit (another branch, another upstream, or local
+        # HEAD when nothing is remote). A successful reset is what makes the
+        # tree the selected checkout's, so its answer is checked, not assumed.
+        try:
+            result = _run_git(["reset", "--hard", base], worktree, timeout=30)
+            if result.returncode != 0:
+                logger.debug(
+                    "Could not rebuild worktree %s from %s (git exit %s)",
+                    worktree, selected, result.returncode,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.debug("Could not rebuild worktree %s from %s", worktree, selected)
     selected_entries = _include_entries(selected)
     placement_entries = _include_entries(placement)
     for entry in placement_entries:
