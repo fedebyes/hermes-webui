@@ -141,6 +141,7 @@ def test_oversized_metadata_prefix_uses_budgeted_reader(session_store, monkeypat
         "model": "test-model",
         "created_at": 100.0,
         "updated_at": 200.0,
+        "last_message_at": 200.0,
         "compression_anchor_summary": "S" * (DB._METADATA_HEAD_BYTES + 16 * 1024),
         "message_count": 3,
         "_mc_v": models._MESSAGE_COUNT_MARKER,
@@ -192,6 +193,7 @@ def test_compact_sidecar_of_the_writer_contract_is_read_from_the_head(session_st
         "model": "test-model",
         "created_at": 100.0,
         "updated_at": 200.0,
+        "last_message_at": 200.0,
         "message_count": 2,
         "_mc_v": models._MESSAGE_COUNT_MARKER,
         "_row_layout": models._ROW_LAYOUT_VERSION,
@@ -540,6 +542,41 @@ def test_budgeted_prefix_without_layout_marker_takes_the_full_read(session_store
     assert DB._metadata_row("subset", source) == DB._metadata_row("subset", full)
 
 
+def test_attached_last_message_at_is_written_ahead_of_messages(session_store):
+    """The head cut must expose an explicitly attached ordering value.
+
+    Re-gate fixture: ``updated_at=200`` with an attached ``last_message_at=100``.
+    The key used to fall through to ``extra`` and serialize AFTER ``messages``,
+    so the head-prefix reader could not see it and fell back to ``updated_at`` —
+    listing 200 where the full read listed 100.
+    """
+    sid = "attached-lma"
+    session = models.Session(
+        session_id=sid,
+        title="Attached LMA",
+        workspace=str(session_store.parent),
+        model="test-model",
+        messages=[{"role": "user", "content": "hi", "timestamp": 50.0}],
+        updated_at=200.0,
+    )
+    session.last_message_at = 100.0
+    session.save(touch_updated_at=False)
+
+    path = session_store / f"{sid}.json"
+    raw = path.read_text(encoding="utf-8")
+    assert raw.index('"last_message_at"') < raw.index('"messages"'), (
+        "the attached ordering value must sit in the metadata head, not after "
+        "the transcript the head never parses"
+    )
+
+    full = DB._read_path(path)
+    assert full["last_message_at"] == 100.0
+    row = DB(session_store).list_sessions()[0]
+    assert row["last_message_at"] == 100.0, (
+        "the head-derived row must agree with the full read on the ordering value"
+    )
+
+
 def test_oversized_reordered_prefix_takes_the_full_read(session_store, monkeypatch):
     """An oversized prefix without a valid layout proof must fall back whole.
 
@@ -724,6 +761,7 @@ def test_recovery_writer_neither_mints_nor_invalidates_the_row_layout(
         "session_id": "rec-marked",
         "created_at": 100.0,
         "updated_at": 200.0,
+        "last_message_at": 200.0,
         "message_count": 2,
         "_mc_v": models._MESSAGE_COUNT_MARKER,
         "_row_layout": models._ROW_LAYOUT_VERSION,
