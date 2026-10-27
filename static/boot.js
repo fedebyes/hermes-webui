@@ -1245,8 +1245,10 @@ function _micToastKeyForRecognitionError(error){
     // Dictation feedback: the timer takes the glyph's place while a capture is
     // open, and every state the previous capture left behind is cleared on stop.
     // Kept last in the function so the prefix reset above stays adjacent to the
-    // clearing it explains.
-    if(on){ _micPaint('rec'); _micStartElapsed(); }
+    // clearing it explains. Opening a capture also takes button ownership away
+    // from any transcription still in flight: a late failure of that request
+    // must not erase the new recorder's label or stop its timer.
+    if(on){ ++_micTranscribeSeq; _micPaint('rec'); _micStartElapsed(); }
     else{ _micPaint(null); _micStopMeter(); _micSpokeAt=0; }
   }
 
@@ -1486,12 +1488,9 @@ function _micToastKeyForRecognitionError(error){
     const ext=(blob.type&&blob.type.includes('ogg'))?'ogg':'webm';
     const form=new FormData();
     form.append('file',new File([blob],`voice-input.${ext}`,{type:blob.type||`audio/${ext}`}));
-    // Snapshot is passed in from the recorder.onstop handler — taken there
-    // BEFORE _setRecording(false) clears _prefix (async server STT path).
+    // Snapshot from onstop, before _setRecording(false) clears _prefix.
     const seq=++_micTranscribeSeq;
-    // 'think' has no hold timeout, so every exit has to retire it explicitly —
-    // otherwise a failed request leaves the button spinning forever. Only the
-    // request that still owns the button may settle it.
+    // 'think' has no hold timeout: only the owning request settles it.
     const ownsButton=()=>seq===_micTranscribeSeq;
     setComposerStatus('Transcribing…');
     _micPaint('think','···');

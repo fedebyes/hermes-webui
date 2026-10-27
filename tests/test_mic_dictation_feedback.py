@@ -280,3 +280,235 @@ def test_a_stale_request_does_not_clear_a_newer_capture(transcribe_runs):
     )
     assert transcribe_runs["staleStatuses"] == []
     assert transcribe_runs["staleFinalCommits"] == ["newer"]
+
+
+# --- capture takes ownership, not just a newer request ----------------------
+#
+# The schedule above starts two transcriptions, which only proves that a newer
+# request outranks an older one. It cannot see the real lifecycle: a recording
+# that starts while a transcription is in flight owns the button even though no
+# second request exists yet. This runs the shipped `_setRecording`,
+# `_micPaint`/timer and `_startMicCapture` (media path) under node so the
+# schedule pending A -> capture B starts -> A fails is exercised as code.
+
+_CAPTURE_HARNESS = r"""
+const _micForceMediaRecorderKey = 'mic_force_media_recorder';
+let _micTranscribeSeq = 0;
+let _micStartSeq = 0;
+let _isRecording = false;
+let _finalText = '';
+let _prefix = '';
+let _rawAudioMode = false;
+let _micHoldActive = false;
+let _canRecordAudio = true;
+let _activeCaptureMode = null;
+let _speechStopRequested = false;
+let _micRestartCount = 0;
+let _forceMediaRecorder = true;
+let recognition = null;
+let mediaStream = null;
+let mediaRecorder = null;
+let audioChunks = [];
+let _micElapsedTimer = null;
+let _micStateTimer = null;
+let _micMeterCtx = null;
+let _micMeterRaf = 0;
+let _micSpokeAt = 0;
+const _MIC_READY_MS = 3000;
+const _MIC_EMPTY_MS = 2500;
+const _MIC_AUTOSTOP_KEY = 'mic_autostop';
+const paints = [];
+let statuses = [];
+const toasts = [];
+const commits = [];
+const store = {};
+const pending = [];
+const SpeechRecognition = function () {};
+const ta = { value: '' };
+
+function _stubBtn() {
+  const set = new Set();
+  return {
+    set,
+    append() {},
+    addEventListener() {},
+    classList: {
+      toggle(cls, on) { on ? set.add(cls) : set.delete(cls); },
+      contains(cls) { return set.has(cls); },
+    },
+  };
+}
+const btn = _stubBtn();
+const micStateEl = { textContent: '', setAttribute() {} };
+const micLevelEl = { textContent: '', style: { setProperty() {} }, setAttribute() {} };
+const status = { style: {} };
+const statusText = { textContent: '' };
+
+globalThis.localStorage = {
+  getItem: (k) => (k in store ? store[k] : null),
+  setItem: (k, v) => { store[k] = String(v); },
+};
+globalThis.window = { _micPendingSend: false };
+globalThis.document = {};
+globalThis.cancelAnimationFrame = () => {};
+globalThis.requestAnimationFrame = () => 0;
+
+class MediaRecorder {
+  static isTypeSupported() { return true; }
+  constructor(_stream, opts) {
+    this.mimeType = (opts && opts.mimeType) || '';
+    this.state = 'inactive';
+    this.onerror = null;
+    this.ondataavailable = null;
+  }
+  start() { this.state = 'recording'; }
+  stop() { this.state = 'inactive'; }
+}
+globalThis.MediaRecorder = MediaRecorder;
+window.MediaRecorder = MediaRecorder;
+// Node >= 21 exposes a read-only `navigator` global; replace it explicitly.
+Object.defineProperty(globalThis, 'navigator', {
+  configurable: true,
+  writable: true,
+  value: {
+    mediaDevices: {
+      getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }),
+    },
+  },
+});
+
+// Shipped source spliced in verbatim below, no eval.
+__FUNCSIF__
+
+function setComposerStatus(s) { statuses.push(s); }
+function showToast(m) { toasts.push(m); }
+function t(k) { return k; }
+function _commitTranscript(text) { commits.push(text); }
+function _ensureSpeechRecognition() { return { start() {} }; }
+function _setButtonTooltipAndKey() {}
+function _micButtonAvailable() { return true; }
+function _micOriginNeedsSecureContext() { return false; }
+function _acquireMicWakeLock() {}
+function _stopMic() {}
+function _stopTracks() {}
+function _micStartMeter() {}
+function _applyDeferredServerSttFlip() {}
+function _micToastKeyForRecognitionError() { return 'mic_denied'; }
+async function _sendRawAudio() {}
+function fetch(url, opts) {
+  let resolve, reject;
+  const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+  pending.push({ resolve, reject });
+  return p;
+}
+
+const blob = new Blob(['x'], { type: 'audio/webm' });
+const out = {};
+
+function okResponse(body) { return { ok: true, status: 200, json: async () => body }; }
+function errResponse(s, body) { return { ok: false, status: s, json: async () => body }; }
+const isTimer = (s) => /^\d+:\d{2}$/.test(s || '');
+
+(async () => {
+  const snap = () => ({
+    recording: btn.classList.contains('state-rec'),
+    busy: btn.classList.contains('mic-busy'),
+    label: micStateEl.textContent,
+    labelIsTimer: isTimer(micStateEl.textContent),
+    elapsedRunning: _micElapsedTimer !== null,
+    statuses: statuses.slice(),
+    toasts: toasts.slice(),
+  });
+  const reset = () => { paints.length = 0; statuses = []; toasts.length = 0; };
+
+  // Capture A opens and stops; its transcription is in flight on the button.
+  _setRecording(true);
+  _setRecording(false);
+  reset();
+  const a = _transcribeBlob(blob, 'draft');
+  await new Promise((r) => setImmediate(r));
+  out.aInFlight = snap();
+
+  // Capture B takes the button through the real start path while A is pending.
+  await _startMicCapture();
+  out.bStarted = snap();
+
+  // A now fails late. Its settlement must not reach B's button.
+  reset();
+  pending.shift().resolve(errResponse(400, { error: 'late' }));
+  await a;
+  out.afterAFails = snap();
+
+  // The recording clock must still be running for B.
+  await new Promise((r) => setTimeout(r, 700));
+  out.afterAFailsLater = snap();
+
+  _micStopElapsed();
+  console.log(JSON.stringify(out));
+  process.exit(0);
+})().catch((e) => { console.error((e && e.stack) || e); process.exit(1); });
+"""
+
+
+def _run_capture_harness():
+    funcs = "\n".join([
+        _extract_function(BOOT_JS, "_isServerSttUnavailable"),
+        _extract_function(BOOT_JS, "_allowBrowserSttFallback"),
+        _extract_function(BOOT_JS, "_micStateClear"),
+        _extract_function(BOOT_JS, "_micPaint"),
+        _extract_function(BOOT_JS, "_micStartElapsed"),
+        _extract_function(BOOT_JS, "_micStopElapsed"),
+        _extract_function(BOOT_JS, "_micStopMeter"),
+        _extract_function(BOOT_JS, "_setRecording"),
+        _extract_function(BOOT_JS, "_transcribeBlob"),
+        _extract_function(BOOT_JS, "_startMicCapture"),
+    ])
+    js = _CAPTURE_HARNESS.replace("__FUNCSIF__", funcs)
+    proc = subprocess.run(
+        [NODE, "-e", js], capture_output=True, text=True, cwd=ROOT, timeout=60
+    )
+    assert proc.returncode == 0, "node harness failed:\n%s" % proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.fixture(scope="module")
+def capture_runs():
+    if NODE is None:
+        pytest.skip("node not on PATH")
+    return _run_capture_harness()
+
+
+def test_pending_transcription_paints_thinking_while_in_flight(capture_runs):
+    assert capture_runs["aInFlight"]["statuses"] == ["Transcribing…"]
+    assert capture_runs["aInFlight"]["recording"] is False
+
+
+def test_a_new_capture_takes_the_button_from_a_pending_request(capture_runs):
+    started = capture_runs["bStarted"]
+    assert started["recording"] is True, "the new capture must own state-rec"
+    assert started["busy"] is True
+    assert started["labelIsTimer"] is True, "the elapsed clock must be the label"
+
+
+def test_a_late_failure_cannot_settle_a_recorder_that_took_over(capture_runs):
+    after = capture_runs["afterAFails"]
+    assert after["recording"] is True, (
+        "a failed transcription of the previous capture must not clear the "
+        "successor recording's state"
+    )
+    assert after["busy"] is True
+    assert after["labelIsTimer"] is True, "the successor's timer label must survive"
+    assert after["elapsedRunning"] is True, "the successor's clock must keep running"
+    assert after["statuses"] == [], (
+        "the stale request must not clear the composer status of a live capture"
+    )
+    # The failure itself is still surfaced to the user; only the button is off-limits.
+    assert after["toasts"] == ["late"]
+
+
+def test_the_recording_clock_keeps_ticking_after_the_late_failure(capture_runs):
+    later = capture_runs["afterAFailsLater"]
+    assert later["recording"] is True
+    assert later["labelIsTimer"] is True
+    assert later["elapsedRunning"] is True
+
