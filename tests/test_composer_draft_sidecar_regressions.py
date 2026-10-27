@@ -1060,6 +1060,74 @@ def test_draft_compression_migration_rolls_back_when_preservation_fails_after_si
             streaming.SESSION_AGENT_LOCKS.pop(new_sid, None)
 
 
+def test_draft_compression_migration_rollback_leaves_absent_intermediate_absent(tmp_path, monkeypatch):
+    """The multi-hop intermediate has no sidecar, so the refusal must create none.
+
+    A second hop publishes a continuation that was never persisted: nothing
+    durable exists under ``old_sid`` when the migration snapshots its preimage.
+    The preservation then writes the snapshot JSON before its index replacement
+    fails, so the rollback has to delete the file it never had — and leave the
+    index, the cache owner and the lock aliases exactly as they were.
+    """
+    models, routes, session_dir = _build_draft_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+
+    # An unrelated row makes the index preimage non-trivial.
+    models.Session(
+        session_id="sid-unrelated",
+        title="unrelated",
+        messages=[{"role": "user", "content": "keep me"}],
+    ).save(touch_updated_at=False)
+
+    old_sid = "sid-hop-absent-old"
+    new_sid = "sid-hop-absent-new"
+    old_path = session_dir / f"{old_sid}.json"
+    index_file = session_dir / "_index.json"
+    assert not old_path.exists(), "the intermediate hop was never persisted"
+    index_preimage = index_file.read_bytes()
+
+    migrating = models.Session(
+        session_id=old_sid,
+        title="intermediate hop",
+        messages=[
+            {"role": "user", "content": "before"},
+            {"role": "assistant", "content": "compressed once already"},
+        ],
+    )
+    lock = routes._get_session_agent_lock(old_sid)
+    with routes.LOCK:
+        routes.SESSIONS.clear()
+        routes.SESSIONS[old_sid] = migrating
+
+    def _fail_index_replacement(*_args, **_kwargs):
+        raise OSError("injected index replacement failure")
+
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(models, "_write_session_index", _fail_index_replacement)
+            result = streaming._migrate_compression_session_ownership(
+                migrating, old_sid, new_sid, lock,
+            )
+        assert result is False
+        assert not old_path.exists(), (
+            "a refused hop must not leave a snapshot for a session that had no sidecar"
+        )
+        assert index_file.read_bytes() == index_preimage
+        with routes.LOCK:
+            assert routes.SESSIONS.get(old_sid) is migrating
+            assert routes.SESSIONS.get(new_sid) is None
+        with streaming.SESSION_AGENT_LOCKS_LOCK:
+            assert streaming.SESSION_AGENT_LOCKS.get(old_sid) is lock
+            assert streaming.SESSION_AGENT_LOCKS.get(new_sid) is None
+        assert migrating.session_id == old_sid
+    finally:
+        with routes.LOCK:
+            routes.SESSIONS.clear()
+        with streaming.SESSION_AGENT_LOCKS_LOCK:
+            streaming.SESSION_AGENT_LOCKS.pop(old_sid, None)
+            streaming.SESSION_AGENT_LOCKS.pop(new_sid, None)
+
+
 def test_draft_compression_migration_rollback_when_evictor_interleaves_after_lock_alias(tmp_path, monkeypatch):
     models, routes, session_dir = _build_draft_env(tmp_path, monkeypatch)
     monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)

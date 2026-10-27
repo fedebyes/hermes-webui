@@ -25,11 +25,14 @@ class _TwoHopHealAgent:
     """First attempt rotates and returns 401; the rebuilt Agent rotates again."""
 
     instances = []
+    # Constructor inputs, captured when construction happens. The live
+    # `session_id` is mutated by compression later, so it is not provenance.
+    constructed_session_ids = []
     calls = 0
     answer = "Fresh retry answer."
 
-    def __init__(self, **kwargs):
-        self.session_id = kwargs.get("session_id")
+    def __init__(self, session_id=None, **kwargs):
+        self.session_id = session_id
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.status_callback = kwargs.get("status_callback")
         self.context_compressor = None
@@ -40,6 +43,7 @@ class _TwoHopHealAgent:
         self.pending = []
         self.pending_lock = threading.Lock()
         _TwoHopHealAgent.instances.append(self)
+        _TwoHopHealAgent.constructed_session_ids.append(session_id)
 
     def run_conversation(self, **kwargs):
         _TwoHopHealAgent.calls += 1
@@ -75,6 +79,7 @@ def test_two_hop_compression_keeps_the_recovered_answer(
     monkeypatch.setenv("HERMES_WEBUI_SILENT_FAILURE_RETRY", retry_enabled)
     scene = worker_scene
     _TwoHopHealAgent.instances = []
+    _TwoHopHealAgent.constructed_session_ids = []
     _TwoHopHealAgent.calls = 0
     monkeypatch.setattr(streaming, "_get_ai_agent", lambda: _TwoHopHealAgent)
     monkeypatch.setattr(
@@ -89,9 +94,9 @@ def test_two_hop_compression_keeps_the_recovered_answer(
     scene.run()
 
     assert _TwoHopHealAgent.calls == 2, "the 401 must have reached the retry"
-    built = [agent.session_id for agent in _TwoHopHealAgent.instances]
+    built = [str(sid) for sid in _TwoHopHealAgent.constructed_session_ids]
     assert "continuation-one" in built, (
-        f"the rebuilt agent must start on the current continuation, built {built}"
+        f"the rebuilt agent must be constructed on the current continuation, built {built}"
     )
     assert scene.session.session_id == "continuation-two", (
         "the second rotation must become the session the turn is saved under"
