@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 from contextlib import redirect_stderr, redirect_stdout
@@ -920,7 +921,18 @@ def _prefer_checkout_over_plain(claimant: Path, common_resolved: Path) -> Path |
     except OSError:
         # Cannot prove the pair is ambiguous, so do not adjudicate it.
         return claimant
-    if parent not in claimant_resolved.parents:
+    if parent not in claimant_resolved.parents and claimant_resolved not in parent.parents:
+        # Neither layout sits inside the other: an ordinary external separate
+        # checkout whose storage dir happens to live elsewhere on disk. It is
+        # not competing with the plain candidate, so its claim stands.
+        #
+        # Mutual containment is what makes a pair ambiguous, in BOTH directions:
+        # ``<storage>/pkg/checkout`` below its storage dir, or a gitfile at
+        # ``base/x/.git`` naming ``base/x/primary/.git`` (the alias wraps the
+        # real checkout). The reversed shape used to slip through this check —
+        # the parent is below the claimant, not above it — and a session opened
+        # in ``primary`` then allocated under ``x/.worktrees`` and wrote
+        # ``x/.gitignore``.
         return claimant
     claim_holds = _holds_its_committed_tree(claimant)
     plain_holds = _holds_its_committed_tree(parent)
@@ -1146,15 +1158,183 @@ def create_worktree_for_workspace(workspace: str | Path) -> dict:
     # linked worktree: a workspace that is itself a worktree (the common case
     # once webui_state/last_workspace.txt carries a session's tree) would
     # otherwise nest the new tree inside it, out of reach of every pruner.
-    repo_root = find_main_worktree_root(workspace) or find_git_repo_root(workspace)
+    #
+    # Placement is the ONLY job the main root does. The base commit and the
+    # ``.worktreeinclude`` manifest come from the checkout the session started
+    # in, so a session opened in a linked checkout is still built from that
+    # branch — see ``_align_worktree_source``.
+    try:
+        selected_root: Path | None = find_git_repo_root(workspace)
+    except ValueError:
+        selected_root = None
+    repo_root = find_main_worktree_root(workspace) or selected_root
+    if repo_root is None:
+        raise ValueError("Workspace is not inside a git repository")
     info = _setup_agent_worktree(str(repo_root))
     path = info.get("path")
     branch = info.get("branch")
     if not path or not branch:
         raise RuntimeError("Hermes Agent returned incomplete worktree metadata")
+    worktree_path = Path(path).expanduser().resolve()
+    if selected_root is not None:
+        _align_worktree_source(worktree_path, selected_root, Path(repo_root))
     return {
-        "path": str(Path(path).expanduser().resolve()),
+        "path": str(worktree_path),
         "branch": str(branch),
         "repo_root": str(Path(info.get("repo_root") or repo_root).expanduser().resolve()),
         "created_at": time.time(),
     }
+
+
+# --- one root places the tree, the selected checkout builds it --------------------
+#
+# ``cli._setup_worktree`` takes a single root and uses it for three different
+# jobs: where the tree lands (``<root>/.worktrees``), which commit it is based
+# on (the resolved base of that root, else its ``HEAD``), and which
+# ``.worktreeinclude`` manifest it copies. WebUI needs the placement root to be
+# the repository's *main* working tree — a tree under a linked checkout is out
+# of reach of every pruner — while the base commit and the include manifest must
+# come from the checkout the session actually started in. Passing one root for
+# both jobs silently rebuilt a linked checkout's session from the primary's
+# HEAD (losing that branch's committed work) and copied the primary's local
+# settings instead of the selected checkout's.
+#
+# The helpers below correct those two facts after the Agent has created the
+# tree, so placement, the lock and the ``.worktrees/`` gitignore entry stay the
+# Agent's own work. Everything is fail-soft: an unreadable git answer leaves the
+# tree exactly as the helper produced it.
+
+_INCLUDE_MANIFEST = ".worktreeinclude"
+
+
+def _git_answer(args: list[str], cwd: str | Path, timeout: float = 5) -> str | None:
+    """Stripped stdout of a git command, or ``None`` when git did not answer."""
+    try:
+        result = _run_git(args, cwd, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    return out or None
+
+
+def _is_within_root(path: Path, root: Path) -> bool:
+    """True when *path* is *root* itself or sits below it."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _include_entries(root: Path) -> list[str]:
+    """Entries listed in ``<root>/.worktreeinclude``, blanks and comments dropped."""
+    try:
+        text = (root / _INCLUDE_MANIFEST).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return []
+    entries: list[str] = []
+    for line in text.splitlines():
+        entry = line.strip()
+        if entry and not entry.startswith("#"):
+            entries.append(entry)
+    return entries
+
+
+def _include_target(root: Path, entry: str) -> Path | None:
+    """``root/entry`` resolved, or ``None`` when it would escape *root*."""
+    root_resolved = _resolve_path(root)
+    if root_resolved is None:
+        return None
+    try:
+        target = (root_resolved / entry).resolve(strict=False)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return target if _is_within_root(target, root_resolved) else None
+
+
+def _drop_included_entry(worktree: Path, entry: str) -> None:
+    """Remove one include the helper copied from the wrong checkout.
+
+    Only ever called on a tree this process just created, and only for a path
+    its own manifest named, so the target is our copy — never user data.
+    """
+    target = _include_target(worktree, entry)
+    if target is None:
+        return
+    if not target.exists() and not target.is_symlink():
+        return
+    try:
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        logger.debug("Could not drop .worktreeinclude entry %s", entry)
+
+
+def _copy_included_entry(source_root: Path, worktree: Path, entry: str) -> None:
+    """Copy one selected-checkout include into *worktree*, mirroring the Agent.
+
+    Files are copied with their metadata; directories are symlinked when the
+    platform allows it (the Agent's own choice) and copied recursively when it
+    does not.
+    """
+    source = _include_target(source_root, entry)
+    destination = _include_target(worktree, entry)
+    if source is None or destination is None:
+        logger.warning("Skipping .worktreeinclude entry outside its root: %s", entry)
+        return
+    try:
+        if source.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(source), str(destination))
+        elif source.is_dir():
+            if destination.exists() and not destination.is_symlink():
+                shutil.rmtree(destination, ignore_errors=True)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.symlink(str(source), str(destination))
+            except (OSError, NotImplementedError):
+                shutil.copytree(str(source), str(destination), symlinks=True)
+    except OSError:
+        logger.debug("Could not copy .worktreeinclude entry %s", entry)
+
+
+def _align_worktree_source(worktree: Path, selected: Path, placement: Path) -> None:
+    """Rebuild *worktree* from the checkout the session started in.
+
+    *selected* is the checkout the session's workspace resolved to;
+    *placement* is the main working tree the Agent nested the new tree under.
+    The base commit and ``.worktreeinclude`` content come from *selected*, and
+    any include the helper copied from *placement* that *selected* does not
+    list is dropped. Fail-soft throughout.
+    """
+    try:
+        if not Path(worktree).is_dir():
+            return
+        if Path(selected).resolve() == Path(placement).resolve():
+            return
+    except (OSError, RuntimeError):
+        return
+    selected_head = _git_answer(["rev-parse", "HEAD"], selected)
+    placement_head = _git_answer(["rev-parse", "HEAD"], placement)
+    worktree_head = _git_answer(["rev-parse", "HEAD"], worktree)
+    if selected_head and placement_head and worktree_head:
+        # The helper resolved its base from the placement root. When that base
+        # is the placement checkout's own HEAD (a repository with no remote to
+        # sync from) the tree is built from the wrong commit; a shared remote
+        # tip is the same commit for both checkouts and is left alone.
+        if worktree_head == placement_head and selected_head != placement_head:
+            try:
+                _run_git(["reset", "--hard", selected_head], worktree, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                logger.debug("Could not rebuild worktree %s from %s", worktree, selected)
+    selected_entries = _include_entries(selected)
+    placement_entries = _include_entries(placement)
+    for entry in placement_entries:
+        if entry not in selected_entries:
+            _drop_included_entry(worktree, entry)
+    for entry in selected_entries:
+        _copy_included_entry(selected, worktree, entry)

@@ -111,16 +111,18 @@ def test_dirty_ordinary_primary_still_unnests_to_primary(git_env, monkeypatch, k
 
 
 def test_ownership_rule_consults_no_index_and_no_path_presence(git_env, monkeypatch):
-    """Pin the rule itself: layout and claims, never content, presence or index.
+    """Pin the rule itself: for an unambiguous candidate, layout and claims only.
 
     A working tree owns its repository whether its files match the index or not,
-    so the rule must not consult the index, ``git status`` or per-path existence:
-    an edited, staged, ``touch``-ed or partially deleted checkout stays the tree.
-    The discrimination against a ``--separate-git-dir`` storage dir is done one
-    layer up, by the gitfile claim that a storage dir cannot make, so no ownership
-    question ever reaches an optional Git query.
+    so an edited, staged, ``touch``-ed or partially deleted checkout stays the
+    tree: no index (``ls-files``) read is asked on this path.
 
-    A failed ``ls-files`` is therefore not merely conservative — it is not asked.
+    ``git status`` is asked in exactly one place, and not here: when a gitfile
+    claimant and the plain candidate that owns the same metadata contain each
+    other (``storage/pkg/checkout`` below its storage dir, or ``x/.git`` aliasing
+    ``x/primary/.git``), layout cannot separate the two, so cleanliness decides
+    which one still holds the committed tree. That adjudication is covered by
+    ``test_worktrees_review_5675116837.py``.
     """
     import api.worktrees as worktrees
 
