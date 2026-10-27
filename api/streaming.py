@@ -7945,6 +7945,21 @@ def _migrate_compression_session_ownership(
                 SESSION_AGENT_LOCKS.pop(old_sid, None)
             if new_lock is missing and SESSION_AGENT_LOCKS.get(new_sid) is agent_lock:
                 SESSION_AGENT_LOCKS.pop(new_sid, None)
+        # The preservation can fail AFTER its own Session.save() replaced the
+        # snapshot JSON (and, before the index replacement completed, left the
+        # index row half-written). Unwinding the lock aliases alone would then
+        # abandon a durable snapshot that no migration published: the caller
+        # raises, the turn aborts, and the next read sees a hop the ownership
+        # map never owned. Roll the durable preimage back as well, exactly as
+        # the later publication-failure branch does (#8011 re-gate).
+        try:
+            _restore_durable_snapshot()
+        except Exception:
+            logger.debug(
+                "Failed to restore the durable preimage after a refused "
+                "compression ownership migration",
+                exc_info=True,
+            )
         return False
 
     try:
