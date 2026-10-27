@@ -1242,12 +1242,145 @@ function _micToastKeyForRecognitionError(error){
     status.style.display=on?'':'none';
     if(statusText) statusText.textContent=on?'Listening':'Listening';
     if(!on){ _finalText=''; _prefix=''; }
+    // Dictation feedback: the timer takes the glyph's place while a capture is
+    // open, and every state the previous capture left behind is cleared on stop.
+    // Kept last in the function so the prefix reset above stays adjacent to the
+    // clearing it explains.
+    if(on){ _micPaint('rec'); _micStartElapsed(); }
+    else{ _micPaint(null); _micStopMeter(); _micSpokeAt=0; }
   }
 
   function _updateMicTooltip(){
     if(!window._micActive){
       _setButtonTooltipAndKey(btn, _rawAudioMode ? 'voice_send_raw' : 'voice_dictate');
     }
+  }
+
+  // ── Dictation feedback ────────────────────────────────────────────────
+  // While dictating, the only signal was the "Listening…" pill: it says the
+  // mic is open, not how long it has been open, whether any sound is arriving,
+  // or whether the server is still transcribing. A local Whisper turn is not
+  // instant (a 150 s clip takes ~150 s), so "did it hear me" was guesswork.
+  //
+  // The state is rendered INSIDE the button that was pressed and uses text or
+  // symbols rather than words, so this adds no translation key. It is driven by
+  // the capture's own lifecycle (start / onstop / commit), never by polling the
+  // DOM, so there is one writer and no race with `recording`.
+  const _MIC_READY_MS=3000;      // how long ✓ Np stays after a transcript lands
+  const _MIC_EMPTY_MS=2500;      // how long 0p stays when nothing was heard
+  const _MIC_AUTOSTOP_KEY='mic_autostop';
+  const _MIC_SILENCE_MS=1600;    // silence after speech that ends the capture
+  const _MIC_LEVEL_GAIN=6;       // rms -> bar scale
+  const micStateEl=document.createElement('span');
+  micStateEl.className='mic-state';
+  micStateEl.setAttribute('aria-hidden','true');
+  const micLevelEl=document.createElement('span');
+  micLevelEl.className='mic-level';
+  micLevelEl.setAttribute('aria-hidden','true');
+  btn.append(micStateEl,micLevelEl);
+
+  let _micElapsedTimer=null;
+  let _micStateTimer=null;
+  let _micMeterCtx=null;
+  let _micMeterRaf=0;
+  let _micSpokeAt=0;
+
+  function _micStateClear(){
+    if(_micStateTimer){clearTimeout(_micStateTimer);_micStateTimer=null;}
+  }
+
+  // state: null | 'rec' | 'think' | 'ready' | 'empty'. `label` is what the
+  // button shows instead of the icon: a timer, '···', '✓ 12p', '0p'.
+  function _micPaint(state,label,holdMs){
+    _micStateClear();
+    if(state!=='rec') _micStopElapsed();
+    btn.classList.toggle('mic-busy',!!state);
+    for(const cls of ['state-rec','state-think','state-ready','state-empty']){
+      btn.classList.toggle(cls,cls==='state-'+(state||''));
+    }
+    micStateEl.textContent=state?(label||''):'';
+    if(state&&holdMs){
+      _micStateTimer=setTimeout(()=>{_micStateTimer=null;_micPaint(null);},holdMs);
+    }
+  }
+
+  function _micStartElapsed(){
+    _micStopElapsed();
+    const startedAt=Date.now();
+    const tick=()=>{
+      const secs=Math.max(0,Math.floor((Date.now()-startedAt)/1000));
+      micStateEl.textContent=Math.floor(secs/60)+':'+String(secs%60).padStart(2,'0');
+    };
+    tick();
+    _micElapsedTimer=setInterval(tick,250);
+  }
+
+  function _micStopElapsed(){
+    if(_micElapsedTimer){clearInterval(_micElapsedTimer);_micElapsedTimer=null;}
+  }
+
+  function _micStopMeter(){
+    if(_micMeterRaf){cancelAnimationFrame(_micMeterRaf);_micMeterRaf=0;}
+    if(_micMeterCtx){
+      try{_micMeterCtx.close();}catch(err){/* already closed */}
+      _micMeterCtx=null;
+    }
+    micLevelEl.style.setProperty('--mic-level','0');
+  }
+
+  function _micAutoStopEnabled(){
+    return localStorage.getItem(_MIC_AUTOSTOP_KEY)!=='0';
+  }
+
+  // Level meter + silence auto-stop, run on the capture's OWN stream (no second
+  // getUserMedia). Peak is a bar under the icon; the analyser also ends the
+  // capture after _MIC_SILENCE_MS of silence once speech was heard, because a
+  // dictation that keeps recording into an empty room is the failure this fixes.
+  function _micStartMeter(stream){
+    _micStopMeter();
+    const Ctx=window.AudioContext||window.webkitAudioContext;
+    if(!Ctx) return;
+    try{ _micMeterCtx=new Ctx(); }catch(err){ return; }
+    let analyser;
+    try{
+      const source=_micMeterCtx.createMediaStreamSource(stream);
+      analyser=_micMeterCtx.createAnalyser();
+      analyser.fftSize=1024;
+      source.connect(analyser);
+    }catch(err){ _micStopMeter(); return; }
+    const buf=new Uint8Array(analyser.fftSize);
+    let noiseFloor=0.01;
+    let silenceSince=0;
+    const tick=()=>{
+      _micMeterRaf=requestAnimationFrame(tick);
+      analyser.getByteTimeDomainData(buf);
+      let sum=0;
+      for(let i=0;i<buf.length;i++){const v=(buf[i]-128)/128;sum+=v*v;}
+      const rms=Math.sqrt(sum/buf.length);
+      micLevelEl.style.setProperty('--mic-level',Math.min(1,rms*_MIC_LEVEL_GAIN).toFixed(2));
+      const threshold=Math.max(0.012,noiseFloor*2.5);
+      if(rms>threshold){
+        _micSpokeAt=Date.now();
+        silenceSince=0;
+        noiseFloor=Math.min(noiseFloor,rms*0.5);
+      }else{
+        noiseFloor=noiseFloor*0.98+rms*0.02;
+        if(!_micSpokeAt) return;
+        if(!silenceSince) silenceSince=Date.now();
+        else if(Date.now()-silenceSince>_MIC_SILENCE_MS
+                &&Date.now()-_micSpokeAt>_MIC_SILENCE_MS
+                &&_micAutoStopEnabled()){
+          silenceSince=0;
+          _stopMic();
+        }
+      }
+    };
+    _micMeterRaf=requestAnimationFrame(tick);
+  }
+
+  function _micWordCount(text){
+    const clean=(text||'').trim();
+    return clean?clean.split(/\s+/).length:0;
   }
 
   function _applyRawAudioModePreference(enabled){
@@ -1322,6 +1455,11 @@ function _micToastKeyForRecognitionError(error){
     }
     ta.value=committed;
     autoResize();
+    // Outcome on the button: a word count when text landed, '0p' when the
+    // capture heard nothing. Held briefly — the composer is the lasting
+    // evidence, this is only the "it worked" tick.
+    if(clean){ _micPaint('ready','✓ '+_micWordCount(clean)+'p',_MIC_READY_MS); }
+    else{ _micPaint('empty','0p',_MIC_EMPTY_MS); }
     if(window._micPendingSend){
       window._micPendingSend=false;
       send();
@@ -1347,6 +1485,7 @@ function _micToastKeyForRecognitionError(error){
     // Snapshot is passed in from the recorder.onstop handler — taken there
     // BEFORE _setRecording(false) clears _prefix (async server STT path).
     setComposerStatus('Transcribing…');
+    _micPaint('think','···');
     try{
       const res=await fetch('api/transcribe',{method:'POST',body:form});
       const data=await res.json().catch(()=>({}));
@@ -1745,6 +1884,8 @@ function _micToastKeyForRecognitionError(error){
       _activeCaptureMode=captureMode;
       mediaRecorder=recorder;
       recorder.start();
+      // Same stream the recorder owns — the meter never opens a second capture.
+      _micStartMeter(captureStream);
       _setRecording(true);
     }catch(err){
       if(startSeq!==_micStartSeq) return;
