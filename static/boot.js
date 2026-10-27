@@ -1426,9 +1426,13 @@ function _micToastKeyForRecognitionError(error){
     }
   }
 
-  function _commitTranscript(text, prefixOverride){
+  function _commitTranscript(text, prefixOverride, ownsButton){
     // `prefixOverride` is the composer content captured at recording start,
     // passed only by the async server-STT path (recorder.onstop → _transcribeBlob).
+    // `ownsButton` is that same path's ownership predicate: the settled feedback
+    // paint is the button's, not the request's. A later capture may already be
+    // recording, and its label and elapsed clock must survive an older request's
+    // ✓ Np — the transcript itself is committed either way.
     // The sync browser-SR path doesn't call this function — it commits inline
     // in sr.onend using _prefix directly.
     //
@@ -1463,9 +1467,12 @@ function _micToastKeyForRecognitionError(error){
     autoResize();
     // Outcome on the button: a word count when text landed, '0p' when the
     // capture heard nothing. Held briefly — the composer is the lasting
-    // evidence, this is only the "it worked" tick.
-    if(clean){ _micPaint('ready','✓ '+_micWordCount(clean)+'p',_MIC_READY_MS); }
-    else{ _micPaint('empty','0p',_MIC_EMPTY_MS); }
+    // evidence, this is only the "it worked" tick. Gated on ownership: a capture
+    // that started while this request was pending owns the label and the clock.
+    if(!ownsButton||ownsButton()){
+      if(clean){ _micPaint('ready','✓ '+_micWordCount(clean)+'p',_MIC_READY_MS); }
+      else{ _micPaint('empty','0p',_MIC_EMPTY_MS); }
+    }
     if(window._micPendingSend){
       window._micPendingSend=false;
       send();
@@ -1515,14 +1522,14 @@ function _micToastKeyForRecognitionError(error){
         // of dropping the queued send and leaving the draft behind. The
         // "no speech" toast is only for the case where there is nothing to send.
         if(window._micPendingSend&&_composerHasContent()){
-          _commitTranscript('', prefixSnapshot);
+          _commitTranscript('', prefixSnapshot, ownsButton);
           return;
         }
         window._micPendingSend=false;
         showToast(t('mic_no_speech'));
         return;
       }
-      _commitTranscript(transcript, prefixSnapshot);
+      _commitTranscript(transcript, prefixSnapshot, ownsButton);
     }catch(err){
       if(_isServerSttUnavailable(err)&&_allowBrowserSttFallback()){
         window._micPendingSend=false;

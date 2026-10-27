@@ -106,7 +106,9 @@ def _extract_function(src, name):
 
 
 _HARNESS = r"""
-const _micForceMediaRecorderKey = 'mic_force_media_recorder';
+const _micForceMediaRecorderKey = 'mic_force_mediarecorder';
+const _micForceMediaRecorderExpiryKey = 'mic_force_mediarecorder_expires';
+const _MIC_FORCE_MR_TTL_MS = 24 * 60 * 60 * 1000;
 let _micTranscribeSeq = 0;
 const paints = [];
 let statuses = [];
@@ -117,6 +119,7 @@ const pending = [];
 globalThis.localStorage = {
   getItem: (k) => (k in store ? store[k] : null),
   setItem: (k, v) => { store[k] = String(v); },
+  removeItem: (k) => { delete store[k]; },
 };
 globalThis.window = {};
 globalThis.document = {};
@@ -132,6 +135,7 @@ function setComposerStatus(s) { statuses.push(s); }
 function showToast(m) { toasts.push(m); }
 function t(k) { return k; }
 function _commitTranscript(text) { commits.push(text); }
+function _composerHasContent() { return false; }
 function _ensureSpeechRecognition() {
   return { started: false, start() { this.started = true; } };
 }
@@ -165,13 +169,17 @@ function errResponse(status, body) {
   out.successCommits = commits.slice();
   out.successStatuses = statuses.slice();
 
-  // 2. empty transcript still commits (nothing was heard, not a failure).
+  // 2. empty transcript is "nothing heard", not a failure: upstream answers 200
+  // with an empty transcript and no_speech. Nothing is committed; the user gets
+  // the "no speech" toast instead of a silently unchanged composer.
   begin();
   p = _transcribeBlob(blob, '');
   await new Promise((r) => setImmediate(r));
   pending.shift().resolve(okResponse({ transcript: '' }));
   await p;
   out.emptyCommits = commits.slice();
+  out.emptyToasts = toasts.slice();
+  out.emptyPaints = paints.slice();
 
   // 3. HTTP failure must retire 'think' and clear the status line.
   begin();
@@ -227,6 +235,8 @@ function errResponse(status, body) {
 
 def _run_transcribe_harness():
     funcs = "\n".join([
+        _extract_function(BOOT_JS, "_getMicForceMediaRecorderStored"),
+        _extract_function(BOOT_JS, "_setMicForceMediaRecorder"),
         _extract_function(BOOT_JS, "_isServerSttUnavailable"),
         _extract_function(BOOT_JS, "_allowBrowserSttFallback"),
         _extract_function(BOOT_JS, "_transcribeBlob"),
@@ -246,11 +256,14 @@ def transcribe_runs():
     return _run_transcribe_harness()
 
 
-def test_success_and_empty_commit_the_transcript(transcribe_runs):
+def test_success_commits_and_empty_reports_no_speech(transcribe_runs):
     assert transcribe_runs["successPainted"][0] == "think"
     assert transcribe_runs["successCommits"] == ["hi there"]
     assert transcribe_runs["successStatuses"] == ["Transcribing…", ""]
-    assert transcribe_runs["emptyCommits"] == ["hi there", ""]
+    assert transcribe_runs["emptyCommits"] == ["hi there"], (
+        "an empty transcript must not append anything to the composer"
+    )
+    assert transcribe_runs["emptyToasts"] == ["mic_no_speech"]
 
 
 def test_http_failure_retires_the_thinking_state(transcribe_runs):
@@ -271,7 +284,7 @@ def test_browser_fallback_settles_the_button(transcribe_runs):
     assert transcribe_runs["fallbackPaints"] == ["think", None]
     assert transcribe_runs["fallbackStatuses"] == ["Transcribing…", ""]
     assert transcribe_runs["fallbackRecognitionArmed"] is True
-    assert transcribe_runs["fallbackStore"]["mic_force_media_recorder"] == "0"
+    assert transcribe_runs["fallbackStore"]["mic_force_mediarecorder"] == "0"
 
 
 def test_a_stale_request_does_not_clear_a_newer_capture(transcribe_runs):
@@ -292,7 +305,9 @@ def test_a_stale_request_does_not_clear_a_newer_capture(transcribe_runs):
 # schedule pending A -> capture B starts -> A fails is exercised as code.
 
 _CAPTURE_HARNESS = r"""
-const _micForceMediaRecorderKey = 'mic_force_media_recorder';
+const _micForceMediaRecorderKey = 'mic_force_mediarecorder';
+const _micForceMediaRecorderExpiryKey = 'mic_force_mediarecorder_expires';
+const _MIC_FORCE_MR_TTL_MS = 24 * 60 * 60 * 1000;
 let _micTranscribeSeq = 0;
 let _micStartSeq = 0;
 let _isRecording = false;
@@ -347,6 +362,7 @@ const statusText = { textContent: '' };
 globalThis.localStorage = {
   getItem: (k) => (k in store ? store[k] : null),
   setItem: (k, v) => { store[k] = String(v); },
+  removeItem: (k) => { delete store[k]; },
 };
 globalThis.window = { _micPendingSend: false };
 globalThis.document = {};
@@ -383,7 +399,15 @@ __FUNCSIF__
 function setComposerStatus(s) { statuses.push(s); }
 function showToast(m) { toasts.push(m); }
 function t(k) { return k; }
-function _commitTranscript(text) { commits.push(text); }
+// The real `_commitTranscript` is spliced in below (its paint is the finding);
+// only its surroundings are stubbed here.
+let _dictationAppend = false;
+const sends = [];
+function autoResize() {}
+function send() { sends.push(ta.value); }
+function _micWordCount(text) {
+  return String(text || '').trim().split(/\s+/).filter(Boolean).length;
+}
 function _ensureSpeechRecognition() { return { start() {} }; }
 function _setButtonTooltipAndKey() {}
 function _micButtonAvailable() { return true; }
@@ -412,6 +436,7 @@ const isTimer = (s) => /^\d+:\d{2}$/.test(s || '');
 (async () => {
   const snap = () => ({
     recording: btn.classList.contains('state-rec'),
+    ready: btn.classList.contains('state-ready'),
     busy: btn.classList.contains('mic-busy'),
     label: micStateEl.textContent,
     labelIsTimer: isTimer(micStateEl.textContent),
@@ -443,6 +468,46 @@ const isTimer = (s) => /^\d+:\d{2}$/.test(s || '');
   await new Promise((r) => setTimeout(r, 700));
   out.afterAFailsLater = snap();
 
+  // Success arm: pending A, real capture B takes over, then A returns 200.
+  // The transcript is still committed; the button stays B's.
+  _setRecording(false);
+  _isRecording = false; // the harness never ran the stop path for the last capture
+  ta.value = 'draft';
+  reset();
+  const a2 = _transcribeBlob(blob, 'draft');
+  await new Promise((r) => setImmediate(r));
+  await _startMicCapture();
+  reset();
+  pending.shift().resolve(okResponse({ transcript: 'older words' }));
+  await a2;
+  out.afterASucceeds = snap();
+  out.afterASucceedsComposer = ta.value;
+
+  // Empty arm: same schedule, A returns an empty transcript.
+  _setRecording(false);
+  _isRecording = false;
+  ta.value = 'draft';
+  reset();
+  const a3 = _transcribeBlob(blob, 'draft');
+  await new Promise((r) => setImmediate(r));
+  await _startMicCapture();
+  reset();
+  pending.shift().resolve(okResponse({ transcript: '   ' }));
+  await a3;
+  out.afterAEmpties = snap();
+  out.afterAEmptiesComposer = ta.value;
+
+  // Control: an owning success still paints its tick and stops its own clock.
+  _setRecording(false);
+  _isRecording = false;
+  ta.value = '';
+  const a4 = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  pending.shift().resolve(okResponse({ transcript: 'two words' }));
+  await a4;
+  out.ownerSuccess = snap();
+  out.ownerSuccessComposer = ta.value;
+
   _micStopElapsed();
   console.log(JSON.stringify(out));
   process.exit(0);
@@ -460,6 +525,7 @@ def _run_capture_harness():
         _extract_function(BOOT_JS, "_micStopElapsed"),
         _extract_function(BOOT_JS, "_micStopMeter"),
         _extract_function(BOOT_JS, "_setRecording"),
+        _extract_function(BOOT_JS, "_commitTranscript"),
         _extract_function(BOOT_JS, "_transcribeBlob"),
         _extract_function(BOOT_JS, "_startMicCapture"),
     ])
@@ -511,4 +577,44 @@ def test_the_recording_clock_keeps_ticking_after_the_late_failure(capture_runs):
     assert later["recording"] is True
     assert later["labelIsTimer"] is True
     assert later["elapsedRunning"] is True
+
+
+def test_a_late_success_cannot_paint_over_a_recorder_that_took_over(capture_runs):
+    after = capture_runs["afterASucceeds"]
+    assert after["ready"] is False, (
+        "an older request's ✓ Np must not replace the live capture's label"
+    )
+    assert after["recording"] is True
+    assert after["labelIsTimer"] is True
+    assert after["elapsedRunning"] is True, (
+        "committing an older transcript must not stop the newer capture's clock"
+    )
+
+
+def test_a_late_success_still_commits_its_transcript(capture_runs):
+    assert capture_runs["afterASucceedsComposer"] == "older words", (
+        "the valid transcript must land in the composer even when the button "
+        "belongs to a newer capture"
+    )
+
+
+def test_a_late_empty_response_cannot_paint_over_a_recorder(capture_runs):
+    after = capture_runs["afterAEmpties"]
+    assert after["ready"] is False
+    assert after["recording"] is True
+    assert after["busy"] is True
+    assert after["labelIsTimer"] is True
+    assert after["elapsedRunning"] is True
+    assert capture_runs["afterAEmptiesComposer"] == "draft", (
+        "an empty transcript leaves the composer untouched"
+    )
+
+
+def test_an_owning_success_still_paints_its_tick(capture_runs):
+    owner = capture_runs["ownerSuccess"]
+    assert owner["ready"] is True, "the owning request must still show its tick"
+    assert owner["recording"] is False
+    assert owner["label"] == "✓ 2p"
+    assert owner["elapsedRunning"] is False, "the owner's own clock stops on settle"
+    assert capture_runs["ownerSuccessComposer"] == "two words"
 
