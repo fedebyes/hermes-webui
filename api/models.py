@@ -2164,6 +2164,13 @@ class Session:
             'gateway_run', 'delegation_reservation', 'delegation_cutoff_ts',
             'skill_provenance',
             'skill_provenance_generation',
+            # An explicitly attached ``last_message_at`` used to fall through to
+            # ``extra`` and serialize AFTER ``messages``, so the head-prefix
+            # reader could not see it and fell back to ``updated_at`` — 200
+            # instead of the attached 100 in the re-gate fixture. Listed here it
+            # is written ahead of the cut, and ``_PROJECTED_FIELDS`` makes a
+            # marked prefix that lacks it fall back to the complete reader.
+            'last_message_at',
         ]
         guarded_messages, exact_replay_rows_removed = _deduplicate_exact_stable_messages(self.messages)
         if exact_replay_rows_removed:

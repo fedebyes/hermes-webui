@@ -50,6 +50,11 @@ _PROJECTED_FIELDS = frozenset(
         "pinned",
         "raw_source",
         "source_label",
+        # An attached ``last_message_at`` is an ordering value the prefix must
+        # expose: without it the head reader falls back to ``updated_at`` and
+        # disagrees with the full read (re-gate: updated_at=200 vs
+        # last_message_at=100).
+        "last_message_at",
     }
 )
 
