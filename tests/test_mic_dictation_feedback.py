@@ -69,3 +69,214 @@ def test_tooltip_anchor_is_untouched():
     # children must not introduce a competing position rule on .mic-btn.
     assert ".has-tooltip{position:relative;}" in STYLE_CSS
     assert ".mic-btn{position:" not in STYLE_CSS
+
+
+# --- behavioural coverage ---------------------------------------------------
+#
+# Source-presence assertions above cannot see a state that is painted and never
+# cleared (review 5674998963: a failed transcription left the button on 'think'
+# forever). These run the shipped `_transcribeBlob` under node with a stubbed
+# DOM/fetch, so every exit path is exercised as code rather than as text.
+
+import json
+import shutil
+import subprocess
+
+import pytest
+
+NODE = shutil.which("node")
+
+
+def _extract_function(src, name):
+    """Return the full source of a top-level `function name(...)` in boot.js."""
+    marker = "function %s(" % name
+    start = src.index(marker)
+    if src[max(0, start - 6):start] == "async ":
+        start -= 6
+    brace = src.index("{", start)
+    depth = 0
+    for pos in range(brace, len(src)):
+        if src[pos] == "{":
+            depth += 1
+        elif src[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:pos + 1]
+    raise AssertionError("unbalanced braces around %s" % name)
+
+
+_HARNESS = r"""
+const _micForceMediaRecorderKey = 'mic_force_media_recorder';
+let _micTranscribeSeq = 0;
+const paints = [];
+let statuses = [];
+const toasts = [];
+const commits = [];
+const store = {};
+const pending = [];
+globalThis.localStorage = {
+  getItem: (k) => (k in store ? store[k] : null),
+  setItem: (k, v) => { store[k] = String(v); },
+};
+globalThis.window = {};
+globalThis.document = {};
+let _forceMediaRecorder = true;
+let recognition = null;
+const SpeechRecognition = function () {};
+
+// Shipped source spliced in verbatim below, no eval.
+__FUNCSIF__
+
+function _micPaint(state) { paints.push(state === undefined ? null : state); }
+function setComposerStatus(s) { statuses.push(s); }
+function showToast(m) { toasts.push(m); }
+function t(k) { return k; }
+function _commitTranscript(text) { commits.push(text); }
+function _ensureSpeechRecognition() {
+  return { started: false, start() { this.started = true; } };
+}
+function fetch(url, opts) {
+  let resolve, reject;
+  const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+  pending.push({ resolve, reject });
+  return p;
+}
+
+const blob = new Blob(['x'], { type: 'audio/webm' });
+const out = {};
+
+function okResponse(body) {
+  return { ok: true, status: 200, json: async () => body };
+}
+function errResponse(status, body) {
+  return { ok: false, status, json: async () => body };
+}
+
+(async () => {
+  const begin = () => { paints.length = 0; statuses = []; toasts.length = 0; };
+
+  // 1. success: transcript committed, 'think' was painted while in flight.
+  begin();
+  let p = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  out.successPainted = paints.slice();
+  pending.shift().resolve(okResponse({ transcript: 'hi there' }));
+  await p;
+  out.successCommits = commits.slice();
+  out.successStatuses = statuses.slice();
+
+  // 2. empty transcript still commits (nothing was heard, not a failure).
+  begin();
+  p = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  pending.shift().resolve(okResponse({ transcript: '' }));
+  await p;
+  out.emptyCommits = commits.slice();
+
+  // 3. HTTP failure must retire 'think' and clear the status line.
+  begin();
+  p = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  pending.shift().resolve(errResponse(400, { error: 'bad audio' }));
+  await p;
+  out.http400Paints = paints.slice();
+  out.http400Statuses = statuses.slice();
+  out.http400Toasts = toasts.slice();
+
+  // 4. rejected fetch (no status) must also settle the button.
+  begin();
+  p = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  pending.shift().reject(new Error('network down'));
+  await p;
+  out.rejectedPaints = paints.slice();
+  out.rejectedStatuses = statuses.slice();
+  out.rejectedToasts = toasts.slice();
+
+  // 5. browser fallback path settles too, and arms recognition.
+  begin();
+  p = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  pending.shift().resolve(errResponse(503, { error: 'unavailable' }));
+  await p;
+  out.fallbackPaints = paints.slice();
+  out.fallbackStatuses = statuses.slice();
+  out.fallbackRecognitionArmed = recognition !== null;
+  out.fallbackStore = Object.assign({}, store);
+
+  // 6. a stale request must not clear a newer capture's button.
+  begin();
+  const first = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  const second = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  const firstReq = pending.shift();
+  begin();
+  firstReq.resolve(errResponse(400, { error: 'stale' }));
+  await first;
+  out.stalePaints = paints.slice();
+  out.staleStatuses = statuses.slice();
+  pending.shift().resolve(okResponse({ transcript: 'newer' }));
+  await second;
+  out.staleFinalCommits = commits.slice(-1);
+
+  console.log(JSON.stringify(out));
+})().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def _run_transcribe_harness():
+    funcs = "\n".join([
+        _extract_function(BOOT_JS, "_isServerSttUnavailable"),
+        _extract_function(BOOT_JS, "_allowBrowserSttFallback"),
+        _extract_function(BOOT_JS, "_transcribeBlob"),
+    ])
+    js = _HARNESS.replace("__FUNCSIF__", funcs)
+    proc = subprocess.run(
+        [NODE, "-e", js], capture_output=True, text=True, cwd=ROOT, timeout=60
+    )
+    assert proc.returncode == 0, "node harness failed:\n%s" % proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.fixture(scope="module")
+def transcribe_runs():
+    if NODE is None:
+        pytest.skip("node not on PATH")
+    return _run_transcribe_harness()
+
+
+def test_success_and_empty_commit_the_transcript(transcribe_runs):
+    assert transcribe_runs["successPainted"][0] == "think"
+    assert transcribe_runs["successCommits"] == ["hi there"]
+    assert transcribe_runs["successStatuses"] == ["Transcribing…", ""]
+    assert transcribe_runs["emptyCommits"] == ["hi there", ""]
+
+
+def test_http_failure_retires_the_thinking_state(transcribe_runs):
+    assert transcribe_runs["http400Paints"] == ["think", None], (
+        "a 400 must leave the button idle, not spinning on 'think'"
+    )
+    assert transcribe_runs["http400Statuses"] == ["Transcribing…", ""]
+    assert transcribe_runs["http400Toasts"] == ["bad audio"]
+
+
+def test_rejected_fetch_retires_the_thinking_state(transcribe_runs):
+    assert transcribe_runs["rejectedPaints"] == ["think", None]
+    assert transcribe_runs["rejectedStatuses"] == ["Transcribing…", ""]
+    assert transcribe_runs["rejectedToasts"] == ["network down"]
+
+
+def test_browser_fallback_settles_the_button(transcribe_runs):
+    assert transcribe_runs["fallbackPaints"] == ["think", None]
+    assert transcribe_runs["fallbackStatuses"] == ["Transcribing…", ""]
+    assert transcribe_runs["fallbackRecognitionArmed"] is True
+    assert transcribe_runs["fallbackStore"]["mic_force_media_recorder"] == "0"
+
+
+def test_a_stale_request_does_not_clear_a_newer_capture(transcribe_runs):
+    assert transcribe_runs["stalePaints"] == [], (
+        "the superseded request must not touch a button its successor owns"
+    )
+    assert transcribe_runs["staleStatuses"] == []
+    assert transcribe_runs["staleFinalCommits"] == ["newer"]

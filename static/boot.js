@@ -1284,6 +1284,10 @@ function _micToastKeyForRecognitionError(error){
   let _micMeterCtx=null;
   let _micMeterRaf=0;
   let _micSpokeAt=0;
+  // Bumped by every server-STT request. A settling paint is only allowed while
+  // it still owns the button: a newer capture (or a newer request) may have
+  // repainted it already.
+  let _micTranscribeSeq=0;
 
   function _micStateClear(){
     if(_micStateTimer){clearTimeout(_micStateTimer);_micStateTimer=null;}
@@ -1484,6 +1488,11 @@ function _micToastKeyForRecognitionError(error){
     form.append('file',new File([blob],`voice-input.${ext}`,{type:blob.type||`audio/${ext}`}));
     // Snapshot is passed in from the recorder.onstop handler — taken there
     // BEFORE _setRecording(false) clears _prefix (async server STT path).
+    const seq=++_micTranscribeSeq;
+    // 'think' has no hold timeout, so every exit has to retire it explicitly —
+    // otherwise a failed request leaves the button spinning forever. Only the
+    // request that still owns the button may settle it.
+    const ownsButton=()=>seq===_micTranscribeSeq;
     setComposerStatus('Transcribing…');
     _micPaint('think','···');
     try{
@@ -1521,13 +1530,15 @@ function _micToastKeyForRecognitionError(error){
         _setMicForceMediaRecorder('0');
         _forceMediaRecorder=false;
         recognition=_ensureSpeechRecognition();
+        if(ownsButton()) _micPaint(null);
         showToast(err.message||t('mic_network'));
         return;
       }
       window._micPendingSend=false;
+      if(ownsButton()) _micPaint(null);
       showToast(err.message||t('mic_network'));
     }finally{
-      setComposerStatus('');
+      if(ownsButton()) setComposerStatus('');
     }
   }
 
