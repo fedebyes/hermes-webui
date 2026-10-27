@@ -7691,10 +7691,16 @@ def _preserve_pre_compression_snapshot(
     traversal, but it should not continue to appear as an active sidebar row.
     """
     old_path = SESSION_DIR / f'{old_sid}.json'
-    if not old_path.exists():
-        return False
     try:
-        existing_text = old_path.read_text(encoding='utf-8')
+        try:
+            existing_text = old_path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            # A multi-hop compression publishes its intermediate continuation
+            # only in memory: the turn saves once, under its FINAL id, so the
+            # hop it just left has no JSON on disk yet. Fall through to the
+            # in-memory branch below instead of refusing the snapshot — refusing
+            # raises out of the second migration and discards the answer.
+            existing_text = ''
         try:
             existing = json.loads(existing_text)
             existing_msgs = len(existing.get('messages') or [])
@@ -7820,7 +7826,14 @@ def _migrate_compression_session_ownership(
     index_row_snapshot = None
     index_file_existed = False
     try:
-        old_preimage = old_path.read_text(encoding='utf-8')
+        try:
+            old_preimage = old_path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            # A multi-hop compression publishes an intermediate continuation
+            # that has never been saved: the turn persists once, under its
+            # final id. Roll back to "absent" instead of aborting the
+            # publication, which would discard the recovered answer.
+            old_preimage = None
         with _models._INDEX_WRITE_LOCK:
             index_file_existed = index_path.exists()
             if index_file_existed:
@@ -7857,7 +7870,14 @@ def _migrate_compression_session_ownership(
                 return 0.0
 
         with _models._INDEX_WRITE_LOCK:
-            _atomic_write_text(old_path, old_preimage, encoding='utf-8')
+            if old_preimage is None:
+                # Nothing durable existed under old_sid before this migration.
+                try:
+                    old_path.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                _atomic_write_text(old_path, old_preimage, encoding='utf-8')
             if not index_path.exists():
                 if not index_file_existed:
                     return
@@ -17721,15 +17741,26 @@ def _run_agent_streaming(
                                 )
                             )
                             if _retry_rotated_on_its_own:
-                                _compression_origin_session_id, _compression_continuation_session_id, _compression_retry_rotated = (
-                                    _migrate_compression_rotation(
-                                        s,
-                                        agent,
-                                        _current_owner_sid,
-                                        _resolved_profile_name,
-                                        _agent_lock,
-                                    )
+                                (
+                                    _hop_origin_session_id,
+                                    _hop_continuation_session_id,
+                                    _compression_retry_rotated,
+                                ) = _migrate_compression_rotation(
+                                    s,
+                                    agent,
+                                    _current_owner_sid,
+                                    _resolved_profile_name,
+                                    _agent_lock,
                                 )
+                                if _compression_retry_rotated:
+                                    # The client opened its stream on the TURN's
+                                    # original id, so that mapping stays put: a
+                                    # second hop moves only the continuation, it
+                                    # does not re-point the stream at the
+                                    # intermediate id the retry started from.
+                                    _compression_continuation_session_id = (
+                                        _hop_continuation_session_id
+                                    )
                             if _compression_retry_rotated:
                                 _compressed = True
                             if _heal_ok and _heal_result is not None:
