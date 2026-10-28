@@ -34,7 +34,23 @@ I18N_JS = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
 pytestmark = pytest.mark.skipif(not shutil.which("node"), reason="node required")
 
 
-LIVE_PREDICATE = "typeof s._live_subagent_count==='number'&&s._live_subagent_count>0"
+LIVE_PREDICATE = (
+    "typeof s._live_subagent_count==='number'&&s._live_subagent_count>0&&childCount===0"
+)
+
+CHILD_PREDICATE = "childCount>0"
+
+# Stubs for the child pill's expand handler: the pill is the row's ONE live
+# marker now, so the harness has to execute its block too, not just the
+# standalone badge's. Only the click plumbing is stubbed — the class, the label
+# and the tooltip under test are the real lines.
+CHILD_BLOCK_STUBS = """
+const _expandedChildSessionKeys = new Set();
+function _retireProjectPickerForExplicitRepaint(){}
+function _sidebarLineageKeyForRow(s){ return s.session_id; }
+function renderSessionListFromCache(){}
+function _sessionChildBadgeTooltip(label){ return label + ' — nested'; }
+"""
 
 
 def _live_badge_block() -> str:
@@ -42,6 +58,13 @@ def _live_badge_block() -> str:
     pattern = r"^    if\(" + re.escape(LIVE_PREDICATE) + r"\)\{.*?^    \}\n"
     m = re.search(pattern, SESSIONS_JS, re.S | re.M)
     assert m, "live subagent badge block not found in static/sessions.js"
+    return m.group(0)
+
+
+def _child_pill_block() -> str:
+    pattern = r"^    if\(" + re.escape(CHILD_PREDICATE) + r"\)\{.*?^    \}\n"
+    m = re.search(pattern, SESSIONS_JS, re.S | re.M)
+    assert m, "child-count pill block not found in static/sessions.js"
     return m.group(0)
 
 
@@ -55,6 +78,7 @@ def _run_render(rows):
     harness asserts what production actually renders.
     """
     block = _live_badge_block()
+    child_block = _child_pill_block()
     harness = f"""
 const fs = require('fs');
 const vm = require('vm');
@@ -83,15 +107,21 @@ class FakeEl {{
     this.textContent = '';
     this.title = '';
     this.children = [];
+    this.dataset = {{}};
   }}
   appendChild(child) {{ this.children.push(child); return child; }}
+  addEventListener() {{}}
 }}
 const document = {{ createElement: (tag) => new FakeEl(tag) }};
-
+{CHILD_BLOCK_STUBS}
 const out = [];
 for (const s of {json.dumps(rows)}) {{
+  const childCount = typeof s._child_session_count === 'number'
+    ? s._child_session_count
+    : (Array.isArray(s._child_sessions) ? s._child_sessions.length : 0);
   const titleRow = new FakeEl('span');
   {block}
+  {child_block}
   out.push(titleRow.children.map(c => ({{
     className: c.className,
     textContent: c.textContent,
@@ -159,6 +189,48 @@ def test_predicate_rejects_non_numeric_counts():
         ]
     )
     assert out == [[], []], out
+
+
+# ── one pill: liveness rides on the child count ─────────────────────────────
+
+KIDS = [{"session_id": "k1"}, {"session_id": "k2"}]
+
+
+def test_children_and_liveness_share_one_pill():
+    """The ordinary fan-out is ONE set: "2 children" and "2 live" were the same
+    rows counted twice, in two pills competing for the same title row."""
+    out = _run_render(
+        [{"session_id": "a", "_child_sessions": KIDS, "_live_subagent_count": 2}]
+    )
+    assert len(out[0]) == 1, out
+    pill = out[0][0]
+    assert pill["className"] == "session-child-count is-live"
+    assert pill["textContent"] == "2 children"
+    # Both numbers survive in the tooltip, and it is real text.
+    assert pill["title"] == "2 live · Subagents running now"
+    assert "undefined" not in pill["title"]
+
+
+def test_partial_fan_out_keeps_the_child_count():
+    """5 children with 2 running must never read as "2 children"."""
+    five = [{"session_id": f"k{i}"} for i in range(5)]
+    out = _run_render(
+        [{"session_id": "a", "_child_sessions": five, "_live_subagent_count": 2}]
+    )
+    assert len(out[0]) == 1, out
+    pill = out[0][0]
+    assert pill["textContent"] == "5 children", pill
+    assert "is-live" in pill["className"].split()
+    assert "2 live" in pill["title"]
+
+
+def test_children_without_liveness_render_the_plain_pill():
+    out = _run_render([{"session_id": "a", "_child_sessions": KIDS}])
+    assert len(out[0]) == 1, out
+    pill = out[0][0]
+    assert pill["className"] == "session-child-count"
+    assert "is-live" not in pill["className"]
+    assert "live" not in pill["title"]
 
 
 # ── decoration loop ─────────────────────────────────────────────────────────
@@ -272,6 +344,14 @@ def test_badge_style_is_defined_once():
 def test_badge_respects_reduced_motion():
     assert "prefers-reduced-motion:reduce" in STYLE_CSS
     assert ".session-live-subagents-badge{animation:none;}" in STYLE_CSS
+
+
+def test_live_child_pill_style_is_defined_once():
+    """The merged pill reuses the badge's pulse, and the `.session-item` prefix
+    is what lets it beat the per-skin `.session-child-count` rules."""
+    assert "\n.session-item .session-child-count.is-live{" in STYLE_CSS
+    assert STYLE_CSS.count(".session-item .session-child-count.is-live{") == 1
+    assert ".session-child-count.is-live{animation:none;}" in STYLE_CSS
 
 
 # ── i18n ────────────────────────────────────────────────────────────────────

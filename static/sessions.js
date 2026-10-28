@@ -10350,7 +10350,13 @@ function renderSessionListFromCache(){
     // the map is refreshed on its own cadence and a stale row would otherwise
     // keep a dead count on screen. Inlined for the same slice-extraction reason
     // as the done badge above.
-    if(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0){
+    // ONE pill per row: liveness is a state of the children, not a second
+    // number beside them, so the child pill below carries it (`.is-live`) and
+    // the standalone badge only survives for a parent whose children are not
+    // renderable in the active scope (project/profile filter), where the count
+    // would otherwise have nowhere to go. Two pills showed "2 live" next to
+    // "2 children" for the ordinary fan-out — the same set, counted twice.
+    if(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0&&childCount===0){
       const liveEl=document.createElement('span');
       liveEl.className='session-live-subagents-badge';
       const liveLabel=t('session_live_subagents', s._live_subagent_count);
@@ -10360,10 +10366,18 @@ function renderSessionListFromCache(){
     }
     if(childCount>0){
       const childCountEl=document.createElement('span');
-      childCountEl.className='session-child-count';
+      // Liveness rides on the child pill: accent tint + the sidebar's only
+      // pulse. The count stays the number of children (a fan-out of 5 with 2
+      // still running must not read as "2 children"), and the split lives in
+      // the tooltip.
+      const _liveKids=(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0)
+        ? s._live_subagent_count : 0;
+      childCountEl.className=_liveKids>0?'session-child-count is-live':'session-child-count';
       const childLabel=t('session_meta_children', childCount);
       childCountEl.textContent=childLabel;
-      childCountEl.title=_sessionChildBadgeTooltip(childLabel);
+      childCountEl.title=_liveKids>0
+        ? t('session_live_subagents', _liveKids)+' · '+t('session_live_subagents_tooltip')
+        : _sessionChildBadgeTooltip(childLabel);
       ['pointerdown','pointerup','click'].forEach(ev=>childCountEl.addEventListener(ev,e=>e.stopPropagation()));
       childCountEl.onclick=(e)=>{
         e.stopPropagation();
