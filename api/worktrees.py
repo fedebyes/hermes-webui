@@ -1290,20 +1290,45 @@ def _head_tracks_entry(worktree: Path, entry: str) -> bool:
     return result.returncode == 0
 
 
+def _restore_committed_entry(worktree: Path, entry: str) -> bool:
+    """Put the selected commit's bytes back for one include path, if it is committed.
+
+    Membership in ``HEAD`` says what the correct content *is*; it does not say
+    the tree *has* it. The helper copies an include before this alignment runs,
+    so a tracked path can already hold the other checkout's dirty bytes — the
+    Agent copies the placement root's file over the same path and no reset
+    happens when the commit already matches. Restoring from ``HEAD`` is
+    therefore part of protecting committed content, not a redundant check.
+
+    Returns ``True`` when the path is committed content: the caller must then
+    leave the path alone, since it is the selected commit's, not our copy.
+    """
+    if not _head_tracks_entry(worktree, entry):
+        return False
+    path = entry.rstrip("/")
+    if path:
+        try:
+            _run_git(["checkout", "--", path], worktree, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            logger.debug("Could not restore committed entry %s", entry)
+    return True
+
+
 def _drop_included_entry(worktree: Path, entry: str) -> None:
     """Remove one include the helper copied from the wrong checkout.
 
     Only ever called on a tree this process just created, and only for a path
     its own manifest named, so the target is our copy — never user data. A path
-    the selected commit itself carries is not our copy: it stays. When the path
-    is a symlink the link is removed, never its target.
+    the selected commit itself carries is not our copy: it is restored to the
+    committed bytes (the helper may have copied over it) and otherwise left
+    alone. When the path is a symlink the link is removed, never its target.
     """
     target = _include_target(worktree, entry, follow_leaf=False)
     if target is None:
         return
     if not target.exists() and not target.is_symlink():
         return
-    if _head_tracks_entry(worktree, entry):
+    if _restore_committed_entry(worktree, entry):
         return
     try:
         if target.is_symlink() or target.is_file():
@@ -1319,7 +1344,8 @@ def _copy_included_entry(source_root: Path, worktree: Path, entry: str) -> None:
 
     Files are copied with their metadata; directories are symlinked when the
     platform allows it (the Agent's own choice) and copied recursively when it
-    does not. Committed content of the tree's ``HEAD`` is left untouched, and an
+    does not. Committed content of the tree's ``HEAD`` is restored from that
+    commit rather than replaced, and an
     existing Agent link is replaced as a link — never followed into the checkout
     it points at, which is why directory includes used to keep reading primary.
     """
@@ -1328,7 +1354,7 @@ def _copy_included_entry(source_root: Path, worktree: Path, entry: str) -> None:
     if source is None or destination is None:
         logger.warning("Skipping .worktreeinclude entry outside its root: %s", entry)
         return
-    if _head_tracks_entry(worktree, entry):
+    if _restore_committed_entry(worktree, entry):
         return
     try:
         if destination.is_symlink():
@@ -1350,33 +1376,114 @@ def _copy_included_entry(source_root: Path, worktree: Path, entry: str) -> None:
         logger.debug("Could not copy .worktreeinclude entry %s", entry)
 
 
-def _resolve_base_commit(root: Path) -> str | None:
-    """The commit the Agent would branch a tree from for *root*, or ``None``.
+_BASE_FETCH_TIMEOUT = 5.0
+_BASE_FRESHNESS_WINDOW = 300.0
 
-    Same policy as the installed helper (``_resolve_worktree_base``): the
-    branch's own upstream first, then the remote default branch, then local
-    ``HEAD``. Only refs are read — the helper's own fetch already refreshed the
-    remote-tracking refs, which every checkout in a repository shares. Two
-    checkouts sharing a commit therefore still resolve their own base instead
-    of one being inferred from the other's head.
+
+def _fetch_head_age(root: Path) -> float | None:
+    """Seconds since *root*'s repository last fetched, or ``None`` when unknown."""
+    git_dir = _git_answer(["rev-parse", "--git-dir"], root)
+    if not git_dir:
+        return None
+    path = Path(git_dir)
+    if not path.is_absolute():
+        path = Path(root) / path
+    try:
+        return max(0.0, time.time() - (path / "FETCH_HEAD").stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _refresh_base_ref(root: Path, ref: str) -> str | None:
+    """The commit *ref* names after the helper's own cheap, bounded refresh.
+
+    Mirrors the installed ``_resolve_worktree_base._refresh``: no network when
+    this repository fetched within the freshness window, otherwise a single
+    fetch capped at the timeout, and the cached remote-tracking ref when that
+    fetch fails. ``None`` when the ref has no commit at all.
     """
-    upstream = _git_answer(
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root
-    )
-    if upstream and "/" in upstream:
-        resolved = _git_answer(
-            ["rev-parse", "--verify", "--quiet", f"{upstream}^{{commit}}"], root
+    qualified = f"{ref}^{{commit}}"
+    cached = _git_answer(["rev-parse", "--verify", "--quiet", qualified], root)
+    age = _fetch_head_age(root)
+    if cached and age is not None and age < _BASE_FRESHNESS_WINDOW:
+        return cached
+    if "/" not in ref:
+        return cached
+    remote, branch = ref.split("/", 1)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="")
+    try:
+        subprocess.run(
+            ["git", "fetch", remote, branch],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            timeout=_BASE_FETCH_TIMEOUT,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            creationflags=windows_hide_flags(),
         )
-        if resolved:
-            return resolved
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Could not refresh %s from %s", ref, remote)
+    return _git_answer(["rev-parse", "--verify", "--quiet", qualified], root)
+
+
+def _remote_default_ref(root: Path) -> str | None:
+    """The remote default branch ref the helper would use, or ``None``.
+
+    ``refs/remotes/origin/HEAD`` is a cache Git does not always write: a bare
+    clone, a ``git init`` plus ``remote add``, and a deleted ``set-head`` all
+    leave it absent. The installed helper asks the remote itself in that case
+    (``git remote show origin``, capped like its fetch); the mirror used to
+    fall through to the selected local HEAD instead, and a tree the helper had
+    already based on the remote default was reset onto an unpublished commit.
+    """
     default_ref = _git_answer(
         ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], root
     )
     if default_ref and default_ref.startswith("refs/remotes/"):
         short = default_ref[len("refs/remotes/"):]
-        resolved = _git_answer(
-            ["rev-parse", "--verify", "--quiet", f"{short}^{{commit}}"], root
-        )
+        if "/" in short:
+            return short
+    show = _git_answer(
+        ["remote", "show", "origin"], root, timeout=max(_BASE_FETCH_TIMEOUT, 5.0)
+    )
+    if not show:
+        return None
+    for line in show.splitlines():
+        line = line.strip()
+        if not line.startswith("HEAD branch:"):
+            continue
+        branch = line.split(":", 1)[1].strip()
+        if branch and branch != "(unknown)":
+            return f"origin/{branch}"
+        return None
+    return None
+
+
+def _resolve_base_commit(root: Path) -> str | None:
+    """The commit the Agent would branch a tree from for *root*, or ``None``.
+
+    The installed helper's complete policy (``_resolve_worktree_base``), not a
+    subset: the branch's own upstream first, then the remote default branch —
+    the cached ``origin/HEAD`` symref or, when that cache is missing, the
+    remote's own answer — then local ``HEAD``. Each remote candidate is
+    refreshed with the helper's bounded fetch rather than assumed current, so
+    the mirror resets to the ref the helper just used. Two checkouts sharing a
+    commit therefore still resolve their own base instead of one being
+    inferred from the other's head.
+    """
+    upstream = _git_answer(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root
+    )
+    if upstream and "/" in upstream:
+        resolved = _refresh_base_ref(root, upstream)
+        if resolved:
+            return resolved
+        return _git_answer(["rev-parse", "HEAD"], root)
+    default_ref = _remote_default_ref(root)
+    if default_ref:
+        resolved = _refresh_base_ref(root, default_ref)
         if resolved:
             return resolved
     return _git_answer(["rev-parse", "HEAD"], root)
