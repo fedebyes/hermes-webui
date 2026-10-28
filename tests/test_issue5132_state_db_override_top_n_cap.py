@@ -245,6 +245,9 @@ def _grown_metadata(n):
         f"s{i}": {
             "_state_db_source": "webui",
             "_state_db_message_count": 5,
+            # The SQL read supplies the active-domain count next to the raw one;
+            # the revision check takes its expectation from this key only.
+            "_state_db_active_message_count": 5,
             "_state_db_last_message_at": 2000.0,
         }
         for i in range(n)
@@ -1027,6 +1030,7 @@ def test_walk_takes_its_own_memo_path_end_to_end(monkeypatch):
         "s0": {
             "_state_db_source": "webui",
             "_state_db_message_count": 5,
+            "_state_db_active_message_count": 5,
             "_state_db_last_message_at": 2003.0,
         }
     }
@@ -1093,6 +1097,7 @@ def test_walk_refuses_a_revision_the_row_did_not_overlay(monkeypatch):
         "s0": {
             "_state_db_source": "webui",
             "_state_db_message_count": 5,
+            "_state_db_active_message_count": 5,
             "_state_db_last_message_at": 2000.0,
         }
     }
@@ -1331,6 +1336,73 @@ def test_genuine_concurrent_append_still_refuses_the_walk(monkeypatch, tmp_path)
         "a transcript that answers a different revision must not be cached as "
         "the row's visible count"
     )
+
+
+def test_archive_rows_outside_the_count_cap_never_become_visible_growth(
+    monkeypatch, tmp_path
+):
+    """Archived rows must not inflate the count when the row is outside the cap.
+
+    #8368 re-gate (SILENT): the active-domain aggregate is only computed for the
+    top-N rows, so a pinned row outside the cap has no
+    ``_state_db_active_message_count``. Falling back to the raw stored counter
+    (six, two active plus four archived) handed the revision check the wrong row
+    domain, refused a settled transcript, and the raw-growth fallback reported
+    six visible messages where master and the full GET report two.
+    """
+    db = _archived_state_db(tmp_path)
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+
+    def _sidecar(sid, **_kwargs):
+        class _Stub:
+            _loaded_metadata_only = False
+            messages = _active_sidecar_rows()
+            profile = None
+            truncation_watermark = None
+            truncation_boundary = None
+            pending_user_source = None
+            pending_started_at = None
+            pending_user_message = None
+
+        return _Stub()
+
+    monkeypatch.setattr(models.Session, "load_metadata_only", _sidecar)
+
+    # 300 pinned fillers own the whole count tier: ``s0`` is outside it, so its
+    # active-domain aggregate (and its last-message timestamp) is never read.
+    fillers = [
+        {
+            "session_id": f"f{index}",
+            "title": f"Filler {index}",
+            "message_count": 3,
+            "visible_message_count": 3,
+            "actual_message_count": 3,
+            "last_message_at": 10_000.0 - index,
+            "updated_at": 10_000.0 - index,
+        }
+        for index in range(300)
+    ]
+    target = {
+        "session_id": "s0",
+        "title": "Archived",
+        "message_count": 2,
+        "visible_message_count": 2,
+        "actual_message_count": 2,
+        "last_message_at": 1000.0,
+        "updated_at": 1000.0,
+    }
+    sessions = fillers + [target]
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert target["visible_message_count"] == 2, (
+        "archived rows must not become visible growth outside the count cap"
+    )
+    assert target["message_count"] == 6, (
+        "the raw count still feeds the growth guard and the displayed total"
+    )
+    assert sessions[0]["visible_message_count"] == 3
 
 
 # --- the timestamp guard decides whether state.db rows are growth at all -----------
