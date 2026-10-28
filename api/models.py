@@ -12345,10 +12345,12 @@ def _reconciled_visible_count_for_sidebar(
 
     * ``expected_state_count`` / ``expected_last_message_at``: the overlay
       already read both columns from the ``sessions`` table. A transcript that
-      answers a different pair is a different revision (a tool row landed
-      between the two reads), so the walk is refused (``None``) instead of
-      stamping a visible count that disagrees with the raw count it is clamped
-      by. Unknown expectations skip the check, they never fail it.
+      GREW past that pair is a different revision (a tool row landed between the
+      two reads), so the walk is refused (``None``) instead of stamping a visible
+      count that disagrees with the raw count it is clamped by. A transcript that
+      SHRANK is the newer answer — the Agent archived rows (compaction, rewind)
+      in that window — and is used as read. Unknown expectations skip the check,
+      they never fail it.
     * ``fresh_if_unchanged_state_count`` = ``(previous_state_count,
       previous_visible_count)``: while state.db has not advanced past
       ``previous_state_count``, the previously reconciled visible count still
@@ -12427,17 +12429,30 @@ def _reconciled_visible_count_for_sidebar(
         return None
     if expected_state_count is not None or expected_last_message_at is not None:
         built_count, built_last = _state_db_shape_of_messages(state_messages)
-        if (
+        # Only real GROWTH invalidates this transcript: it then holds rows the
+        # caller's row never counted. A SMALLER transcript is not a mismatch —
+        # the Agent archives rows between the two reads whenever it compacts or
+        # rewinds, so the detailed read is the newer, correct answer. Refusing it
+        # on inequality made that poll fall back to the raw stored counter (six
+        # where master and the detail payload report two); the next poll
+        # corrected it, but one wrong sidebar count per compaction is new with
+        # this overlay. A shrink is honoured below, with the timestamp rejection
+        # skipped for it (the expectation came from the pre-archive aggregate).
+        grew = (
             expected_state_count is not None
             and built_count is not None
-            and built_count != expected_state_count
-        ):
-            # The transcript moved between the overlay's SQL read and this
-            # detailed read: its visible count no longer describes the row the
-            # caller is overlaying.
+            and built_count > expected_state_count
+        )
+        shrank = (
+            expected_state_count is not None
+            and built_count is not None
+            and built_count < expected_state_count
+        )
+        if grew:
             return None
         if (
-            expected_last_message_at is not None
+            not shrank
+            and expected_last_message_at is not None
             and built_last is not None
             and float(built_last) > float(expected_last_message_at) + 0.000001
         ):

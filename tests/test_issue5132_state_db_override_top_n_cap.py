@@ -1038,7 +1038,12 @@ def test_walk_takes_its_own_memo_path_end_to_end(monkeypatch):
 
     def _counting_state_read(sid, **kwargs):
         reads.append(str(sid))
-        return _fake_state_rows()
+        # Five rows: the sidecar's four plus the appended reply the aggregate
+        # counted. Growth (5 == 5) is the shape this test pins the memo path on;
+        # a transcript smaller than its aggregate is covered separately below.
+        return _fake_state_rows() + [
+            {"role": "assistant", "content": "m4", "timestamp": 1004.0}
+        ]
 
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
     monkeypatch.setattr(
@@ -1062,6 +1067,141 @@ def test_walk_takes_its_own_memo_path_end_to_end(monkeypatch):
         "one transcript read for five polls: after the first walk the memo "
         "answers every poll whose state.db count has not moved"
     )
+
+
+def _pinned_stub_sidecar(messages):
+    """A full-load sidecar stub carrying *messages*."""
+
+    class _Stub:
+        _loaded_metadata_only = False
+        profile = None
+        truncation_watermark = None
+        truncation_boundary = None
+        pending_user_source = None
+        pending_started_at = None
+        pending_user_message = None
+
+    _Stub.messages = list(messages)
+    return _Stub()
+
+
+def _patch_archive_scene(monkeypatch, sessions, metadata, state_rows):
+    """Patch the overlay for a scene whose aggregate and detailed read disagree."""
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+    monkeypatch.setattr(models, "get_state_db_session_messages", state_rows)
+
+
+def test_archiving_between_the_aggregate_and_the_walk_keeps_the_shrunk_count(monkeypatch):
+    """A compaction between the two reads is not a mismatch: report what was read.
+
+    The SQL aggregate sees six active rows; the Agent archives four of them
+    before the detailed read, which therefore returns two. Rejecting that
+    transcript made this poll report the raw stored counter (six) while the full
+    GET reported two — one wrong sidebar count per compaction.
+    """
+    kept = [
+        {"role": "user", "content": "keep0", "timestamp": 1000.0},
+        {"role": "assistant", "content": "keep1", "timestamp": 1001.0},
+    ]
+    sessions = _grown_sessions(1)
+    sessions[0]["message_count"] = 2
+    sessions[0]["actual_message_count"] = 2
+    sessions[0]["visible_message_count"] = 2
+    metadata = {
+        "s0": {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 6,
+            "_state_db_active_message_count": 6,
+            "_state_db_last_message_at": 3003.0,
+        }
+    }
+    _patch_archive_scene(monkeypatch, sessions, metadata, lambda sid, **kw: list(kept))
+    monkeypatch.setattr(
+        models.Session, "load_metadata_only", lambda sid, **kw: _pinned_stub_sidecar(kept)
+    )
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert sessions[0]["visible_message_count"] == 2, (
+        "the shrunken transcript is the newer answer; the raw pre-archive "
+        "counter must not be reported for that poll"
+    )
+
+
+def test_compaction_that_archives_and_appends_reports_the_new_total(monkeypatch):
+    """Compaction archives four rows and appends a reply inside the same window."""
+    sidecar = [
+        {"role": "user", "content": "keep0", "timestamp": 1000.0},
+        {"role": "assistant", "content": "keep1", "timestamp": 1001.0},
+    ]
+    fresh = sidecar + [
+        {"role": "user", "content": "after-compaction", "timestamp": 3003.0}
+    ]
+    sessions = _grown_sessions(1)
+    sessions[0]["message_count"] = 2
+    sessions[0]["actual_message_count"] = 2
+    sessions[0]["visible_message_count"] = 2
+    metadata = {
+        "s0": {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 6,
+            "_state_db_active_message_count": 6,
+            "_state_db_last_message_at": 3003.0,
+        }
+    }
+    _patch_archive_scene(monkeypatch, sessions, metadata, lambda sid, **kw: list(fresh))
+    monkeypatch.setattr(
+        models.Session, "load_metadata_only", lambda sid, **kw: _pinned_stub_sidecar(sidecar)
+    )
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert sessions[0]["visible_message_count"] == 3, (
+        "two surviving rows plus the reply appended during the compaction"
+    )
+
+
+def test_walk_refuses_growth_but_answers_a_shrink(monkeypatch):
+    """Directly: growth between the reads refuses the transcript, a shrink answers."""
+    sidecar = [
+        {"role": "user", "content": "keep0", "timestamp": 1000.0},
+        {"role": "assistant", "content": "keep1", "timestamp": 1001.0},
+    ]
+    state_rows = {"rows": list(sidecar)}
+    monkeypatch.setattr(
+        models.Session, "load_metadata_only", lambda sid, **kw: _pinned_stub_sidecar(sidecar)
+    )
+    monkeypatch.setattr(
+        models,
+        "get_state_db_session_messages",
+        lambda sid, **kw: list(state_rows["rows"]),
+    )
+
+    # The aggregate saw two rows; three landed before the detailed read.
+    state_rows["rows"] = sidecar + [
+        {"role": "assistant", "content": f"landed-{i}", "timestamp": 4004.0 + i}
+        for i in range(3)
+    ]
+    assert (
+        models._reconciled_visible_count_for_sidebar(
+            "s0", expected_state_count=2, expected_last_message_at=1001.0
+        )
+        is None
+    )
+
+    # A shrink (the aggregate counted six, four were archived) is answered.
+    state_rows["rows"] = list(sidecar)
+    answered = models._reconciled_visible_count_for_sidebar(
+        "s0", expected_state_count=6, expected_last_message_at=3003.0
+    )
+    assert answered is not None
+    assert int(getattr(answered, "visible", answered)) == 2
 
 
 def _fake_stub_sidecar(sid, **kwargs):
