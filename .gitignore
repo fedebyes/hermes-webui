@@ -84,3 +84,6 @@ docs/ui-ux/review-shots/
 # Local WebUI runtime data and credentials
 .webui_password
 attachments/
+
+# Session scratch (plans, probes) written by the agent while patching this tree
+.hermes/
