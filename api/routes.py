@@ -1308,9 +1308,16 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
         MAX_DESCRIPTION_LENGTH,
         _EXCLUDED_SKILL_DIRS,
         _parse_frontmatter,
-        _sort_skills,
         skill_matches_platform,
     )
+
+    # The agent renamed this helper from the private ``_sort_skills`` to the
+    # public ``sort_skills``. Import whichever this install ships so the skills
+    # endpoint does not die with ImportError on a version skew.
+    try:
+        from tools.skills_tool import _sort_skills
+    except ImportError:
+        from tools.skills_tool import sort_skills as _sort_skills
 
     if not skills_dir.exists():
         skills_dir.mkdir(parents=True, exist_ok=True)

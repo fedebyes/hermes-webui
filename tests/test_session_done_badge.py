@@ -1,4 +1,5 @@
-"""Sidebar `done` badge: a row with `done_at` renders the badge, a row without it does not.
+"""Sidebar `done` marker: a row with `done_at` renders the resting check, and the
+check outranks the unread dot.
 
 `done_at` is the structural "this conversation is finished" flag (written by the
 close/checkmark scripts through POST /api/session/mark-done). The sidebar must
@@ -7,9 +8,10 @@ render it as data — never by inferring from a title prefix or from silence.
 The repo intentionally avoids a node/jsdom dependency (see AGENTS.md), so this
 file follows the WEBUI-SUB convention: precise structural assertions on
 `static/sessions.js` + `static/style.css`, plus one real execution of the
-extracted render fragment under node with a minimal fake DOM. That way removing
-the `if(s.done_at)` guard, dropping the `.done` row class, or inlining the wrong
-i18n key reddens the test instead of silently rendering nothing.
+extracted marker-decision fragment under node with a minimal fake DOM. That way
+removing the `done_at` presence guard, dropping the `.done` row class, letting
+the unread dot displace the check again, or inlining the wrong i18n key reddens
+the test instead of silently rendering nothing.
 
 i18n: every locale block must carry both keys, or the badge falls back to the
 raw key name in that language.
@@ -34,19 +36,71 @@ pytestmark = pytest.mark.skipif(not shutil.which("node"), reason="node required"
 
 
 DONE_PREDICATE = "s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''"
+DECISION_END = "    ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);\n"
+
+# The marker decision, as the ordered source lines the renderer executes. Each
+# entry is a line PREFIX, so the harness follows the code when the blocks move
+# (and reports the one line that is missing when a priority rule is removed)
+# instead of pinning a character offset that any refactor invalidates.
+DECISION_LINES = (
+    "    const _doneHere=",
+    "    const _unreadDot=",
+    "    const hasAttentionState=",
+    "    ts.className=",
+    "    state.className=",
+)
+
+REQUIRED_REASON = {
+    "    const _unreadDot=": (
+        "the unread dot is not gated by `done`: a finished conversation with "
+        "unread replies loses its resting check to the neutral dot"
+    ),
+}
 
 
-def _done_badge_block() -> str:
-    """The `if(<done predicate>){...}` fragment from the row renderer."""
-    pattern = r"^    if\(" + re.escape(DONE_PREDICATE) + r"\)\{.*?^    \}\n"
-    m = re.search(pattern, SESSIONS_JS, re.S | re.M)
-    assert m, "done badge block not found in static/sessions.js"
-    return m.group(0)
+def _source_line(prefix: str) -> str:
+    m = re.search(r"^" + re.escape(prefix) + r".*?;$", SESSIONS_JS, re.M)
+    if m:
+        return m.group(0) + "\n"
+    assert prefix not in REQUIRED_REASON, REQUIRED_REASON.get(prefix, "")
+    assert False, f"marker decision line not found in static/sessions.js: {prefix!r}"
+
+
+def _marker_decision_block() -> str:
+    """The marker-priority lines from the row renderer, in source order.
+
+    Together they decide which single marker the right-hand slot carries
+    (`_doneHere` -> the resting check, `_unreadDot` -> the neutral dot) and
+    whether the timestamp yields to it. Executed as a whole, so the test reads
+    the real decision instead of restating it.
+    """
+    return "".join(_source_line(p) for p in DECISION_LINES)
+
+
+def _done_check_block() -> str:
+    """The `if(_doneHere){...}` block that appends the resting check.
+
+    The check is appended either to the title row directly or to the
+    right-aligned group that also holds the timestamp; the harness aliases the
+    two so one extraction covers both shapes.
+    """
+    start = SESSIONS_JS.find("    if(_doneHere){")
+    assert start != -1, "done check block not found in static/sessions.js"
+    prop = SESSIONS_JS.find("appendChild(doneEl);", start)
+    assert prop != -1, "done marker not found inside the block"
+    closing = SESSIONS_JS.find("\n    }\n", prop)
+    assert closing != -1, "done marker block not terminated"
+    return SESSIONS_JS[start : closing + len("\n    }\n")]
 
 
 def _run_render(rows):
-    """Execute the extracted fragment against a minimal fake DOM."""
-    block = _done_badge_block()
+    """Execute the extracted fragments against a minimal fake DOM.
+
+    Each input row carries `done_at` plus the three flags the renderer derives
+    from the live session (`isStreaming`, `hasUnread`, `attention`).
+    """
+    block = _marker_decision_block()
+    check = _done_check_block()
     harness = f"""
 class FakeEl {{
   constructor(tag) {{
@@ -57,6 +111,7 @@ class FakeEl {{
     this.children = [];
   }}
   appendChild(child) {{ this.children.push(child); return child; }}
+  setAttribute(name, value) {{ this[name] = value; }}
 }}
 const document = {{ createElement: (tag) => new FakeEl(tag) }};
 function t(key, ...args) {{
@@ -72,17 +127,34 @@ function t(key, ...args) {{
 function _formatRelativeSessionTime(ms) {{ return ms ? '2h ago' : 'unknown'; }}
 
 const out = [];
-for (const s of {json.dumps(rows)}) {{
-  const titleRow = new FakeEl('span');
-  // The row-class predicate, verbatim from _renderOneSession (presence, not
-  // truthiness — a stored 0 is a valid timestamp).
-  const isDone = {DONE_PREDICATE};
-  {block}
-  out.push({{ isDone, children: titleRow.children.map(c => ({{
-    className: c.className,
-    textContent: c.textContent,
-    title: c.title,
-  }})) }});
+for (const row of {json.dumps(rows)}) {{
+  const s = {{ session_id: row.session_id, done_at: row.done_at }};
+  const isStreaming = Boolean(row.isStreaming);
+  const hasUnread = Boolean(row.hasUnread);
+  const attention = row.attention || null;
+  const attentionDotClass = attention
+    ? (attention.kind === 'approval' ? ' is-attention-approval'
+      : (attention.kind === 'clarify' ? ' is-attention-clarify' : ' is-attention-generic'))
+    : '';
+  const titleRow = new FakeEl('div');
+  // The check lands in the title row (branch shape) or in the right-aligned
+  // group beside the timestamp (live-tree shape); alias both onto one list.
+  const _rightGroup = titleRow;
+  const tsMs = 1700000000000;
+  const ts = document.createElement('span');
+  const state = {{ className: '' }};
+{block}{check}  out.push({{
+    doneHere: _doneHere,
+    unreadDot: _unreadDot,
+    hasAttentionState,
+    timestampHidden: ts.className.includes('is-hidden'),
+    stateClass: state.className,
+    children: titleRow.children.map(c => ({{
+      className: c.className,
+      textContent: c.textContent,
+      title: c.title,
+    }})),
+  }});
 }}
 console.log(JSON.stringify(out));
 """
@@ -93,28 +165,78 @@ console.log(JSON.stringify(out));
     return json.loads(proc.stdout)
 
 
-def test_row_with_done_at_renders_the_badge():
+def test_row_with_done_at_renders_the_check():
     out = _run_render([{"session_id": "a", "done_at": 1700000000.0}])
     assert len(out[0]["children"]) == 1, out
-    badge = out[0]["children"][0]
-    assert badge["className"] == "session-done-badge"
-    assert badge["textContent"] == "Done"
-    assert badge["title"] == "Marked done 2h ago"
-    assert out[0]["isDone"] is True
+    check = out[0]["children"][0]
+    # A resting check beside the timestamp, not a text pill beside the title:
+    # the pill competed with the live-subagent badge for the same row.
+    assert check["className"] == "session-done-check"
+    assert check["textContent"] == ""
+    assert check["title"] == "Marked done 2h ago"
+    assert out[0]["doneHere"] is True
+    assert out[0]["timestampHidden"] is False
+
+
+def test_done_beats_unread_so_the_check_keeps_the_slot():
+    """A closed conversation with unread replies keeps its check.
+
+    Regression: `hasAttentionState` folded `hasUnread` in unconditionally, so the
+    neutral dot took the slot the check belongs to and a finished session read as
+    "needs attention" instead of "settled".
+    """
+    out = _run_render([{"session_id": "a", "done_at": 1700000000.0, "hasUnread": True}])
+    row = out[0]
+    assert row["doneHere"] is True, row
+    assert row["unreadDot"] is False, row
+    assert " is-unread" not in row["stateClass"], row
+    assert [c["className"] for c in row["children"]] == ["session-done-check"], row
+    # The dot is gone, so nothing claims the timestamp's slot: "✓ 2h" stays whole.
+    assert row["timestampHidden"] is False, row
+
+
+def test_unread_without_done_keeps_the_dot():
+    out = _run_render([{"session_id": "b", "hasUnread": True}])
+    row = out[0]
+    assert row["doneHere"] is False
+    assert row["unreadDot"] is True
+    assert " is-unread" in row["stateClass"], row
+    assert row["children"] == [], row
+    assert row["timestampHidden"] is True, row
+
+
+def test_streaming_still_wins_over_done():
+    """A running turn is never a closed row — the spinner must not be replaced."""
+    out = _run_render([{"session_id": "c", "done_at": 1700000000.0, "isStreaming": True}])
+    row = out[0]
+    assert row["doneHere"] is False, row
+    assert " is-streaming" in row["stateClass"], row
+    assert row["children"] == [], row
+
+
+def test_pending_attention_still_wins_over_done():
+    """A pending clarify/approval means the agent is blocked, not finished."""
+    for kind in ("clarify", "approval"):
+        out = _run_render(
+            [{"session_id": "d", "done_at": 1700000000.0, "attention": {"kind": kind}}]
+        )
+        row = out[0]
+        assert row["doneHere"] is False, row
+        assert f" is-attention-{kind}" in row["stateClass"], row
+        assert row["children"] == [], row
 
 
 def test_row_without_done_at_renders_nothing():
-    out = _run_render([{"session_id": "b"}, {"session_id": "c", "done_at": None}])
-    assert out == [
-        {"isDone": False, "children": []},
-        {"isDone": False, "children": []},
-    ], out
+    out = _run_render([{"session_id": "e"}, {"session_id": "f", "done_at": None}])
+    for row in out:
+        assert row["doneHere"] is False
+        assert row["children"] == []
 
 
 def test_done_at_zero_still_reads_as_done():
     """0 is a valid timestamp: presence, not truthiness, decides (JS `if(0)` is false)."""
-    out = _run_render([{"session_id": "d", "done_at": 0}])
-    assert out[0]["isDone"] is True
+    out = _run_render([{"session_id": "g", "done_at": 0}])
+    assert out[0]["doneHere"] is True
     assert len(out[0]["children"]) == 1, out
 
 
@@ -141,6 +263,11 @@ def test_done_row_class_has_a_style_consumer():
     """A class the renderer emits and a test asserts must actually be styled —
     otherwise it is dead weight that reads as a feature."""
     assert ".session-item.done .session-title{" in STYLE_CSS
+
+
+def test_done_check_has_a_style_and_yields_on_hover():
+    assert "\n  .session-done-check{" in STYLE_CSS
+    assert ".session-item:hover .session-done-check" in STYLE_CSS
 
 
 def test_every_locale_defines_both_done_keys():

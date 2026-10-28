@@ -8034,9 +8034,9 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     """
     import os as _os
     try:
-        _cap = int(_os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "300"))
+        _cap = int(_os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "60"))
     except (TypeError, ValueError):
-        _cap = 300
+        _cap = 60
     all_ids = {str(s.get('session_id')) for s in sessions if s.get('session_id')}
     if _cap > 0 and len(sessions) > _cap:
         count_ids = {str(s.get('session_id')) for s in sessions[:_cap] if s.get('session_id')}
@@ -8050,10 +8050,17 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
         )
     except Exception:
         return
-    _apply_sidebar_state_db_override_metadata(sessions, metadata)
+    _apply_sidebar_state_db_override_metadata(sessions, metadata, count_ids)
 
 
-def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: dict[str, dict]) -> None:
+def _apply_sidebar_state_db_override_metadata(
+    sessions: list[dict],
+    metadata: dict[str, dict],
+    count_session_ids: set[str] | None = None,
+) -> None:
+    # ``count_session_ids`` bounds the per-row transcript reconciliation to the
+    # top-N rows (None = no cap). Metadata-only overrides still apply to every
+    # row: they are free and the sidebar source filter depends on them.
     for session in sessions:
         sid = session.get('session_id')
         if sid not in metadata:
@@ -8111,7 +8118,21 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
             # sidecar metadata-only write happened after the state.db append,
             # keep the conservative anti-resurrection guard and wait for a
             # newer settled state.db message before overlaying counts again.
-            if state_count > current_count and (state_last <= 0 or state_last > current_last):
+            #
+            # The transcript reconciliation below is the expensive half of this
+            # overlay (one full sidecar+state.db merge per grown row: measured
+            # 98 rows x 0.19 s = 18.8 s of a 20 s /api/sessions build, with
+            # 307k _cached_message_key calls). ``count_session_ids`` is the
+            # existing top-N bound for this pass, so honour it here too: rows
+            # outside the cap keep their sidecar count until the history panel
+            # or the next poll brings them into the window. Without this gate
+            # the cap only limited the SQL aggregate while every grown row
+            # still paid the merge (TOP_N=20 and TOP_N=300 both measured ~13 s).
+            if (
+                state_count > current_count
+                and (state_last <= 0 or state_last > current_last)
+                and (count_session_ids is None or str(sid) in count_session_ids)
+            ):
                 try:
                     existing_actual = max(0, int(session.get('actual_message_count') or 0))
                 except (TypeError, ValueError):

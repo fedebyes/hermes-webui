@@ -83,6 +83,7 @@ from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
+from api.session_cost import usage_fields as session_cost_fields
 from api.models import (
     StateDBSessionMessagesSnapshot,
     _cancelled_journal_turn_owner,
@@ -12093,6 +12094,24 @@ def _run_agent_streaming(
                 _usage['cache_write_tokens'] = getattr(_agent, 'session_cache_write_tokens', 0) or 0
             except Exception:
                 pass
+            # Aligned cost (api/session_cost.py). The runtime accumulator above is
+            # per-process (a resumed session starts it at 0) and card-priced, so it
+            # cannot agree with the [session-cost] notice for the same conversation.
+            # The durable figure lives in state.db and is priced with the calibrated
+            # rate the spend feed publishes: quote that, keyed by session, and leave
+            # `estimated_cost` untouched as the legacy/process-local fallback.
+            _sid_cost = getattr(_session_obj, 'session_id', None)
+            if _sid_cost:
+                _usage.update(
+                    session_cost_fields(
+                        str(_sid_cost),
+                        model=getattr(_agent, 'model', None) or getattr(_session_obj, 'model', None),
+                        # A conversation not yet flushed has no row: price the live
+                        # counters instead. On a first call they carry no cache reads,
+                        # so the net/gross difference cannot distort it.
+                        fallback_tokens=int(_usage['input_tokens'] or 0) + int(_usage['output_tokens'] or 0),
+                    )
+                )
             try:
                 _cc = getattr(_agent, 'context_compressor', None)
                 if _cc:
@@ -15688,6 +15707,17 @@ def _run_agent_streaming(
                 'turn_cache_hit_percent': turn_cache_hit_percent,
                 'duration_seconds': round(_turn_duration_seconds, 3),
             }
+            # Aligned cumulative cost, same helper and same basis as the live payload:
+            # the header and the /usage panel must quote one number, and that number
+            # must be the durable one the [session-cost] notice quotes.
+            _sid_final = getattr(s, 'session_id', None)
+            if _sid_final:
+                usage.update(
+                    session_cost_fields(
+                        str(_sid_final),
+                        model=getattr(agent, 'model', None) or getattr(s, 'model', None),
+                    )
+                )
             if _turn_tps is not None:
                 usage['tps'] = _turn_tps
             if _gateway_routing:

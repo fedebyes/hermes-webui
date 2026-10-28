@@ -21,10 +21,18 @@ from api.profiles import _profiles_match
 _CRON_RUN_TS_RE = re.compile(r"\d{8}_\d{6}")
 
 
-_SESSIONS_CACHE_TTL_SECONDS = 2.5
+# #4808/#5132: this is only the *age* bound on a cache entry — real content
+# changes bust the entry immediately via ``_session_list_cache_source_stamp``
+# (state.db + WAL stat, content fingerprint, session index stat, settings
+# write version). The bound must therefore be LONGER than the idle sidebar
+# poll (``static/sessions.js`` refreshes every 30s), otherwise every idle poll
+# misses the cache and pays a full all_sessions() rebuild: on a large store
+# (700+ rows, multi-hundred-MB state.db) that is a 5-7s CPU burst per client
+# per poll. 60s = one rebuild per two polls worst case instead of one per poll.
+_SESSIONS_CACHE_TTL_SECONDS = 60.0
 # #4808: while a turn is actively streaming the frontend polls /api/sessions on a
-# fixed cadence (static/sessions.js `_streamingPollMs`). With the idle TTL of
-# 2.5s, the entry expires between streaming polls, so each poll can find it stale
+# fixed cadence (static/sessions.js `_streamingPollMs`). With the old idle TTL of
+# 2.5s, the entry expired between streaming polls, so each poll could find it stale
 # and force a full all_sessions() rebuild on the hot path under the global store
 # LOCK — pinning CPU and starving token rendering on large stores (recurrence of
 # #4672). Hold the sidebar cache steady for longer than one poll interval while

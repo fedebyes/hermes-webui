@@ -80,8 +80,18 @@ def test_state_indicator_uses_right_actions_slot_to_prevent_title_shift():
 
 
 def test_timestamp_hidden_when_attention_state_is_present():
-    assert "+(hasUnread?' unread':'')+(attention?' needs-attention':'')+attentionClass" in SESSIONS_JS
-    assert "const hasAttentionState=isStreaming||hasUnread||Boolean(attention);" in SESSIONS_JS
+    # The `unread` row class follows the marker, not the raw fact: it is what
+    # reserves the 40px the dot sits in, and a done row drawing the check must
+    # not keep that reservation (it indented the check+timestamp ~32px against
+    # its neighbours).
+    assert "+(hasUnread?' unread':'')+(attention?' needs-attention':'')+attentionClass" not in SESSIONS_JS
+    assert "+(_unreadDot?' unread':'')+(attention?' needs-attention':'')+attentionClass" in SESSIONS_JS
+    # Unread now feeds the same predicate through `_unreadDot`, which yields to a
+    # resting done check (see tests/test_session_done_badge.py for the priority
+    # matrix): streaming and a pending attention still hide the timestamp, and so
+    # does an unread row that is not finished.
+    assert "const _unreadDot=hasUnread&&!_doneHere;" in SESSIONS_JS
+    assert "const hasAttentionState=isStreaming||Boolean(attention)||_unreadDot;" in SESSIONS_JS
     assert "ts.className='session-time'+(hasAttentionState?' is-hidden':'');" in SESSIONS_JS
     assert "ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);" in SESSIONS_JS
     assert ".session-time.is-hidden{display:none;}" in STYLE_CSS

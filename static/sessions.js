@@ -10138,8 +10138,18 @@ function renderSessionListFromCache(){
     const hasUnread=(_hasUnreadForSession(s)||!!s._child_session_has_unread)&&!isActive;
     const attention=_sessionAttentionState(s)||_sessionAttentionState({_child:true,attention:s._child_session_attention});
     const attentionClass=attention?(attention.kind==='approval'?' attention-approval':(attention.kind==='clarify'?' attention-clarify':' attention-attention')):'';
+    // One marker per row, decided ONCE here because the row's classes are part
+    // of the same decision: priority is streaming > pending attention (the agent
+    // is blocked, so the row is not closed) > done > unread. Done outranks
+    // unread because the dot shares the slot and says strictly less — but the
+    // `unread` class is what reserves the 40px the dot sits in, so it has to
+    // follow the marker: keeping it with the check drawn indented every finished
+    // row with unread replies by ~32px against its neighbours.
+    const _doneHere=(s.done_at!==null&&s.done_at!==undefined&&s.done_at!=='')&&!isStreaming&&!attention;
+    const _unreadDot=hasUnread&&!_doneHere;
+    const hasAttentionState=isStreaming||Boolean(attention)||_unreadDot;
     const readOnly=_isReadOnlySession(s);
-    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+((s.done_at!==null&&s.done_at!==undefined&&s.done_at!=='')?' done':'')+(ownStreaming?' streaming':'')+(hasUnread?' unread':'')+(attention?' needs-attention':'')+attentionClass;
+    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+((s.done_at!==null&&s.done_at!==undefined&&s.done_at!=='')?' done':'')+(ownStreaming?' streaming':'')+(_unreadDot?' unread':'')+(attention?' needs-attention':'')+attentionClass;
     const swipeReturnOffset=_sessionSwipeReturnOffsets.get(s.session_id);
     if(swipeReturnOffset!==undefined){
       _sessionSwipeReturnOffsets.delete(s.session_id);
@@ -10244,13 +10254,10 @@ function renderSessionListFromCache(){
     }
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
-    const hasAttentionState=isStreaming||hasUnread||Boolean(attention);
+    // Marker decision (streaming > attention > done > unread) is taken above,
+    // before the row classes: it drives both the class list and these markers.
     ts.className='session-time'+(hasAttentionState?' is-hidden':'');
     ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
-    // Done marker lives in the right group beside the timestamp (built below);
-    // the state slot now carries live signals only. Live always wins: a
-    // streaming/unread/attention row must never look closed.
-    const _doneHere=!!s.done_at&&!hasAttentionState;
     titleRow.appendChild(title);
     // Done check + timestamp share one right-aligned group: `.session-time`
     // carries `margin-left:auto`, so a bare sibling inserted before it would be
@@ -10801,7 +10808,7 @@ function renderSessionListFromCache(){
     // no state class of its own.
     const _hasLiveState=isStreaming||hasUnread||!!attention;
     const _isDone=false; // done now renders as .session-done-check, beside the timestamp
-    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''))+attentionDotClass;
+    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(_unreadDot?' is-unread':''))+attentionDotClass;
     state.setAttribute('aria-hidden','true');
     // Tooltip precedence: a localized attention title (pending approval/clarify,
     // from the attention-indicator feature) is more specific and actionable than

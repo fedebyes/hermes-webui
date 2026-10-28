@@ -105,7 +105,7 @@ class WebUIJsonSessionDB:
         for path in self.session_dir.glob("*.json"):
             if path.name.startswith("_"):
                 continue
-            data = self._read_path(path)
+            data = self._read_metadata_row_source(path)
             if not isinstance(data, dict):
                 continue
             sid = str(data.get("session_id") or path.stem)
@@ -196,6 +196,60 @@ class WebUIJsonSessionDB:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None
+
+    #: Bytes scanned from the head of a sidecar to recover the metadata prefix.
+    #: Metadata keys are serialized before ``messages``, so they all live in the
+    #: first few KB: measured over 637 real sidecars the top-level ``"messages"``
+    #: key started at p50 2.6 KB, p99 32 KB, max 43 KB.
+    _METADATA_HEAD_BYTES = 64 * 1024
+
+    @classmethod
+    def _read_metadata_prefix(cls, path: Path) -> dict[str, Any] | None:
+        """Parse only the metadata that precedes ``messages`` in a sidecar.
+
+        ``list_sessions()`` needs ~20 scalar fields out of each sidecar, but a
+        full ``json.loads`` also decodes every message: on a store of 639 files
+        (1.18 GB) that costs ~16 s per refresh, spent entirely on bytes the
+        sidebar never reads. Metadata is serialized before ``messages``, so the
+        head is cut at that key and closed with ``}`` -- a few KB instead of
+        megabytes.
+
+        Returns ``None`` when the cut cannot be found (key beyond the window, or
+        a non-dict document), so the caller falls back to a full parse.
+        """
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(cls._METADATA_HEAD_BYTES)
+        except OSError:
+            return None
+        cut = head.find(b'\n  "messages":')
+        if cut < 0:
+            cut = head.find(b'"messages":')
+        if cut < 0:
+            return None
+        prefix = head[:cut].rstrip()
+        # Trim a trailing separator so the object closes cleanly.
+        while prefix and prefix[-1:] in (b",", b"\n", b" ", b"\t", b"\r"):
+            prefix = prefix[:-1]
+        prefix += b"\n}"
+        try:
+            data = json.loads(prefix.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _read_metadata_row_source(cls, path: Path) -> dict[str, Any] | None:
+        """Metadata-only read used by ``list_sessions``. See ``_read_metadata_prefix``."""
+        prefix = cls._read_metadata_prefix(path)
+        if prefix is not None:
+            # ``_metadata_row`` derives ``message_count`` from ``len(messages)``
+            # when the field is absent. The head read never sees ``messages``,
+            # so a sidecar that omits ``message_count`` must be parsed whole --
+            # otherwise the sidebar would report 0 messages for it.
+            if isinstance(prefix.get("message_count"), int):
+                return prefix
+        return cls._read_path(path)
 
     @staticmethod
     def _metadata_row(sid: str, data: dict[str, Any]) -> dict[str, Any]:

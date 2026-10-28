@@ -1307,13 +1307,25 @@ def session_usage(session_id: str) -> dict[str, Any]:
     s = get_session(session_id)
     inp = int(s.input_tokens or 0)
     out = int(s.output_tokens or 0)
-    return {
+    payload = {
         'input_tokens': inp,
         'output_tokens': out,
         'total_tokens': inp + out,
         'estimated_cost': s.estimated_cost,
         'model': s.model,
     }
+    # Aligned cost (api/session_cost.py): durable tokens x the calibrated price,
+    # the same arithmetical pair the [session-cost] notice quotes. The legacy
+    # `estimated_cost` above is the runtime's per-process accumulator and is kept
+    # untouched for every existing consumer; a caller that wants the figure which
+    # agrees with the notice reads `estimated_cost_eur`.
+    try:
+        from api.session_cost import usage_fields
+
+        payload.update(usage_fields(session_id, model=s.model))
+    except Exception:
+        payload['estimated_cost_eur'] = None
+    return payload
 
 
 def _extract_text(content: Any) -> str:

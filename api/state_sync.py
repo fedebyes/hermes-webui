@@ -293,9 +293,28 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
         # values into state.db. Omitting cache counters makes insights/reporting
         # show false 0% hit rates even when the live stream and sidecar saw warm
         # prefix reads.
+        #
+        # ``input_tokens`` must be NET of cache, the basis every other writer
+        # uses. The callers hand us the WebUI's own counter, which mirrors
+        # ``agent.session_prompt_tokens`` — the GROSS prompt total, cache read and
+        # cache write included (``CanonicalUsage.prompt_tokens``). The runtime's
+        # per-call writer stores ``CanonicalUsage.input_tokens``, which
+        # ``agent/usage_pricing.normalize_usage`` has already stripped of both
+        # cache buckets for the chat/codex shapes. Consumers sum
+        # ``input + cache_read + output`` (usage_tracker.deepseek_tokens, the
+        # peak-cost-notice family query, session_cost.family_tokens), so a gross
+        # value counts the cache a second time and a single warm session can read
+        # ~2x its real size. Rows written before this fix stay gross on purpose —
+        # history is not rewritten; the calibration absorbs the residual.
+        net_input_tokens = max(
+            0,
+            int(input_tokens or 0)
+            - int(cache_read_tokens or 0)
+            - int(cache_write_tokens or 0),
+        )
         db.update_token_counts(
             session_id=session_id,
-            input_tokens=input_tokens,
+            input_tokens=net_input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,

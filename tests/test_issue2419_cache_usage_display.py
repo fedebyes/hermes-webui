@@ -50,7 +50,13 @@ def test_context_indicator_surfaces_cache_hit_rate():
     assert "cacheWriteTok=usage.cache_write_tokens||0" in src
     assert "cacheHitPct=usage.cache_hit_percent" in src
     assert "t('usage_cache_hit_detail',cacheHitPct" in src
-    assert "Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}" in src
+    # The cost label moved onto the aligned basis (api/session_cost.py): € from the
+    # calibrated price when the payload carries it, $ from the runtime accumulator
+    # as the fallback. Pinning the old `$`-only expression made this assertion a
+    # guard against the very change that aligns the meter with [session-cost].
+    assert "const costLabel=" in src
+    assert "usage.estimated_cost_eur" in src
+    assert "Estimated cost: ${costLabel}" in src
     assert "cacheHitPct=msg._turnUsage.cache_hit_percent" in src
     assert "t('usage_cached_percent',cacheHitPct)" in src
     assert "cacheHitPct!=null" in src

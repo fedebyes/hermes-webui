@@ -8180,6 +8180,15 @@ function _syncCtxIndicator(usage){
   const DEFAULT_CTX=128*1024;
   const ctxWindow=usage.context_length||DEFAULT_CTX;
   const cost=usage.estimated_cost;
+  // Aligned cost (api/session_cost.py): durable tokens x the calibrated price —
+  // the same figure the [session-cost] notice quotes. Preferred over the runtime
+  // accumulator `cost`, which resets on every resume and is priced on the vendor
+  // card. `cost` remains the fallback so an older payload, or a session whose
+  // price cannot be defended, still shows a number — in $, as before.
+  const costEur=Number(usage.estimated_cost_eur);
+  const costLabel=(usage.estimated_cost_eur!=null&&Number.isFinite(costEur))
+    ? `\u20ac${costEur<0.01?costEur.toFixed(4):costEur.toFixed(2)}`
+    : (cost?`$${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`:'');
   // Show indicator whenever we have any usage data (tokens or cost)
   if(!promptTok&&!totalTok&&!cost&&!cacheReadTok&&!cacheWriteTok){
     if(wrap) wrap.style.display='none';
@@ -8225,7 +8234,7 @@ function _syncCtxIndicator(usage){
   const contextLabel=hasPostCompressionEstimate?'Estimated next model context':'Context window';
   let label=hasPromptTok?`${contextLabel} ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
   if(!hasExplicitCtx&&hasPromptTok) label+=' (est. 128K)';
-  if(cost) label+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+  if(costLabel) label+=` \u00b7 ${costLabel}`;
   if(cacheText) label+=` \u00b7 ${cacheText}`;
   el.setAttribute('aria-label',label);
   const usageText=hasPromptTok?(overflowed?`${contextLabel}: ${rawPct}% used (context exceeded)`:`${contextLabel}: ${pct}% used (${100-pct}% left)`):`${_fmtTokens(totalTok)} tokens used`;
@@ -8246,8 +8255,8 @@ function _syncCtxIndicator(usage){
   }
   let costText='';
   if(costLine){
-    if(cost){
-      costText=`Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+    if(costLabel){
+      costText=`Estimated cost: ${costLabel}`;
       if(cacheText) costText+=` \u00b7 ${cacheText}`;
       costLine.style.display='';
       costLine.textContent=costText;
