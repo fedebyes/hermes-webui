@@ -14813,6 +14813,13 @@ def _run_agent_streaming(
     _success_writeback_committed = False
     _steer_settled = False
     _returned_pending_steer = []
+    # Handles of Agents this turn replaced. Both retries rebuild the Agent and
+    # republish it under the stream id (``_register_agent_if_current``), but
+    # Steer is accepted against whatever handle is registered at that moment: a
+    # guidance accepted on a since-replaced Agent is stashed on that object, and
+    # draining only the live one silently drops it (review 5678828328). Keep the
+    # retired handles for the turn and drain each distinct one once.
+    _replaced_steer_agents = []
 
     def _remember_pending_steer_result(value):
         text = value.get('pending_steer') if isinstance(value, dict) else None
@@ -14829,16 +14836,25 @@ def _run_agent_streaming(
                 return
             _steer_settled = True
             target = AGENT_INSTANCES.get(stream_id) or agent
+            drain_targets = [target, *list(_replaced_steer_agents)]
             if stream_id in STREAMS and not cancel_event.is_set():
                 update_active_run(stream_id, phase="finalizing")
         leftovers = list(_returned_pending_steer)
-        try:
-            drain = getattr(target, '_drain_pending_steer', None)
-            text = drain() if callable(drain) else None
-            if text:
-                leftovers.append(str(text))
-        except Exception:
-            logger.debug("Failed to drain pending steer for session %s", session_id)
+        # Drain outside the registry locks, once per distinct handle: the live
+        # Agent first, then every Agent this turn replaced, so guidance accepted
+        # before a retry still reaches the client as a leftover.
+        drained = set()
+        for candidate in drain_targets:
+            if candidate is None or id(candidate) in drained:
+                continue
+            drained.add(id(candidate))
+            try:
+                drain = getattr(candidate, '_drain_pending_steer', None)
+                text = drain() if callable(drain) else None
+                if text:
+                    leftovers.append(str(text))
+            except Exception:
+                logger.debug("Failed to drain pending steer for session %s", session_id)
         if leftovers:
             put('pending_steer_leftover', {
                 'session_id': session_id, 'text': '\n'.join(leftovers),
@@ -15013,6 +15029,14 @@ def _run_agent_streaming(
         with STREAMS_LOCK:
             cancelled = cancel_event.is_set() or stream_id not in STREAMS
             if not cancelled:
+                previous = AGENT_INSTANCES.get(stream_id)
+                if previous is not None and previous is not candidate:
+                    # A retry replaces the turn's Agent while the stream is still
+                    # registered, so Steer accepted just before the swap stashed
+                    # its guidance on THIS handle. Retain it for terminal
+                    # settlement, which drains every handle the turn published.
+                    if not any(item is previous for item in _replaced_steer_agents):
+                        _replaced_steer_agents.append(previous)
                 AGENT_INSTANCES[stream_id] = candidate
                 # Check and publication share one admission, not a check followed
                 # by an unlocked cache/lifecycle write that could undo Stop.
