@@ -1204,6 +1204,14 @@ function switchTasksSubtab(name){
     titleEl.setAttribute('data-i18n',titleKey);
     titleEl.textContent=t(titleKey)||(name==='scripts'?'Scripts':'Scheduled jobs');
   }
+  // The shared Refresh button reloads the active tab (refreshTasksPanel), so
+  // its tooltip and accessible name follow the tab too (#7685 UX review).
+  const refreshBtn=$('cronRefreshBtn');
+  if(refreshBtn){
+    const refreshLabel=name==='scripts'?'Refresh script list':'Refresh job list';
+    refreshBtn.setAttribute('data-tooltip',refreshLabel);
+    refreshBtn.setAttribute('aria-label',refreshLabel);
+  }
   const jobsBtn=$('tasksTabJobs');
   const scriptsBtn=$('tasksTabScripts');
   if(jobsBtn) jobsBtn.classList.toggle('active',name==='jobs');

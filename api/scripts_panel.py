@@ -65,7 +65,11 @@ def _is_safe_script_name(name: str) -> bool:
     The checks are ordered cheapest-first and every one of them is a traversal
     or control-character test — never a character-class whitelist.
     """
-    if not name or len(name) > 128:
+    # No length policy: the filesystem enforces its own limit (255 bytes on Linux,
+    # more for Unicode names on APFS) and an over-long name fails the open with
+    # ENAMETOOLONG, which the read path already maps to None. A 128-character cap
+    # hid scripts the Agent's cron runner runs (release gate 2026-10-29).
+    if not name:
         return False
     if "/" in name or "\\" in name or "\0" in name:
         return False
@@ -382,6 +386,10 @@ def read_script(name: str) -> dict | None:
     to the same cap, so a file that grows between the check and the read
     cannot return over-cap content flagged ``too_large: false``.
     """
+    # Same contract as list_scripts(): only .py/.sh files are scripts. Without this
+    # the raw route served any file in the directory (notes.txt, a .env copy).
+    if Path(name).suffix.lower() not in _SCRIPT_EXTS:
+        return None
     base = scripts_dir()
     acquired = _open_script_for_read(base, name)
     if acquired is None:
