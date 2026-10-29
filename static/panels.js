@@ -1214,6 +1214,34 @@ function switchTasksSubtab(name){
   const scriptsList=$('scriptsList');
   if(cronList) cronList.hidden=(name!=='jobs');
   if(scriptsList) scriptsList.hidden=(name!=='scripts');
+  // The Scripts tab is a read-only browse of the profile's scripts
+  // directory: there is no "create" action there, so the shared "New job"
+  // button would offer a job action that has nothing to do with the tab
+  // (#7685 open item). Hide it for the whole Scripts tab rather than
+  // relabelling it -- a "New script" button would be a lie, because the
+  // panel cannot create a script either.
+  const newJobBtn=$('cronNewJobBtn');
+  if(newJobBtn) newJobBtn.hidden=(name==='scripts');
+  // The main column's empty state belongs to the Jobs tab: it names a
+  // scheduled job and points at the job detail. On the Scripts tab the
+  // list itself IS the content (a script row is not selectable -- there is
+  // no script detail view yet), so the empty state has to say what the
+  // panel actually offers instead of promising a selection that cannot
+  // happen.
+  const emptyTitle=$('taskDetailEmptyTitle');
+  const emptySub=$('taskDetailEmptySub');
+  if(emptyTitle){
+    const key=name==='scripts'?'scripts_detail_empty_title':'tasks_empty_title';
+    emptyTitle.setAttribute('data-i18n',key);
+    emptyTitle.textContent=t(key)||(name==='scripts'?'Scripts':'Select a scheduled job');
+  }
+  if(emptySub){
+    const key=name==='scripts'?'scripts_detail_empty_sub':'tasks_empty_sub';
+    emptySub.setAttribute('data-i18n',key);
+    emptySub.textContent=t(key)||(name==='scripts'
+      ?'This panel lists the scripts in this profile. Open a script file on the server to run it.'
+      :'Pick a job from the sidebar to view its details and runs, or create a new one.');
+  }
   if(name==='scripts') loadScriptsList(true);
 }
 
