@@ -1184,3 +1184,48 @@ def test_the_401_self_heal_rebuilds_on_the_current_continuation_identity(
     assert "apperror" not in emitted, (
         "a successful retry must not end with a migration error card"
     )
+
+
+# ── Steer accepted across a retry is drained, not dropped ───────────────────
+
+
+def test_a_retry_drains_steer_accepted_on_the_agent_it_replaced(worker_scene):
+    """Guidance accepted before the retry swaps the Agent must come back.
+
+    ``_handle_chat_steer`` stashes guidance on whichever handle is registered at
+    that moment. Both retries rebuild the Agent and republish it under the same
+    stream id, so draining only the live handle at terminal settlement silently
+    dropped guidance the endpoint had already answered ``accepted: true``.
+    """
+    scene = worker_scene
+    built = []
+
+    def on_init():
+        built.append(scene.agent)
+        if len(built) == 2:
+            # The swap has not happened yet: the first attempt's handle is still
+            # the registered one, so this is exactly what the Steer endpoint
+            # would reach between the first attempt's return and the retry.
+            assert streaming.AGENT_INSTANCES.get("run") is built[0]
+            built[0].steer("left guidance")
+
+    def on_run():
+        if _runs(scene) == 1:
+            scene.result = _silent_result()
+        else:
+            scene.result = {"messages": [
+                _user_row(), {"role": "assistant", "content": "Finished."},
+            ]}
+
+    scene.on_init = on_init
+    scene.on_run = on_run
+
+    scene.run()
+
+    assert _runs(scene) == 2, "the silent turn must have been retried"
+    leftovers = [data["text"] for event, data in list(scene.events.queue)
+                 if event == "pending_steer_leftover"]
+    assert leftovers == ["left guidance"], (
+        f"guidance accepted before the retry was dropped; leftovers={leftovers}"
+    )
+    assert built[0].pending == [], "the replaced handle must be drained, not leaked"
