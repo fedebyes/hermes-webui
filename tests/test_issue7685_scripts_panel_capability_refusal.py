@@ -21,8 +21,6 @@ import importlib
 import os
 from pathlib import Path
 
-import pytest
-
 
 def _scripts_module():
     import api.scripts_panel as mod
