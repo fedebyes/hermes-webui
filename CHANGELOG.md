@@ -389,6 +389,8 @@
 
 ### Changed
 
+- **A running subagent's transcript shows its live work.** Opening a delegated subagent while it runs used to show one collapsed, empty "Processed" chip that never updated until a reload. Its last turn now opens with every step's thinking and tool cards, the newest step reads "Running", the page follows the running child, and the steps settle to the usual collapsed chips when it finishes. The parent's delegate card is named by the subagent's goal. Thanks @carlotestor. (#7885)
+
 - **German: 208 strings that still showed English are translated.** MCP (37), Settings and composer (116) and slash commands (55). Thanks @solarmaster961. (#8291, #8292, #8293)
 
 - **Keyboard and screen reader users can reach conversations in the sidebar directly.** Conversation titles are now real buttons (the open one is marked as the current page), the Chat label is a heading, and a keyboard-focused row shows a clear focus ring, including in forced-colours mode and the Geist Contrast skin. Focus stays on the same conversation when the list refreshes, J/K navigation keeps working after a mouse click, and opening a conversation closes any open project or model menu. On touch screens, the first tap on a tag filters by it, a long press on a tag still opens the conversation's actions, and a swipe that starts on a tag still swipes. (#7049, thanks @sheldon-im)
