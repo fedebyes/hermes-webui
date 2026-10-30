@@ -5,6 +5,8 @@
 
 ### Added
 
+- **Tasks has a read-only Scripts tab.** Next to Jobs, a Scripts tab lists the active profile's `scripts/` folder (the scripts cron jobs can run) with each file's size, age and the description from its leading comment, and opens a file read-only. Reads stay inside that folder (no symlinks out, size-capped), a platform that cannot open the folder safely says so instead of showing an empty list, and the tab hides "New job" since it cannot create anything. Thanks @happy5318. (#7685, for #2316)
+
 - **Opt-in Screen reader mode, enabled for the terminal.** A Settings toggle (also found by Settings search) makes the terminal readable by screen readers. Off by default. Thanks @grzezlo. (#8305)
 
 - **A read-only endpoint reports a session's background delegations.** `GET /api/session/delegations?session_id=...` returns how many delegated tasks are still running and how many have finished but not yet been delivered, so a client can warn before switching away. It reads counts only (no prompts or results), stays inside the session's own profile, and answers `unknown` rather than zero when the ledger can't be read. Thanks @happy5318. (Refs #8019)
