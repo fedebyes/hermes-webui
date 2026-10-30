@@ -110,6 +110,7 @@ const _micForceMediaRecorderKey = 'mic_force_mediarecorder';
 const _micForceMediaRecorderExpiryKey = 'mic_force_mediarecorder_expires';
 const _MIC_FORCE_MR_TTL_MS = 24 * 60 * 60 * 1000;
 let _micTranscribeSeq = 0;
+const _MIC_EMPTY_MS = 2500;
 const paints = [];
 let statuses = [];
 const toasts = [];
@@ -228,6 +229,23 @@ function errResponse(status, body) {
   await second;
   out.staleFinalCommits = commits.slice(-1);
 
+  // 7. a superseded request whose no-speech response lands late must not paint
+  // over the newer capture's button either.
+  begin();
+  const staleEmpty = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  const newerReq = _transcribeBlob(blob, '');
+  await new Promise((r) => setImmediate(r));
+  const staleEmptyReq = pending.shift();
+  begin();
+  staleEmptyReq.resolve(okResponse({ transcript: '', no_speech: true }));
+  await staleEmpty;
+  out.staleNoSpeechPaints = paints.slice();
+  out.staleNoSpeechToasts = toasts.slice();
+  pending.shift().resolve(okResponse({ transcript: 'newer still' }));
+  await newerReq;
+  out.staleNoSpeechFinalCommits = commits.slice(-1);
+
   console.log(JSON.stringify(out));
 })().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
 """
@@ -264,6 +282,18 @@ def test_success_commits_and_empty_reports_no_speech(transcribe_runs):
         "an empty transcript must not append anything to the composer"
     )
     assert transcribe_runs["emptyToasts"] == ["mic_no_speech"]
+    assert transcribe_runs["emptyPaints"] == ["think", "empty"], (
+        "a successful no-speech response must retire 'think' to the timed "
+        "empty tick, not leave the button painting in flight forever"
+    )
+
+
+def test_stale_no_speech_does_not_paint_a_newer_capture(transcribe_runs):
+    assert transcribe_runs["staleNoSpeechPaints"] == [], (
+        "a superseded request's empty response must not touch a button its "
+        "successor owns"
+    )
+    assert transcribe_runs["staleNoSpeechFinalCommits"] == ["newer still"]
 
 
 def test_http_failure_retires_the_thinking_state(transcribe_runs):

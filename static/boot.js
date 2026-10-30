@@ -1526,6 +1526,11 @@ function _micToastKeyForRecognitionError(error){
           return;
         }
         window._micPendingSend=false;
+        // A 200 with nothing heard is a settlement, not a request still in
+        // flight: 'think' has no hold timeout, so this exit has to retire it
+        // exactly like _commitTranscript's empty case does — the same timed
+        // "0p" tick, gated on ownership so a newer capture keeps its button.
+        if(ownsButton()) _micPaint('empty','0p',_MIC_EMPTY_MS);
         showToast(t('mic_no_speech'));
         return;
       }
