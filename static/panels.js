@@ -1154,6 +1154,19 @@ async function loadScriptsList(animate, silent){
   // owner's result with the previous profile's scripts (or an error).
   if(!_scriptsReplyIsCurrent(owner,gen,seq)){ return; }
   if(animate) box.style.opacity='';
+  // The main column's Scripts copy says the panel lists this profile's
+  // scripts. On a capability refusal it has to agree with the panel instead
+  // of promising a listing (#7685 release review). Only while the Scripts
+  // tab is showing: the Jobs tab owns that copy otherwise.
+  const mainSub=$('taskDetailEmptySub');
+  const scriptsPane=$('scriptsList');
+  if(mainSub&&scriptsPane&&!scriptsPane.hidden){
+    const subKey=data.unavailable?'scripts_unavailable':'scripts_detail_empty_sub';
+    mainSub.setAttribute('data-i18n',subKey);
+    mainSub.textContent=t(subKey)||(data.unavailable
+      ?'Scripts are unavailable on this platform.'
+      :'This panel lists the scripts in this profile. Open a script file on the server to run it.');
+  }
   const dirCaption=data.directory?`<div class="scripts-dir-caption">${esc(data.directory)}</div>`:'';
   // A capability refusal is NOT an empty profile: the platform could not
   // serve the listing at all. Say so instead of showing the empty state.

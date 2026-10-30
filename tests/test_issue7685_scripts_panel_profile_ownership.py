@@ -15,6 +15,7 @@ runs the extracted functions, and asserts on what the DOM ends up holding.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -367,3 +368,31 @@ def test_switch_hook_is_wired_into_switchprofile() -> None:
         """
     )
     assert _run(source).endswith("OK"), _run(source)
+
+
+def test_a_refused_listing_rewrites_the_main_column_copy() -> None:
+    """The main column's Scripts copy promises a listing; a capability refusal
+    must replace it with the refusal, a later listing restores it, and the Jobs
+    tab's copy is never touched (#7685 release review)."""
+    source = (
+        _dom_and_helpers()
+        + _DECLS
+        + _scripts_helpers()
+        + """
+        const sub = $('taskDetailEmptySub');
+        _scripted.push({ data: { exists:true, scripts:[], unavailable:'O_NOFOLLOW not supported' } });
+        await loadScriptsList(false);
+        const refused = sub.textContent;
+        _scripted.push({ data: { exists:true, scripts:[{name:'a.py',description:'A',size:1}] } });
+        await loadScriptsList(false);
+        const listed = sub.textContent;
+        $('scriptsList').hidden = true;          // the Jobs tab is showing
+        sub.textContent = 'jobs copy';
+        _scripted.push({ data: { exists:true, scripts:[], unavailable:'O_NOFOLLOW not supported' } });
+        await loadScriptsList(false);
+        console.log(JSON.stringify([refused, listed, sub.textContent]));
+        """
+    )
+    assert json.loads(_run(source)) == [
+        "scripts_unavailable", "scripts_detail_empty_sub", "jobs copy",
+    ]
