@@ -146,6 +146,16 @@ def test_the_new_job_button_carries_an_id() -> None:
     assert re.search(r'id="cronNewJobBtn"', INDEX_HTML)
 
 
+def test_a_hidden_panel_head_button_is_not_displayed() -> None:
+    # `.panel-head-btn` sets display:inline-flex, which outranks the UA
+    # `[hidden]{display:none}` rule, so `hidden=true` alone left "New job"
+    # visible on the Scripts tab (release review, #7685). The stylesheet has
+    # to restore display:none for a hidden head button.
+    style_css = (REPO_ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    assert re.search(r"\.panel-head-btn\{[^}]*display:inline-flex", style_css)
+    assert re.search(r"\.panel-head-btn\[hidden\]\{display:none;?\}", style_css)
+
+
 def test_the_empty_state_carries_ids() -> None:
     assert re.search(r'id="taskDetailEmptyTitle"', INDEX_HTML)
     assert re.search(r'id="taskDetailEmptySub"', INDEX_HTML)
