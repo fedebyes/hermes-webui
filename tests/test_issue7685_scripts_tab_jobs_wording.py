@@ -151,17 +151,49 @@ def test_the_empty_state_carries_ids() -> None:
     assert re.search(r'id="taskDetailEmptySub"', INDEX_HTML)
 
 
-def test_every_locale_carries_the_scripts_empty_strings() -> None:
-    # A locale missing the key would fall back to the raw key name in the UI.
+def _locale_blocks() -> dict[str, str]:
+    """Return {locale: block text} for every locale in static/i18n.js."""
     starts = {}
     for m in re.finditer(r"^  ('?[a-zA-Z-]+'?): \{$", I18N_JS, re.MULTILINE):
         starts[m.start()] = m.group(1).strip("'")
     assert len(starts) == 15, sorted(starts.values())
-
     offsets = sorted(starts)
+    blocks = {}
     for idx, start in enumerate(offsets):
         end = offsets[idx + 1] if idx + 1 < len(offsets) else len(I18N_JS)
-        block = I18N_JS[start:end]
-        locale = starts[start]
-        assert "scripts_detail_empty_title:" in block, locale
-        assert "scripts_detail_empty_sub:" in block, locale
+        blocks[starts[start]] = I18N_JS[start:end]
+    return blocks
+
+
+def _block_values(block: str) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in re.findall(
+            r"['\"]?([A-Za-z][A-Za-z0-9_]*)['\"]?\s*:\s*'([^']*)'", block
+        )
+    }
+
+
+def test_every_locale_carries_the_scripts_empty_strings() -> None:
+    # Every locale must RESOLVE these two keys to a non-empty string.
+    #
+    # The key does NOT have to be physically present in the locale block:
+    # t() resolves it as `_locale[key] ?? LOCALES.en[key]`, so an absent key
+    # falls back to the English string, never to the raw key name. Requiring
+    # a physical copy in every locale is what docs/GUIDELINES.md section 8
+    # rules out ("don't paste English into every locale block") -- a pasted
+    # copy is a second source of truth that goes stale when the English
+    # wording changes.
+    #
+    # The empty-state strings are a detail panel's title and subtitle, so
+    # they are asserted for resolution here; the no-English-paste rule for
+    # the whole Scripts key set is pinned separately in
+    # tests/test_issue7685_scripts_panel_i18n_fallback.py.
+    blocks = _locale_blocks()
+    en_values = _block_values(blocks["en"])
+    for locale, block in blocks.items():
+        values = _block_values(block)
+        for key in ("scripts_detail_empty_title", "scripts_detail_empty_sub"):
+            resolved = values.get(key, en_values.get(key))
+            assert resolved, f"{locale}.{key} resolves to an empty string"
+            assert resolved.strip(), f"{locale}.{key} resolves to whitespace only"
