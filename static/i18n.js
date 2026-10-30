@@ -1189,6 +1189,7 @@ const LOCALES = {
     cron_tab_scripts: 'Scripts',
     scripts_empty: 'No scripts in this profile yet.',
     scripts_no_directory: 'No scripts directory yet.',
+    scripts_unavailable: 'Scripts are unavailable on this platform.',
     scripts_load_failed: 'Could not load scripts.',
     scripts_detail_empty_title: 'Scripts',
     scripts_detail_empty_sub: 'This panel lists the scripts in this profile. Open a script file on the server to run it.',

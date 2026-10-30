@@ -341,39 +341,61 @@ def list_scripts() -> dict:
     described after it is proven to be a regular file INSIDE the scripts
     directory, so a symlink pointing outside the target is skipped rather
     than reported with its target's description.
+
+    A capability refusal is reported, not hidden (#7685 review): without
+    ``O_NOFOLLOW``/``O_DIRECTORY`` the directory cannot be opened safely, so
+    the listing could not be produced at all. Returning an empty list there
+    would read as "this profile has no scripts", which is a different fact
+    from "this platform cannot serve the listing" -- an empty folder is a
+    known-empty answer, a refusal is an unknown one. The payload therefore
+    carries ``unavailable`` with the reason, and the panel shows the refusal
+    instead of an empty state.
     """
     base = scripts_dir()
     out: list[dict] = []
+    unavailable = ""
     if base.is_dir():
-        for entry in _safe_iterdir(base):
-            if entry.suffix.lower() not in _SCRIPT_EXTS:
-                continue
-            # Acquire a validated descriptor FIRST: no preview metadata is
-            # read from anything that is not a regular file pinned inside
-            # the scripts directory.
-            acquired = _open_script_for_read(base, entry.name)
-            if acquired is None:
-                continue
-            fd, st = acquired
-            try:
-                raw = _read_bounded(fd, 4096).content
-                out.append(
-                    {
-                        "name": entry.name,
-                        "size": st.st_size,
-                        "modified": int(st.st_mtime),
-                        "description": _read_description_bytes(
-                            raw, entry.suffix.lower()
-                        ),
-                    }
-                )
-            finally:
-                _close_quietly(fd)
+        # Capability pre-check: without O_NOFOLLOW/O_DIRECTORY the directory
+        # cannot be opened safely, so _open_script_for_read refuses EVERY
+        # entry and the listing would come back empty -- reading as "this
+        # profile has no scripts", which is a different fact from "this
+        # platform cannot serve the listing". An empty folder is a
+        # known-empty answer; a refusal is an unknown one.
+        try:
+            _base_open_flags()
+        except OSError as exc:
+            unavailable = str(exc)
+        if not unavailable:
+            for entry in _safe_iterdir(base):
+                if entry.suffix.lower() not in _SCRIPT_EXTS:
+                    continue
+                # Acquire a validated descriptor FIRST: no preview metadata
+                # is read from anything that is not a regular file pinned
+                # inside the scripts directory.
+                acquired = _open_script_for_read(base, entry.name)
+                if acquired is None:
+                    continue
+                fd, st = acquired
+                try:
+                    raw = _read_bounded(fd, 4096).content
+                    out.append(
+                        {
+                            "name": entry.name,
+                            "size": st.st_size,
+                            "modified": int(st.st_mtime),
+                            "description": _read_description_bytes(
+                                raw, entry.suffix.lower()
+                            ),
+                        }
+                    )
+                finally:
+                    _close_quietly(fd)
     out.sort(key=lambda e: e["name"].lower())
     return {
         "scripts": out,
         "directory": str(base),
         "exists": base.is_dir(),
+        "unavailable": unavailable,
     }
 
 

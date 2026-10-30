@@ -1155,6 +1155,13 @@ async function loadScriptsList(animate, silent){
   if(!_scriptsReplyIsCurrent(owner,gen,seq)){ return; }
   if(animate) box.style.opacity='';
   const dirCaption=data.directory?`<div class="scripts-dir-caption">${esc(data.directory)}</div>`:'';
+  // A capability refusal is NOT an empty profile: the platform could not
+  // serve the listing at all. Say so instead of showing the empty state.
+  if(data.unavailable){
+    box.innerHTML=`<div style="padding:12px;color:var(--muted);font-size:12px">${esc(t('scripts_unavailable')||'Scripts are unavailable on this platform.')}</div>`;
+    _scriptsLastDir=null;
+    return;
+  }
   if(!data.exists){
     box.innerHTML=`<div style="padding:12px;color:var(--muted);font-size:12px">${esc(t('scripts_no_directory')||'No scripts directory yet.')}</div>`;
     _scriptsLastDir=null;

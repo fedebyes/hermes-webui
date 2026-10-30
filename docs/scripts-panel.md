@@ -103,8 +103,9 @@ else is skipped rather than reported with its target's description.
 
 Two consequences are worth knowing:
 
-- On a platform without `O_NOFOLLOW`/`O_DIRECTORY` the listing comes back
-  empty rather than announcing a refusal, so it can read as an empty folder.
+- On a platform without `O_NOFOLLOW`/`O_DIRECTORY` the listing is **refused**,
+  and the refusal is reported rather than shown as an empty folder (see
+  "A third state is a refusal" above).
 - A FIFO in the directory does not block the listing: the leaf is opened
   `O_NONBLOCK` so the open returns instead of waiting for a writer, and it is
   then rejected by the regular-file check before anything is read.
@@ -113,6 +114,13 @@ A profile with no `scripts/` directory and a profile with an empty one are
 different states: the listing carries an `exists` flag, and the panel shows
 "No scripts directory yet." for the former and "No scripts in this profile
 yet." for the latter.
+
+A third state is a **refusal**: on a platform without `O_NOFOLLOW`/
+`O_DIRECTORY` the scripts directory cannot be opened safely, so the listing
+cannot be produced at all. That is not the same fact as "this profile has no
+scripts", and the panel does not pretend it is — the listing carries an
+`unavailable` field with the reason, and the panel shows "Scripts are
+unavailable on this platform." instead of an empty state.
 
 ## Profile ownership
 

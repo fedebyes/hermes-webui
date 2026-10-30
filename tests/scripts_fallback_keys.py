@@ -31,6 +31,7 @@ translated in every locale and are therefore NOT in this set.
 SCRIPTS_FALLBACK_KEYS_COMMON = (
     "scripts_no_directory",
     "scripts_load_failed",
+    "scripts_unavailable",
 )
 
 # Additionally absent from the locales whose "scripts" spelling matches
