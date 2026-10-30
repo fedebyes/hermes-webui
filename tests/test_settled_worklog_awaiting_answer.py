@@ -126,9 +126,19 @@ def test_running_marked_worklog_is_labelled_running_not_processed():
 def test_running_subagent_dot_pulses_and_respects_reduced_motion():
     css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
     sel = '.tool-worklog-group[data-tool-worklog-group="1"][data-subagent-running="1"] .as-dot'
-    rule = re.search(re.escape(sel) + r"\{([^}]*)\}", css).group(1)
-    assert "animation:wlpulse 1.3s ease-in-out infinite" in rule
-    assert re.search(r"@media \(prefers-reduced-motion: reduce\)\{\s*" + re.escape(sel) + r"\{animation:none;\}", css)
+    # The pulse is the ::after ring on the keyframes the tool-card running dot
+    # uses; the keyframes must exist (a rule naming missing keyframes is a
+    # silent no-op, which is how this dot lost its pulse on a master that
+    # renamed them).
+    ring = re.search(re.escape(sel + "::after") + r"\{([^}]*)\}", css).group(1)
+    match = re.search(r"animation:([a-z-]+) ", ring)
+    assert match, ring
+    assert re.search(r"@keyframes " + match.group(1) + r"\{", css), match.group(1)
+    core = re.search(re.escape(sel) + r"\{([^}]*)\}", css).group(1)
+    assert "animation" not in core and "position:relative" in core
+    assert re.search(
+        r"@media \(prefers-reduced-motion: reduce\)\{\s*" + re.escape(sel + "::after")
+        + r"\{animation:none;opacity:0;\}", css)
 
 
 def _real_disclosure_harness():
