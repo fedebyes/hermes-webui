@@ -17,14 +17,17 @@ the ``profile_concept_*`` block (issue #2147) and
 
 Which keys are absent depends on the locale:
 
-* ``scripts_no_directory`` and ``scripts_load_failed`` -- absent from every
-  non-English locale (the English sentences were never translated).
+* ``scripts_no_directory``, ``scripts_load_failed``, ``scripts_unavailable`` and
+  ``scripts_detail_empty_sub`` -- absent from every non-English locale (the
+  English sentences were never translated; the translated
+  ``scripts_detail_empty_sub`` said "open the file to run it" and was dropped
+  when the English sentence was corrected in the #7685 release review).
 * ``cron_tab_scripts`` and ``scripts_detail_empty_title`` -- absent from the
   locales whose word for "scripts" is spelled like the English one
   (es, fr, pt, vi), where the copy was English rather than a translation.
 
-``cron_tab_jobs``, ``scripts_empty`` and ``scripts_detail_empty_sub`` are
-translated in every locale and are therefore NOT in this set.
+``cron_tab_jobs`` and ``scripts_empty`` are translated in every locale and are
+therefore NOT in this set.
 """
 
 # Absent from EVERY non-English locale block.
@@ -32,6 +35,7 @@ SCRIPTS_FALLBACK_KEYS_COMMON = (
     "scripts_no_directory",
     "scripts_load_failed",
     "scripts_unavailable",
+    "scripts_detail_empty_sub",
 )
 
 # Additionally absent from the locales whose "scripts" spelling matches

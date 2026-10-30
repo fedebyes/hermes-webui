@@ -1165,7 +1165,7 @@ async function loadScriptsList(animate, silent){
     mainSub.setAttribute('data-i18n',subKey);
     mainSub.textContent=t(subKey)||(data.unavailable
       ?'Scripts are unavailable on this platform.'
-      :'This panel lists the scripts in this profile. Open a script file on the server to run it.');
+      :'This panel lists the scripts in this profile. To view or edit one, open the file on the server.');
   }
   const dirCaption=data.directory?`<div class="scripts-dir-caption">${esc(data.directory)}</div>`:'';
   // A capability refusal is NOT an empty profile: the platform could not
@@ -1267,7 +1267,7 @@ function switchTasksSubtab(name){
     const key=name==='scripts'?'scripts_detail_empty_sub':'tasks_empty_sub';
     emptySub.setAttribute('data-i18n',key);
     emptySub.textContent=t(key)||(name==='scripts'
-      ?'This panel lists the scripts in this profile. Open a script file on the server to run it.'
+      ?'This panel lists the scripts in this profile. To view or edit one, open the file on the server.'
       :'Pick a job from the sidebar to view its details and runs, or create a new one.');
   }
   if(name==='scripts') loadScriptsList(true);

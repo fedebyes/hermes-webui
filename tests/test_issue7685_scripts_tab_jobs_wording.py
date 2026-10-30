@@ -67,7 +67,7 @@ const STRINGS = {
   tasks_empty_title: 'Select a scheduled job',
   tasks_empty_sub: 'Pick a job from the sidebar to view its details and runs, or create a new one.',
   scripts_detail_empty_title: 'Scripts',
-  scripts_detail_empty_sub: 'This panel lists the scripts in this profile. Open a script file on the server to run it.',
+  scripts_detail_empty_sub: 'This panel lists the scripts in this profile. To view or edit one, open the file on the server.',
 };
 function t(k){ return STRINGS[k] !== undefined ? STRINGS[k] : k; }
 let _currentTasksSubtab='jobs';
