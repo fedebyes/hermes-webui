@@ -174,17 +174,7 @@ def _apply_fetch_failure_message(fetch_out: str, network_message: str) -> str:
     return f'fetch failed: {detail}'
 
 
-def _restart_blocker_snapshot() -> dict:
-    """Return the WebUI-owned chat work that should block a self-restart.
-
-    A Gateway run is excluded only once its resumable run identity is saved
-    (#7293): it runs inside the Hermes Gateway, survives a WebUI restart and is
-    reattached afterwards. Legacy Gateway relays and Gateway launches still
-    awaiting that handoff are counted (see run_drain.webui_owned_active_runs).
-    """
-    from api import run_drain
-
-    runs = run_drain.webui_owned_active_runs()
+def _blocker_snapshot_from_runs(runs: list[dict]) -> dict:
     stream_ids = [r['stream_id'] for r in runs if r.get('registered_stream')]
     run_ids = [r['stream_id'] for r in runs]
     return {
@@ -196,6 +186,20 @@ def _restart_blocker_snapshot() -> dict:
     }
 
 
+def _restart_blocker_snapshot() -> dict:
+    """Return the WebUI-owned chat work that should block a self-restart.
+
+    A Gateway run is excluded only once its resumable run identity is saved
+    (#7293): it runs inside the Hermes Gateway, survives a WebUI restart and is
+    reattached afterwards. Legacy Gateway relays and Gateway launches still
+    awaiting that handoff are counted (see run_drain.webui_owned_active_runs).
+    An update of the Agent counts those runs too (``_update_blocker_snapshot``).
+    """
+    from api import run_drain
+
+    return _blocker_snapshot_from_runs(run_drain.webui_owned_active_runs())
+
+
 def _active_stream_count() -> int:
     """Return the current in-memory chat stream count.
 
@@ -203,6 +207,26 @@ def _active_stream_count() -> int:
     ``_restart_blocker_snapshot()`` so detached worker runs also block updates.
     """
     return int(_restart_blocker_snapshot().get('active_streams') or 0)
+
+
+def _update_blocker_snapshot(target: str) -> dict:
+    """Return the chat work that should block an update of ``target`` (#8660).
+
+    ``_restart_blocker_snapshot`` leaves out Gateway runs whose resumable run
+    identity is saved, because they survive a WebUI restart. An Agent update
+    also cycles the Gateway that executes them
+    (``_ensure_gateway_restart_for_agent_update``), which ends them, so for
+    ``target == 'agent'`` every live run blocks, as every active run did
+    before #7293. That is one pass over the registries with no durability
+    check (``run_drain.all_active_runs``), so no run can be counted twice or
+    missed while its durable mark changes. A WebUI-only update keeps the
+    #7293 exemption.
+    """
+    if target != 'agent':
+        return _restart_blocker_snapshot()
+    from api import run_drain
+
+    return _blocker_snapshot_from_runs(run_drain.all_active_runs())
 
 
 def _restart_blocked_response(target: str, blocker_snapshot: dict | int) -> dict:
@@ -503,7 +527,7 @@ def _run_fenced_update(target: str, force_active_runs: bool, run) -> dict:
     """
     from api import run_drain
 
-    blocker_snapshot = _restart_blocker_snapshot()
+    blocker_snapshot = _update_blocker_snapshot(target)
     if blocker_snapshot.get('restart_blocked') and not force_active_runs:
         return _restart_blocked_response(target, blocker_snapshot)
 
@@ -512,7 +536,7 @@ def _run_fenced_update(target: str, force_active_runs: bool, run) -> dict:
     try:
         token = run_drain.hold_run_admission(f'update:{target}', force=bool(force_active_runs))
         try:
-            blocker_snapshot = _restart_blocker_snapshot()
+            blocker_snapshot = _update_blocker_snapshot(target)
             if blocker_snapshot.get('restart_blocked'):
                 if not force_active_runs:
                     return _restart_blocked_response(target, blocker_snapshot)
@@ -841,6 +865,67 @@ _CHANNEL_TAG_GLOBS = {
     'stable': 'v*',
     'experimental': 'exp-v*',
 }
+# Stable release tags are pure dotted versions (``v0.21.6``, legacy
+# ``v2026.5.29.2`` with its 4th component). The ``v*`` glob also matches
+# build-metadata prereleases (``v0.21.6+canary.20261010T070026Z``) which are
+# NOT published releases — _release_tags filters them out of the stable list.
+_STABLE_RELEASE_TAG_RE = re.compile(r'^v\d+(?:\.\d+)+$')
+# The major-version SERIES a stable tag belongs to (``v0.52.114`` -> ``v0``,
+# legacy ``v2026.9.24`` -> ``v2026``). The Agent repo renamed its stable series
+# from ``v2026.9.x`` to ``v0.21.x`` in Oct 2026, so ordering has to rank the
+# current series above the legacy one and VERSIONS inside a series by number.
+_STABLE_SERIES_RE = re.compile(r'^(v\d+)\.')
+
+
+def _stable_series(tag: str) -> str:
+    """Return the major-version series of a stable release tag."""
+    match = _STABLE_SERIES_RE.match(tag)
+    return match.group(1) if match else tag
+
+
+def _release_version_key(tag: str):
+    """Numeric version tuple of a release tag (``v0.52.114`` -> ``(0, 52, 114)``).
+
+    Compare NUMERICALLY, not lexically: ``v0.52.5`` must outrank ``v0.52.2``
+    and ``v0.52.114`` must outrank ``v0.52.5``.
+    """
+    return tuple(int(part) for part in tag[1:].split('.'))
+
+
+def _order_stable_tags(tags):
+    """Group stable release tags by series and order each group by DESCENDING
+    NUMERIC VERSION.
+
+    Series order is fixed, not date-based: the legacy CalVer series ``v2026``
+    ranks below every other series, and the others rank by major number,
+    highest first. That is what fixes the rename from ``v2026.9.x`` to
+    ``v0.21.x``: name order ranked the LEGACY series first, resolving "latest"
+    to an ancestor of HEAD and firing the branch-comparison fallback.
+
+    The order is the same whatever order ``tags`` arrive in, so it carries none
+    of the creation-date hazards:
+
+    * ``git`` breaks creatordate TIES by refname ascending, so two releases
+      tagged in the same second would list the OLDER one first and the update
+      check would report ``behind=0`` on an install that is one release behind;
+    * creatordate is the tagger date for an ANNOTATED tag but the COMMIT date
+      for a lightweight one, so a mixed pair could rank an older release ahead
+      of a newer one even without a tie.
+
+    ``v2026`` is named explicitly because it is the only legacy series that
+    exists; a future series rename would need a new rule here.
+    """
+    por_grupo = {}
+    for tag in tags:
+        serie = _stable_series(tag)
+        if serie not in por_grupo:
+            por_grupo[serie] = []
+        por_grupo[serie].append(tag)
+    ordenados = []
+    for serie in sorted(por_grupo, key=lambda s: (s != 'v2026', int(s[1:]) if s[1:].isdigit() else -1), reverse=True):
+        ordenados.extend(sorted(por_grupo[serie], key=_release_version_key, reverse=True))
+    return ordenados
+
 
 
 def _normalize_channel(channel) -> str:
@@ -853,6 +938,24 @@ def _normalize_channel(channel) -> str:
 def _channel_tag_glob(channel) -> str:
     """Return the ``git tag --list`` glob for the given channel."""
     return _CHANNEL_TAG_GLOBS[_normalize_channel(channel)]
+
+
+# ``git describe`` must skip the same non-release tags _release_tags drops from
+# the stable list. A build-metadata canary (``v0.22.5+canary.1``) or a ``-``
+# prerelease on the SAME commit as a stable release would otherwise describe as
+# the installed tag, fall outside the filtered list, and send both the check and
+# the apply to the branch head (untagged development code) on an up-to-date
+# install.
+_STABLE_DESCRIBE_EXCLUDES = ('--exclude', 'v*+*', '--exclude', 'v*-*')
+
+
+def _channel_describe_filter(channel) -> list:
+    """``--match``/``--exclude`` arguments that limit ``git describe`` to the
+    channel's release tags (the tags ``_release_tags`` can list)."""
+    args = ['--match', _channel_tag_glob(channel)]
+    if _normalize_channel(channel) == 'stable':
+        args.extend(_STABLE_DESCRIBE_EXCLUDES)
+    return args
 
 
 def _read_update_channel() -> str:
@@ -905,12 +1008,44 @@ def channel_version_badge(channel=None) -> str:
 
 
 def _release_tags(path, channel=DEFAULT_UPDATE_CHANNEL):
-    """Return the channel's release tags newest-first, in version-sort order."""
+    """Return the channel's release tags newest-first.
+
+    **Experimental** tags stay in plain name order (``--sort=-v:refname``):
+    they are a single series that has never been renamed, so numeric name order
+    IS release order.
+
+    **Stable** tags are ordered by SERIES (current above legacy) and then by
+    NUMERIC VERSION inside each series (see ``_order_stable_tags``), because:
+
+    * the Agent repo renamed its stable series from ``v2026.9.x`` to
+      ``v0.21.x`` (Oct 2026) and name order ranks ``v2026.9.24`` above
+      ``v0.21.6`` (2026 > 0). The "latest" tag then resolves to an ANCESTOR of
+      HEAD, the release check bails out (HEAD contains the advertised tag), and
+      the check falls through to the branch-comparison fallback — advertising
+      hundreds of untagged master commits to an install that is already on the
+      latest stable release;
+    * pure creation-date order has two defects of its own: ``git`` breaks
+      creatordate ties by refname ASCENDING (two releases tagged in the same
+      second rank the OLDER one first, hiding a real update), and creatordate
+      is the tagger date for annotated tags but the commit date for lightweight
+      ones (a mixed pair can rank an older release above a newer one).
+
+    Build-metadata prerelease tags (``v0.21.6+canary.*``, ``rc.*``,
+    ``abandoned-*``) are excluded from the stable channel: they are not
+    published releases and would otherwise outrank the release itself.
+    """
     glob = _channel_tag_glob(channel)
-    out, ok = _run_git(['tag', '--list', glob, '--sort=-v:refname'], path)
+    if _normalize_channel(channel) != 'stable':
+        out, ok = _run_git(['tag', '--list', glob, '--sort=-v:refname'], path)
+        if not (ok and out):
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
+    out, ok = _run_git(['tag', '--list', glob, '--sort=-creatordate'], path)
     if not (ok and out):
         return []
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    tags = [line.strip() for line in out.splitlines() if line.strip()]
+    tags = [t for t in tags if _STABLE_RELEASE_TAG_RE.match(t)]
+    return _order_stable_tags(tags)
 
 
 def _current_release_tag(path, channel=DEFAULT_UPDATE_CHANNEL):
@@ -922,7 +1057,7 @@ def _current_release_tag(path, channel=DEFAULT_UPDATE_CHANNEL):
     math resolve to the experimental tag and fall through to the branch firehose.
     """
     out, ok = _run_git(
-        ['describe', '--tags', '--abbrev=0', '--match', _channel_tag_glob(channel)],
+        ['describe', '--tags', '--abbrev=0', *_channel_describe_filter(channel)],
         path,
     )
     return out if ok and out else None
@@ -954,7 +1089,11 @@ def _count_channel_tags_ahead(path, channel=DEFAULT_UPDATE_CHANNEL):
     )
     if not (ok and out):
         return 0
-    return sum(1 for line in out.splitlines() if line.strip())
+    tags = [line.strip() for line in out.splitlines() if line.strip()]
+    if _normalize_channel(channel) == 'stable':
+        # Count releases, not the prerelease tags _release_tags drops.
+        tags = [t for t in tags if _STABLE_RELEASE_TAG_RE.match(t)]
+    return len(tags)
 
 
 def _release_tag_sort_key(tag):
@@ -1147,7 +1286,7 @@ def _head_is_past_latest_tag(path, current_tag, channel=DEFAULT_UPDATE_CHANNEL):
     if not current_tag:
         return False
     full_desc, ok = _run_git(
-        ['describe', '--tags', '--always', '--match', _channel_tag_glob(channel)],
+        ['describe', '--tags', '--always', *_channel_describe_filter(channel)],
         path,
     )
     return bool(ok and full_desc and full_desc != current_tag)
@@ -1313,6 +1452,20 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
             )
             exact_tag = (exact_tag or '').strip()
             current_sha_ref = exact_tag if ok and exact_tag else None
+        elif _normalize_channel(channel) == 'stable':
+            # The stable describe skips prereleases, so an install whose only
+            # reachable ``v*`` tag is a canary (e.g. a shallow clone of a canary
+            # build) has no release behind HEAD. That tag is still the installed
+            # version and a real ref for the compare link: show it, but never use
+            # it for release selection.
+            raw_tag, ok = _run_git(
+                ['describe', '--tags', '--abbrev=0', '--match', _channel_tag_glob(channel)],
+                path,
+            )
+            raw_tag = (raw_tag or '').strip()
+            if ok and raw_tag:
+                current_version_display = raw_tag
+                current_sha_ref = raw_tag
 
     # If behind == 0 but HEAD has moved past the tag (e.g. the agent repo
     # keeps committing to master between tagged releases), the release check
