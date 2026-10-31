@@ -2202,6 +2202,8 @@ deleted session):
   stored binding is the sidecar echoed back, not a fresh choice, and is recovered
   the same way. An explicit value that differs from the stored binding stays
   strict — picking a non-existent directory for this turn is a real error (400).
+  A still-existing echoed path is resolved by `resolve_trusted_workspace` exactly
+  as before; recovery only steps in when that resolver rejects the binding.
 
 A recovery is never silent: `/api/chat/start` answers `workspace` (the new
 binding), `workspace_recovered: true` and `workspace_recovered_from` (the value

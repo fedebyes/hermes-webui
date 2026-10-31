@@ -30143,6 +30143,14 @@ def _same_workspace_binding(left, right) -> bool:
         return False
 
 
+def _resolve_strict_workspace(requested_workspace, profile):
+    """Resolve an explicitly requested workspace through the trust gate."""
+    try:
+        return str(resolve_trusted_workspace(requested_workspace, profile=profile))
+    except TypeError:
+        return str(resolve_trusted_workspace(requested_workspace))
+
+
 def _resolve_chat_workspace_with_fallback(s, requested_workspace):
     """Resolve the chat workspace, returning ``(workspace, recovered_from)``.
 
@@ -30163,15 +30171,21 @@ def _resolve_chat_workspace_with_fallback(s, requested_workspace):
     Untrusted, remote and non-directory paths stay strict in both branches —
     ``resolve_implicit_workspace_with_recovery`` only recovers a genuinely
     missing local path, so recovery cannot widen the trust boundary.
+
+    An echoed value is resolved strictly *first*: recovery is the fallback for a
+    rejected binding, never a second gate in front of the normal resolver, so a
+    still-usable workspace takes the unchanged path (and callers that stub that
+    resolver keep seeing it called).
     """
     _session_profile = getattr(s, "profile", None)
     stored_workspace = getattr(s, "workspace", None)
     explicit = requested_workspace not in (None, "")
-    if explicit and not _same_workspace_binding(requested_workspace, stored_workspace):
+    if explicit:
         try:
-            return str(resolve_trusted_workspace(requested_workspace, profile=_session_profile)), None
-        except TypeError:
-            return str(resolve_trusted_workspace(requested_workspace)), None
+            return _resolve_strict_workspace(requested_workspace, _session_profile), None
+        except ValueError:
+            if not _same_workspace_binding(requested_workspace, stored_workspace):
+                raise
     candidate = requested_workspace if explicit else stored_workspace
     try:
         workspace, recovered = resolve_implicit_workspace_with_recovery(

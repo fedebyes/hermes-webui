@@ -169,6 +169,36 @@ def test_existing_echoed_workspace_is_untouched(monkeypatch, tmp_path):
     assert sidecar.read_bytes() == before
 
 
+def test_existing_echo_is_resolved_before_recovery_is_considered(monkeypatch, tmp_path):
+    """A usable echoed workspace never reaches the recovery helper.
+
+    Recovery is a fallback for a rejected binding, not a second gate in front of
+    the normal resolver: an existing path must be decided by
+    ``resolve_trusted_workspace`` alone, so callers that stub that resolver (and
+    every test double that does) keep the unchanged code path.
+    """
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    session = SimpleNamespace(
+        session_id="sess-echo-healthy", workspace=str(existing), profile="default"
+    )
+    _trust_local(monkeypatch, tmp_path, fallback)
+
+    def _no_recovery(*_a, **_k):
+        raise AssertionError("recovery must not run for an existing workspace")
+
+    monkeypatch.setattr(routes, "resolve_implicit_workspace_with_recovery", _no_recovery)
+
+    resolved, recovered = routes._resolve_chat_workspace_with_fallback(
+        session, str(existing)
+    )
+
+    assert resolved == str(existing)
+    assert recovered is None
+
+
 def test_resolver_carries_recovery_marker_only_when_it_recovers(monkeypatch, tmp_path):
     fallback = tmp_path / "fallback"
     fallback.mkdir()
@@ -293,6 +323,10 @@ def test_chat_start_with_healthy_workspace_stays_byte_identical(monkeypatch, tmp
         messages=[{"role": "user", "content": "hello"}],
     )
     _write_sidecar(_session_dir(monkeypatch, tmp_path), session)
+    # Pin trust to tmp_path: pytest's basetemp is outside $HOME on some hosts
+    # (CI runners, TMPDIR=/tmp), and this test asserts the *response shape* of a
+    # healthy send, not where the trust gate draws its line.
+    _trust_local(monkeypatch, tmp_path, tmp_path / "fallback")
 
     captured, _result = _post_chat_start(
         monkeypatch,
