@@ -27,7 +27,7 @@ name: Docker smoke
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, 'base/**']
     paths:
       - 'Dockerfile'
       - 'docker_init.bash'

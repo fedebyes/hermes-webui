@@ -19,7 +19,7 @@ name: Docs CI
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, 'base/**']
     paths:
       - '**/*.md'
       - '**/*.markdown'

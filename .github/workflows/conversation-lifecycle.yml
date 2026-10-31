@@ -6,7 +6,7 @@ name: Conversation lifecycle (informational)
 # skipped entirely (GitHub treats a path-filtered no-match as "not triggered").
 on:
   pull_request:
-    branches: [master]
+    branches: [master, 'base/**']
     paths:
       - 'static/**'
       - 'api/**.py'
