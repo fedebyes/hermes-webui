@@ -9324,6 +9324,7 @@ const _SETTINGS_SPEECH_STORAGE_KEYS={
   voice_continuous:'hermes-voice-continuous',
   voice_silence_ms:'hermes-voice-silence-ms',
   raw_audio_mode:'hermes-raw-audio-mode',
+  mic_auto_stop:'hermes-mic-auto-stop',
 };
 let _settingsSpeechPersistedKeys=new Set();
 let _settingsSpeechLocalStorageKeys=new Set();
@@ -9461,6 +9462,8 @@ function _speechPreferencesPayloadFromUi(){
   if(voiceModeCb) _setOwnedSpeechPayload(payload,'voice_mode_button',voiceModeCb.checked);
   const rawAudioCb=$('settingsRawAudio');
   _setOwnedSpeechPayload(payload,'raw_audio_mode',rawAudioCb?rawAudioCb.checked:localStorage.getItem('hermes-raw-audio-mode')==='true');
+  const micAutoStopCb=$('settingsMicAutoStop');
+  _setOwnedSpeechPayload(payload,'mic_auto_stop',micAutoStopCb?micAutoStopCb.checked:localStorage.getItem('hermes-mic-auto-stop')==='true');
   _setOwnedSpeechPayload(payload,'voice_continuous',localStorage.getItem('hermes-voice-continuous')==='true');
   const voiceSilence=parseInt(localStorage.getItem('hermes-voice-silence-ms'),10);
   _setOwnedSpeechPayload(payload,'voice_silence_ms',(Number.isFinite(voiceSilence)&&voiceSilence>=200)?voiceSilence:1800);
@@ -10291,6 +10294,19 @@ async function loadSettingsPanel(){
     }
     const voiceContinuous=_speechBool('voice_continuous','hermes-voice-continuous',false);
     _syncSpeechPreferenceCache('voice_continuous',voiceContinuous?'true':'false');
+    // Opt-in: silence auto-stop starts OFF (manual stop is the default capture).
+    const micAutoStopCb=$('settingsMicAutoStop');
+    if(micAutoStopCb){
+      const micAutoStop=_speechBool('mic_auto_stop','hermes-mic-auto-stop',false);
+      micAutoStopCb.checked=micAutoStop;
+      _syncSpeechPreferenceCache('mic_auto_stop',micAutoStop?'true':'false');
+      micAutoStopCb.onchange=function(){
+        _markSpeechPreferenceChanged('mic_auto_stop');
+        try{localStorage.setItem('hermes-mic-auto-stop',this.checked?'true':'false');}catch(_){}
+        _syncSpeechPreferenceCache('mic_auto_stop',this.checked?'true':'false');
+        _schedulePreferencesAutosave();
+      };
+    }
     const voiceSilence=parseInt(_speechSetting('voice_silence_ms','hermes-voice-silence-ms',1800),10);
     _syncSpeechPreferenceCache('voice_silence_ms',Number.isFinite(voiceSilence)&&voiceSilence>=200?String(voiceSilence):'1800');
     // TTS settings use /api/settings as the durable source and localStorage as the runtime cache.

@@ -1270,8 +1270,10 @@ function _micToastKeyForRecognitionError(error){
   // DOM, so there is one writer and no race with `recording`.
   const _MIC_READY_MS=3000;      // how long ✓ Np stays after a transcript lands
   const _MIC_EMPTY_MS=2500;      // how long 0p stays when nothing was heard
-  const _MIC_AUTOSTOP_KEY='mic_autostop';
-  const _MIC_SILENCE_MS=1600;    // silence after speech that ends the capture
+  // Opt-in: manual capture is the default (the mic records until the user
+  // stops it). Silence auto-stop is a preference that starts OFF.
+  const _MIC_AUTOSTOP_KEY='hermes-mic-auto-stop';
+  const _MIC_SILENCE_MS=1600;    // silence after speech that ends an opt-in capture
   const _MIC_LEVEL_GAIN=6;       // rms -> bar scale
   const micStateEl=document.createElement('span');
   micStateEl.className='mic-state';
@@ -1334,8 +1336,12 @@ function _micToastKeyForRecognitionError(error){
     micLevelEl.style.setProperty('--mic-level','0');
   }
 
+  // Read at fire time, so a Settings → Sound toggle applies to the next
+  // capture without a reload. Absent key = OFF (opt-in, Settings-backed:
+  // `mic_auto_stop`, mirrored to hermes-mic-auto-stop by
+  // _mirrorSpeechSettingsFromServer).
   function _micAutoStopEnabled(){
-    return localStorage.getItem(_MIC_AUTOSTOP_KEY)!=='0';
+    try{return localStorage.getItem(_MIC_AUTOSTOP_KEY)==='true';}catch(_){return false;}
   }
 
   // Level meter + silence auto-stop, run on the capture's OWN stream (no second
@@ -4167,6 +4173,7 @@ function _mirrorSpeechSettingsFromServer(s){
     voice_continuous:false,
     voice_silence_ms:1800,
     raw_audio_mode:false,
+    mic_auto_stop:false,
   };
   const cachedValue=(storageKey)=>{
     try{return localStorage.getItem(storageKey);}catch(_){return null;}
@@ -4193,6 +4200,7 @@ function _mirrorSpeechSettingsFromServer(s){
     ['tts_auto_read','hermes-tts-auto-read'],
     ['voice_mode_button','hermes-voice-mode-button'],
     ['voice_continuous','hermes-voice-continuous'],
+    ['mic_auto_stop','hermes-mic-auto-stop'],
   ];
   boolKeys.forEach(([settingKey,storageKey])=>{
     if(hasServerValue(settingKey)){

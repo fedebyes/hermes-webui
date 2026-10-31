@@ -46,14 +46,32 @@ def test_level_meter_uses_the_capture_stream_not_a_second_capture():
     assert "createMediaStreamSource(stream)" in meter
 
 
-def test_silence_auto_stop_is_opt_out_and_bounded():
-    assert "_MIC_AUTOSTOP_KEY='mic_autostop'" in BOOT_JS
-    assert "localStorage.getItem(_MIC_AUTOSTOP_KEY)!=='0'" in BOOT_JS
-    # It may only fire after speech was actually heard, never on a quiet room.
+def test_silence_auto_stop_is_opt_in_and_bounded():
+    # Maintainer decision: manual capture is the default, silence auto-stop is a
+    # Settings preference that starts OFF.
+    assert "_MIC_AUTOSTOP_KEY='hermes-mic-auto-stop'" in BOOT_JS
+    assert "localStorage.getItem(_MIC_AUTOSTOP_KEY)==='true'" in BOOT_JS
     assert "_MIC_SILENCE_MS=1600" in BOOT_JS
     auto_stop = BOOT_JS.split("function _micStartMeter(stream){", 1)[1].split("function _micWordCount", 1)[0]
+    # It may only fire after speech was actually heard, never on a quiet room.
     assert "if(!_micSpokeAt) return;" in auto_stop
     assert "_micAutoStopEnabled()" in auto_stop
+
+
+def test_auto_stop_preference_is_wired_through_settings():
+    # One preference, four surfaces: server default OFF (durable), the Sound
+    # panel checkbox, its runtime cache key, and the boot-time mirror that turns
+    # the server value into localStorage.
+    config_py = (ROOT / "api" / "config.py").read_text(encoding="utf-8")
+    panels_js = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    index_html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    i18n_js = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+    assert '"mic_auto_stop": False' in config_py
+    assert config_py.count('"mic_auto_stop",') >= 2  # speech key set + bool validation
+    assert 'id="settingsMicAutoStop"' in index_html
+    assert "mic_auto_stop:'hermes-mic-auto-stop'" in panels_js
+    assert "['mic_auto_stop','hermes-mic-auto-stop']" in BOOT_JS
+    assert "settings_label_mic_autostop" in i18n_js
 
 
 def test_css_renders_state_inside_the_button_without_new_i18n_keys():

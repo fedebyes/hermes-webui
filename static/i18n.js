@@ -1307,6 +1307,8 @@ const LOCALES = {
     settings_desc_raw_audio: 'Record and send the original audio file to the agent instead of converting it to text first. The agent can then transcribe it or process the raw audio (emotion, background noise, custom STT). Like Telegram\'s voice message behavior.',
     voice_send_raw: 'Send raw audio',
     voice_raw_attached: 'Audio attached. Press Send or type more.',
+    settings_label_mic_autostop: 'Stop dictation automatically after silence',
+    settings_desc_mic_autostop: 'Off by default: the mic keeps recording until you stop it. When ON, dictation ends on its own 1.6 s after you stop speaking, so a long turn does not wait for a manual stop.',
     settings_label_tts_voice: 'Voice',
     settings_desc_tts_voice: "Preferred voice. Populated from your browser's available voices.",
     settings_tts_voice_default_system: 'Default system voice',
