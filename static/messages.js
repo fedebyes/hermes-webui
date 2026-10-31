@@ -2065,6 +2065,18 @@ async function send(){
     })});
     _pendingMoaConfig=null;
     postStartData = startData;
+    // The server recovered a workspace whose directory no longer existed
+    // (pruned worktree, removed checkout) and repaired the session binding.
+    // Adopt the new root locally — we post S.session.workspace on every send,
+    // so keeping the deleted path would make the next message look like an
+    // explicit pick of a missing directory. Same contract as /api/list.
+    if(postStartData&&postStartData.workspace_recovered===true&&postStartData.workspace&&S.session){
+      S.session.workspace=String(postStartData.workspace);
+      try{ if(typeof S._dirCache!=='undefined') S._dirCache={}; }catch(_){ }
+      try{ if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays(); }catch(_){ }
+      try{ if(typeof syncTerminalButton==='function') syncTerminalButton(); }catch(_){ }
+      try{ if(typeof showToast==='function') showToast(t('workspace_recovered_notice',S.session.workspace),5000,'warning'); }catch(_){ }
+    }
   }catch(e){
     const errMsg=String((e&&e.message)||'');
     // If /api/chat/start returns 404, the session was deleted server-side
