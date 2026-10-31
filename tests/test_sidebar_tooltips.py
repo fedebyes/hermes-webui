@@ -31,7 +31,10 @@ def test_sidebar_status_badges_have_explanatory_tooltips():
     assert "function _sessionStateTooltip" in js
     assert "branchInd.title=_sessionForkTooltip(parentLabel);" in js
     assert "segmentCountEl.title=_sessionLineageBadgeTooltip(segmentLabel,canExpandLineageSegments);" in js
-    assert "childCountEl.title=_sessionChildBadgeTooltip(childLabel);" in js
+    # The child pill's tooltip is still the helper's; it now also carries the
+    # live line ("1 live · 3 children — …"), so the assignment is no longer the
+    # helper call verbatim.
+    assert "const childHint=_sessionChildBadgeTooltip(childLabel);" in js
     assert "_sessionStateTooltip({isStreaming,hasUnread})" in js
 
 
