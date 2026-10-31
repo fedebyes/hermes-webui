@@ -7522,6 +7522,7 @@ async function switchToProfile(name) {
     sessionInProgress = true;
   }
   const _workspaceVisibleAtStart = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
+  let _reasoningSwitchHeld = false;
   // Stale-snapshot guard ownership for THIS switch: armed the instant
   // S.activeProfile changes (see below), handed to the settings reconciliation
   // on success, released in `finally` on every other exit. The counter arms are
@@ -7555,6 +7556,11 @@ async function switchToProfile(name) {
     // red error while the real switch completes and renders. The catch block below is
     // the single source of truth for switch failure and is gated on _switchGen, so the
     // error surfaces ONLY when the CURRENT switch genuinely fails (@rodboev review, #4662).
+    // Effort saves queued in the previous profile must go out under its cookie.
+    if (typeof _beginReasoningProfileSwitch === 'function') {
+      _reasoningSwitchHeld = true;
+      await _beginReasoningProfileSwitch();
+    }
     const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }), timeoutToast: false });
     if (_switchGen !== _profileSwitchGeneration) return false;
     // A retained empty-composer pick belongs to the old profile's providers; keeping it
@@ -7800,6 +7806,7 @@ async function switchToProfile(name) {
     }
     return false;
   } finally {
+    if (_reasoningSwitchHeld) _endReasoningProfileSwitch();
     // Always remove loading indicator regardless of success or failure
     if (_switchGen === _profileSwitchGeneration && _chip) { _chip.classList.remove('switching'); _chip.disabled = false; }
     if (_switchGen === _profileSwitchGeneration && _titlebarBtn) { _titlebarBtn.classList.remove('switching'); _titlebarBtn.disabled = false; }
@@ -11963,6 +11970,8 @@ function _buildProviderQuotaCard(status){
   const card=document.createElement('div');
   const state=(status.status||'unavailable').replace(/[^a-z0-9_-]/gi,'').toLowerCase()||'unavailable';
   card.className='provider-quota-card provider-quota-card-'+state;
+  // No provider configured is a neutral state, not a failure: keep its message muted.
+  if(!status.provider) card.classList.add('provider-quota-card-neutral');
   const accountLimits=status.account_limits||null;
   const providerBase=status.display_name||status.provider||t('provider_quota_active_provider');
   const provider=(accountLimits&&accountLimits.plan)?`${providerBase} · ${accountLimits.plan}`:providerBase;
@@ -11970,7 +11979,9 @@ function _buildProviderQuotaCard(status){
   let body='';
   if(accountLimits&&(status.status==='available'||accountLimits.pool)){
     const windows=Array.isArray(accountLimits.windows)?accountLimits.windows:[];
-    const details=Array.isArray(accountLimits.details)&&!accountLimits.pool?accountLimits.details:[];
+    // A pool snapshot's own details only repeat the breakdown below; usage-API details
+    // (e.g. credit balance) are the account's and stay visible next to the pool.
+    const details=Array.isArray(accountLimits.details)&&(!accountLimits.pool||accountLimits.source==='usage_api')?accountLimits.details:[];
     const windowHtml=windows.map(w=>{
       const used=_formatProviderQuotaPercent(w&&w.used_percent);
       const reset=_formatProviderQuotaReset(w&&w.reset_at);
@@ -11991,6 +12002,9 @@ function _buildProviderQuotaCard(status){
     const poolHtml=_buildProviderQuotaPoolBreakdown(accountLimits);
     body=windowHtml+detailHtml+poolHtml;
     if(!body) body=`<div class="provider-quota-message">${esc(status.message||t('provider_quota_account_limits_loaded'))}</div>`;
+    // A pool breakdown shown next to a failure reflects locally recorded credential
+    // state, not the failed check: keep the failure message visible above it.
+    else if(status.status!=='available'&&status.message) body=`<div class="provider-quota-message">${esc(status.message)}</div>`+body;
   }else if(status.status==='available'&&quota){
     body=`
       <div class="provider-quota-metric"><span>${esc(t('provider_quota_metric_remaining'))}</span><strong>${esc(_formatProviderQuotaMoney(quota.limit_remaining))}</strong></div>
