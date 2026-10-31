@@ -9766,7 +9766,8 @@ function _vaultPromptSessionId() {
     const sid = _promptActiveSessionId();
     if (sid) return sid;
   }
-  return (typeof activeSid === 'string') ? activeSid : '';
+  const session = (typeof S !== 'undefined' && S) ? S.session : null;
+  return (session && typeof session.session_id === 'string') ? session.session_id : '';
 }
 
 function _clearVaultPromptFields() {
