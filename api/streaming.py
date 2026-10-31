@@ -12933,6 +12933,51 @@ def _build_partial_message(content_text, reasoning_text, tool_calls) -> dict | N
     return _msg
 
 
+def _delivered_streamed_answer(stream_id) -> str:
+    """Return the assistant prose a turn already streamed to the client.
+
+    A turn can stream its whole answer and still hand the settlement a result
+    payload whose ``messages`` stop at the pre-turn history (#14070). The
+    streamed buffer is then the only copy of the reply the user read, so it —
+    not the payload — decides whether the turn produced an answer.
+    """
+    from api import config as _live_config
+
+    partial_texts = STREAM_PARTIAL_TEXT
+    if getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts) is not partial_texts:
+        partial_texts = _live_config.STREAM_PARTIAL_TEXT
+    streams_lock = STREAMS_LOCK
+    if getattr(_live_config, 'STREAMS_LOCK', streams_lock) is not streams_lock:
+        streams_lock = _live_config.STREAMS_LOCK
+
+    with streams_lock:
+        text = partial_texts.get(stream_id, '')
+    # Reuse the cancel/error cleaning: strips thinking blocks and returns ''
+    # when nothing user-visible was delivered.
+    partial = _build_partial_message(text, None, None)
+    return (partial or {}).get('content', '')
+
+
+def _record_delivered_answer(session, text: str) -> dict:
+    """Persist delivered streamed text as the turn's final assistant row.
+
+    Counterpart of ``_snapshot_and_append_partial_on_error`` for turns that did
+    deliver an answer: the row is final (no ``_partial``), so a reload shows the
+    reply the user already read instead of an error card (#14070).
+    """
+    message = {
+        'role': 'assistant',
+        'content': text,
+        'timestamp': int(time.time()),
+    }
+    session.messages.append(message)
+    # The agent's next turn reads context_messages, so it must carry the reply
+    # too — otherwise the model re-answers a turn it already finished.
+    if isinstance(session.context_messages, list):
+        session.context_messages.append({'role': 'assistant', 'content': text})
+    return message
+
+
 def _snapshot_and_append_partial_on_error(
     session,
     stream_id,
@@ -16695,13 +16740,30 @@ def _run_agent_streaming(
                     and not _tool_limit_reached
                     and not _last_err
                 )
+                # #14070: a soft partial whose reply already reached the client
+                # never produced "no content" — the result payload just lost the
+                # final row. The delivered text is the turn's answer, so settle
+                # it as one instead of stacking an error card under it.
+                _delivered_answer_text = ''
+                if _token_sent and not _last_err and not _captured_terminal_failure:
+                    _delivered_answer_text = _delivered_streamed_answer(stream_id)
+                _delivered_answer_settles_turn = (
+                    _soft_partial_terminal_failure
+                    and bool(_delivered_answer_text)
+                )
                 if (
                     _terminal_failure
                     and (_soft_partial_terminal_failure or _tool_limit_reached)
                     and _classification['type'] == 'no_response'
-                    and not _saved_transcript_lacks_final_answer
+                    and (
+                        not _saved_transcript_lacks_final_answer
+                        or _delivered_answer_settles_turn
+                    )
                 ):
                     _terminal_failure = False
+                    if _delivered_answer_settles_turn and _saved_transcript_lacks_final_answer:
+                        _record_delivered_answer(s, _delivered_answer_text)
+                        _assistant_added = True
                 if _terminal_failure:
                     _assistant_added = False
                 elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
