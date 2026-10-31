@@ -5,6 +5,8 @@
 
 ### Added
 
+- **Tasks has a read-only Scripts tab.** Next to Jobs, a Scripts tab lists the active profile's `scripts/` folder (the scripts cron jobs can run) with each file's size, age and the description from its leading comment, and opens a file read-only. Reads stay inside that folder (no symlinks out, size-capped), a platform that cannot open the folder safely says so instead of showing an empty list, and the tab hides "New job" since it cannot create anything. Thanks @happy5318. (#7685, for #2316)
+
 - **The workspace Artifacts panel shows which skills each conversation used.** A new "Skills used" section lists every skill the session loaded and how many times, counted from successful skill loads (the Agent's `skill_view`, `/use` and bundle commands) and kept per session and profile. Files and skills sit in their own collapsible sections ("Files changed N", "Skills used N"), and the Artifacts badge counts both. Thanks @rodboev. (#6693, for #6593)
 
 - **A notice shows when memory is off for the agent serving the chat.** When memory can't be kept inside one profile, the Agent runs with memory (or just its external provider) switched off, and before this the only trace was a server log line. A dismissible notice above the composer now says which case applies (an Agent too old to scope memory per profile, an Agent that can't claim a provider per profile, or a provider already used by another profile) and how to turn memory back on. Healthy and read-only sessions show nothing. (#8652, refs #8517)
