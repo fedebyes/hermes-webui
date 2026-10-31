@@ -1573,10 +1573,10 @@ _RUNNING_STATUS = {
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 @pytest.mark.parametrize("label", _GATEWAY_LAST_ACTIVE_VALUES)
 def test_last_active_renders_exactly_one_separator_per_locale(label):
-    """#8621: the card must render one separator, even when the translated
-    label already ends in a colon (15 of 16 locales do). The template adds
-    ': ' after the label; the label must be stripped of trailing
-    ASCII/full-width colons and whitespace first."""
+    """#8621: the card must render one separator, and it is the one the
+    translator chose. A label that already ends in a colon keeps it -- a
+    full-width "：", or a French " : " -- and only a label with no colon
+    gets the template's ": "."""
     html = _render_gateway_card(_RUNNING_STATUS, strings={"gateway_last_active": label})
 
     # Normalise full-width colons so one check covers both colon shapes.
@@ -1584,15 +1584,23 @@ def test_last_active_renders_exactly_one_separator_per_locale(label):
     assert ": :" not in flat and "::" not in flat, (
         f"double separator for gateway_last_active={label!r}: {html[:200]}"
     )
-    # The label itself and the template separator must both be present.
+    # The translated label is rendered as the translator wrote it, colon
+    # included: the full-width "：" and the French " : " are theirs, and the
+    # card must not swap them for an ASCII ": ".
+    sep = re.search(r"([：:])\s*$", label)
+    expected = label if sep else label + ": "
+    assert expected in html, (
+        f"translated label {label!r} not rendered verbatim: {html[:200]}"
+    )
+    # The label's own text must still be there.
     stripped = label.rstrip().rstrip(":：").rstrip()
     assert stripped in html, f"translated label {label!r} missing from card"
-    assert stripped + ": " in flat, f"template separator missing for {label!r}"
 
 
 def test_gateway_last_active_values_are_strip_clean():
-    """Every locale value must reduce to a single separator when the template
-    colon is appended — pins the data shape a future locale must satisfy."""
+    """Every locale value must carry at most one trailing colon, so the card
+    can render it as the translator wrote it -- pins the data shape a future
+    locale must satisfy."""
     for label in _GATEWAY_LAST_ACTIVE_VALUES:
         stripped = label.rstrip().rstrip(":：").rstrip()
         # After stripping, the label itself must no longer end in a colon.
