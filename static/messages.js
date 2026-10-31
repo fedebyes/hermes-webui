@@ -6605,6 +6605,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // Browser notification is owned by showClarifyCard()/_notifyPromptCard().
     });
 
+    // Vault secrets: the in-process runtime installs the Agent's vault prompt
+    // callbacks (api/vault_prompt.py) and publishes the request here. The payload
+    // carries metadata only (backend / site / hint); the answer goes back over
+    // POST /api/vault/prompt/respond and is never echoed into the transcript.
+    source.addEventListener('vault_prompt',e=>{
+      let d={};
+      try{ d=JSON.parse(e.data||'{}'); }catch(_){ return; }
+      if(!d || !d.prompt_id) return;
+      showVaultPrompt(d);
+      playAttentionSound(_attentionSoundKey(activeSid,'vault_prompt',1));
+    });
+
     source.addEventListener('state_saved',e=>{
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
@@ -7613,7 +7625,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       })();
     });
 
-    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
+    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','vault_prompt','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
       source.addEventListener(_runJournalEventName,_rememberRunJournalCursor);
     }
   }
@@ -9727,6 +9739,247 @@ function _renderPendingPromptsForActiveSession() {
     activeSessionHasPendingPromptAttention()
   ) return;
   if (typeof syncTopbar === 'function') syncTopbar();
+}
+
+// ── Vault secret prompts (masked) ──────────────────────────────────────────
+// The Agent's browser_vault tool asks the *surface* for a vault master password,
+// a login to save, or a one-time code. The in-process runtime installs those
+// callbacks (api/vault_prompt.py) and publishes a `vault_prompt` event carrying
+// metadata only. This card collects the value in a masked field, posts it to
+// /api/vault/prompt/respond, and wipes the field immediately: the value is never
+// rendered into the transcript, the composer, a toast or localStorage.
+let _vaultPrompt = null;
+let _vaultPromptCountdown = null;
+
+function _vaultT(key, ...args) {
+  try {
+    if (typeof t === 'function') {
+      const value = t(key, ...args);
+      if (value != null && value !== key && value !== '') return value;
+    }
+  } catch (_) { /* i18n remains optional */ }
+  return key;
+}
+
+function _vaultPromptSessionId() {
+  if (typeof _promptActiveSessionId === 'function') {
+    const sid = _promptActiveSessionId();
+    if (sid) return sid;
+  }
+  return (typeof activeSid === 'string') ? activeSid : '';
+}
+
+function _clearVaultPromptFields() {
+  const secret = $("vaultPromptSecret");
+  if (secret) secret.value = "";
+  const identifier = $("vaultPromptIdentifier");
+  if (identifier) identifier.value = "";
+}
+
+function _stopVaultPromptCountdown() {
+  if (_vaultPromptCountdown) {
+    clearInterval(_vaultPromptCountdown);
+    _vaultPromptCountdown = null;
+  }
+  const el = $("vaultPromptCountdown");
+  if (el) el.textContent = "";
+}
+
+function hideVaultPrompt() {
+  _clearVaultPromptFields();
+  _stopVaultPromptCountdown();
+  _vaultPrompt = null;
+  const card = $("vaultPromptCard");
+  if (card) card.classList.remove("visible");
+}
+
+function _ensureVaultPromptCard() {
+  let card = $("vaultPromptCard");
+  if (card) return card;
+  const host = $("msgInner") || $("messages");
+  if (!host) return null;
+  card = document.createElement("div");
+  card.className = "vault-card";
+  card.id = "vaultPromptCard";
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-labelledby", "vaultPromptHeading");
+  card.innerHTML = `
+    <div class="vault-inner">
+      <div class="vault-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <span class="vault-heading" id="vaultPromptHeading"></span>
+        <span class="vault-countdown" id="vaultPromptCountdown"></span>
+      </div>
+      <div class="vault-detail" id="vaultPromptDetail"></div>
+      <div class="vault-fields">
+        <input class="vault-input" id="vaultPromptIdentifier" type="text" autocomplete="off" spellcheck="false" hidden>
+        <input class="vault-input" id="vaultPromptSecret" type="password" autocomplete="new-password" spellcheck="false">
+      </div>
+      <div class="vault-actions">
+        <button type="button" class="vault-submit" id="vaultPromptSubmit"></button>
+        <button type="button" class="vault-cancel" id="vaultPromptCancel"></button>
+      </div>
+      <div class="vault-hint" id="vaultPromptHint"></div>
+    </div>`;
+  host.appendChild(card);
+  const submit = $("vaultPromptSubmit");
+  if (submit) submit.onclick = () => { void respondVaultPrompt(false); };
+  const cancel = $("vaultPromptCancel");
+  if (cancel) cancel.onclick = () => { void respondVaultPrompt(true); };
+  const secret = $("vaultPromptSecret");
+  if (secret) {
+    secret.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); void respondVaultPrompt(false); }
+    });
+  }
+  return card;
+}
+
+function _vaultExpiryMs(pending) {
+  const requestedAt = Number(pending && pending.requested_at);
+  const timeoutSeconds = Number(pending && pending.timeout_seconds);
+  if (Number.isFinite(requestedAt) && Number.isFinite(timeoutSeconds) && timeoutSeconds > 0) {
+    return (requestedAt + timeoutSeconds) * 1000;
+  }
+  return 0;
+}
+
+function _startVaultPromptCountdown(pending) {
+  _stopVaultPromptCountdown();
+  const expiresAt = _vaultExpiryMs(pending);
+  if (!expiresAt) return;
+  const tick = () => {
+    const el = $("vaultPromptCountdown");
+    if (!el || !_vaultPrompt) return;
+    const remaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+    el.textContent = remaining > 0 ? `${remaining}s` : "";
+    el.classList.toggle("urgent", remaining <= 10);
+    if (remaining <= 0) {
+      _stopVaultPromptCountdown();
+      const submit = $("vaultPromptSubmit");
+      if (submit) submit.disabled = true;
+      const hint = $("vaultPromptHint");
+      if (hint) hint.textContent = _vaultT('vault_expired');
+    }
+  };
+  tick();
+  _vaultPromptCountdown = setInterval(tick, 1000);
+}
+
+function showVaultPrompt(payload) {
+  if (!payload || !payload.prompt_id) return;
+  const sid = _vaultPromptSessionId();
+  if (!sid) return;
+  if (_vaultPrompt && _vaultPrompt.prompt_id === payload.prompt_id) return;
+  const card = _ensureVaultPromptCard();
+  if (!card) return;
+  const kind = String(payload.kind || '');
+  _vaultPrompt = { ...payload, session_id: sid };
+  _clearVaultPromptFields();
+  const heading = $("vaultPromptHeading");
+  const detail = $("vaultPromptDetail");
+  const hint = $("vaultPromptHint");
+  const submit = $("vaultPromptSubmit");
+  const cancel = $("vaultPromptCancel");
+  const identifier = $("vaultPromptIdentifier");
+  const secret = $("vaultPromptSecret");
+  if (heading) {
+    heading.textContent = kind === 'save_login' ? _vaultT('vault_save_heading')
+      : (kind === 'code' ? _vaultT('vault_code_heading') : _vaultT('vault_unlock_heading'));
+  }
+  if (detail) {
+    detail.textContent = kind === 'save_login'
+      ? _vaultT('vault_save_detail', String(payload.site || payload.origin || ''))
+      : (kind === 'code'
+        ? _vaultT('vault_code_detail', String(payload.site || ''))
+        : _vaultT('vault_unlock_detail', String(payload.display_name || payload.backend || '')));
+  }
+  if (submit) {
+    submit.disabled = false;
+    submit.textContent = kind === 'save_login' ? _vaultT('vault_save_action')
+      : (kind === 'code' ? _vaultT('vault_code_action') : _vaultT('vault_unlock_action'));
+  }
+  if (cancel) cancel.textContent = _vaultT('vault_cancel_action');
+  if (hint) hint.textContent = _vaultT('vault_hint');
+  if (identifier) identifier.hidden = kind !== 'save_login';
+  if (secret) {
+    secret.value = "";
+    secret.type = "password";
+    secret.setAttribute('autocomplete', kind === 'save_login' ? 'new-password' : 'current-password');
+    secret.inputMode = kind === 'code' ? 'numeric' : 'text';
+    secret.placeholder = kind === 'code' ? _vaultT('vault_code_placeholder') : _vaultT('vault_secret_placeholder');
+  }
+  _attachVaultCardDock(card);
+  _startVaultPromptCountdown(payload);
+  const focusTarget = (kind === 'save_login' && identifier) ? identifier : secret;
+  if (focusTarget && typeof focusTarget.focus === 'function') {
+    try { focusTarget.focus(); } catch (_) { /* focus is best-effort */ }
+  }
+}
+
+function _attachVaultCardDock(card) {
+  // Keep the card docked above the composer alongside the clarify card: the same
+  // transcript padding variable keeps the last message reachable.
+  card.classList.add("visible");
+  const messages = $("messages");
+  if (!messages) return;
+  const measure = () => {
+    if (!card.classList.contains("visible")) return;
+    const inner = card.querySelector(".vault-inner") || card;
+    const height = inner && inner.getBoundingClientRect ? inner.getBoundingClientRect().height : 0;
+    if (height > 0) messages.style.setProperty("--clarify-card-height", Math.ceil(height + 24) + "px");
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(measure);
+  setTimeout(measure, 420);
+}
+
+async function respondVaultPrompt(cancelled) {
+  const pending = _vaultPrompt;
+  if (!pending) return;
+  const body = { session_id: pending.session_id, prompt_id: pending.prompt_id };
+  if (cancelled) {
+    body.cancelled = true;
+  } else if (pending.kind === 'save_login') {
+    const identifierEl = $("vaultPromptIdentifier");
+    const secretEl = $("vaultPromptSecret");
+    const identifier = identifierEl ? String(identifierEl.value || '') : '';
+    const password = secretEl ? String(secretEl.value || '') : '';
+    if (!identifier) { if (identifierEl) identifierEl.focus(); return; }
+    if (!password) { if (secretEl) secretEl.focus(); return; }
+    body.identifier = identifier;
+    body.password = password;
+  } else {
+    const secretEl = $("vaultPromptSecret");
+    const value = secretEl ? String(secretEl.value || '') : '';
+    if (!value.trim()) { if (secretEl) secretEl.focus(); return; }
+    body.value = value.trim();
+  }
+  // Wipe the DOM before the request leaves: from here the value exists only in
+  // this fetch body.
+  _clearVaultPromptFields();
+  const submit = $("vaultPromptSubmit");
+  if (submit) { submit.disabled = true; submit.textContent = _vaultT('vault_responding'); }
+  try {
+    const result = await api("/api/vault/prompt/respond", {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    if (result && result.ok) {
+      hideVaultPrompt();
+      return;
+    }
+    if (result && (result.error === "no_pending_prompt" || result.error === "prompt_mismatch")) {
+      // The turn ended or the request already settled: nothing to answer.
+      hideVaultPrompt();
+      return;
+    }
+  } catch (_) { /* fall through to the retry state */ }
+  const stillPending = _vaultPrompt && _vaultPrompt.prompt_id === pending.prompt_id;
+  if (stillPending && submit) {
+    submit.disabled = false;
+    submit.textContent = pending.kind === 'save_login' ? _vaultT('vault_save_action')
+      : (pending.kind === 'code' ? _vaultT('vault_code_action') : _vaultT('vault_unlock_action'));
+  }
 }
 
 function _ensureClarifyCardDom() {

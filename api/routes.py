@@ -17548,6 +17548,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/clarify/pending":
         return _handle_clarify_pending(handler, parsed)
 
+    if parsed.path == "/api/vault/prompt/pending":
+        return _handle_vault_prompt_pending(handler, parsed)
+
     if parsed.path == "/api/clarify/stream":
         return _handle_clarify_sse_stream(handler, parsed)
 
@@ -20115,6 +20118,10 @@ def handle_post(handler, parsed) -> bool:
     # ── Clarify (POST) ──
     if parsed.path == "/api/clarify/respond":
         return _handle_clarify_respond(handler, body)
+
+    # ── Vault prompts (POST) ──
+    if parsed.path == "/api/vault/prompt/respond":
+        return _handle_vault_prompt_respond(handler, body)
 
     # ── Commands (POST) ──
     if parsed.path == "/api/commands/bundles/resolve":
@@ -25455,6 +25462,52 @@ def _handle_clarify_pending(handler, parsed):
     if pending:
         return j(handler, {"pending": pending})
     return j(handler, {"pending": None})
+
+
+def _handle_vault_prompt_pending(handler, parsed):
+    """The session's open secret request (metadata only), so a reload can re-attach."""
+    sid = parse_qs(parsed.query).get("session_id", [""])[0]
+    if not sid:
+        return j(handler, {"error": "session_id is required"}, status=400)
+    from api.vault_prompt import pending as _vault_pending
+
+    return j(handler, {"pending": _vault_pending(sid)})
+
+
+def _handle_vault_prompt_respond(handler, body):
+    """Settle a masked vault prompt. The value is handed to the parked tool thread only.
+
+    Nothing here logs, echoes or streams the answer: the response is a bare ack, and
+    the request body is never written to the request log (which records the line, not
+    the payload).
+    """
+    sid = str(body.get("session_id", "") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required")
+    from api.vault_prompt import pending as _vault_pending, resolve as _vault_resolve
+
+    current = _vault_pending(sid)
+    if not current:
+        return j(handler, {"ok": False, "error": "no_pending_prompt"}, status=409)
+    prompt_id = str(body.get("prompt_id", "") or "")
+    if prompt_id and prompt_id != current.get("prompt_id"):
+        return j(handler, {"ok": False, "error": "prompt_mismatch"}, status=409)
+    kind = current.get("kind")
+    if body.get("cancelled"):
+        value = None
+    elif kind == "save_login":
+        identifier = str(body.get("identifier", "") or "")
+        password = str(body.get("password", "") or "")
+        if not identifier or not password:
+            return bad(handler, "identifier and password are required")
+        value = {"identifier": identifier, "password": password}
+    else:
+        value = str(body.get("value", "") or "")
+        if not value:
+            return bad(handler, "value is required")
+    if not _vault_resolve(sid, str(current.get("prompt_id", "")), value):
+        return j(handler, {"ok": False, "error": "no_pending_prompt"}, status=409)
+    return j(handler, {"ok": True})
 
 
 def _handle_clarify_sse_stream(handler, parsed):

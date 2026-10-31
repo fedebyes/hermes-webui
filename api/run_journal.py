@@ -1206,7 +1206,7 @@ REPLAY_PROMPT_TOOL_NAMES = frozenset({"clarify"})
 # ``approval`` is settled ONLY by the run's terminal row: approvals are a
 # queue (#527, pending_count > 1) and the respond path writes no journal row,
 # so no per-entry settle evidence exists.
-REPLAY_PROMPT_EVENT_NAMES = frozenset({"clarify", "approval"})
+REPLAY_PROMPT_EVENT_NAMES = frozenset({"clarify", "approval", "vault_prompt"})
 
 
 def settled_prompt_events(events) -> set[tuple[str, int]]:
