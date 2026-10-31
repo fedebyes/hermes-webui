@@ -73,6 +73,8 @@
 
 ### Fixed
 
+- **The Gateway Status card shows a single separator after "Last active".** Most translations of the label already end in a colon, and the card added another, so it read "Last active: : <date>". The card now keeps the colon the translation chose (a full-width "：" in Chinese, " : " in French) and adds ": " only to a label without one. (#8635, closes #8621, thanks @happy5318)
+
 - **Every assistant message in a routed turn shows the model that produced it.** Gateway routing metadata was stamped only on the turn's last answer, so interim answers before tool calls had no model label (one real session showed 25 of 32 answers unlabelled). Each assistant message now carries its turn's routing, and the footer lookup is scoped to the message's own foot, so the final answer keeps its "Done in" and usage footer. Thanks @solarmaster961. (#8287)
 
 - **Stopping a Gateway run now retires its approval cards before WebUI reports the run stopped.** With a Hermes Gateway on the default chat stream, a pending approval card stayed clickable after Stop (and after WebUI's own settle on shutdown or update) until the Gateway connection closed, and an Allow click in that window let the Agent run a command WebUI had already recorded as stopped. Stop and the server settle now retire the run's cards first, a card arriving during the stop is never left clickable, and a later click gets a clear 409 without reaching the Gateway. Stop never waits on an approval in flight. (#8634)
