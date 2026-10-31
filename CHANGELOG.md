@@ -5,7 +5,7 @@
 
 ### Added
 
-- **Tasks has a read-only Scripts tab.** Next to Jobs, a Scripts tab lists the active profile's `scripts/` folder (the scripts cron jobs can run) with each file's size, age and the description from its leading comment, and opens a file read-only. Reads stay inside that folder (no symlinks out, size-capped), a platform that cannot open the folder safely says so instead of showing an empty list, and the tab hides "New job" since it cannot create anything. Thanks @happy5318. (#7685, for #2316)
+- **Usage quotas for OpenCode Go and Command Code.** Settings > Providers shows their usage, limits and reset times on the quota card, read from each provider's usage API (sanitized to the card's existing window format), and reports a definitive failure, such as an invalid key, instead of the credential pool. Thanks @droopanu. (#7883)
 
 - **Opt-in Screen reader mode, enabled for the terminal.** A Settings toggle (also found by Settings search) makes the terminal readable by screen readers. Off by default. Thanks @grzezlo. (#8305)
 
