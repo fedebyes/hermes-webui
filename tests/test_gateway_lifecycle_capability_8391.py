@@ -1553,12 +1553,28 @@ def test_renderer_passes_the_lifecycle_to_the_unproven_note():
     assert "esc(command)" in note
 # ── #8621: Gateway Status card "Last active" separator ─────────────────────
 
-_GATEWAY_LAST_ACTIVE_PATTERN = re.compile(r"gateway_last_active:\s*'([^']*)'")
+_GATEWAY_LAST_ACTIVE_PATTERN = re.compile(r"^\s*gateway_last_active:\s*'([^']*)'", re.M)
 
 
 def _gateway_last_active_values() -> list[str]:
-    values = _GATEWAY_LAST_ACTIVE_PATTERN.findall(I18N_JS)
-    assert len(values) == 16, f"expected 16 gateway_last_active locales, got {len(values)}"
+    """The live gateway_last_active value of every locale.
+
+    Exactly one per locale: a locale that defines the key twice -- the later
+    definition wins, so the earlier is dead code -- fails here instead of
+    quietly contributing a value that can never be rendered.
+    """
+    blocks = _locale_blocks()
+    values = []
+    for name, body in blocks.items():
+        hits = _GATEWAY_LAST_ACTIVE_PATTERN.findall(body)
+        assert len(hits) == 1, (
+            f"locale {name!r} defines gateway_last_active {len(hits)} times; the "
+            "later definition wins, so the earlier one is dead code"
+        )
+        values.append(hits[0])
+    assert len(values) == len(blocks), (
+        f"{len(values)} gateway_last_active values for {len(blocks)} locales"
+    )
     return values
 
 
