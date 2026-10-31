@@ -14819,6 +14819,24 @@ def _run_agent_streaming(
         except ImportError:
             logger.debug("Clarify module not available, falling back to polling")
 
+        # Vault secrets (external manager master password, "save this login",
+        # one-time codes). Hermes Agent never asks for one itself: the browser_vault
+        # tool calls a per-thread callback the *surface* installs through
+        # agent.vault_backends.unlock. The TUI and the Desktop gateway install them;
+        # this in-process runtime installed none, so can_prompt_here() was False and
+        # the tool answered unlock_unavailable/prompt_unavailable — the secret could
+        # only be typed from the TUI or Telegram. The request is published as the
+        # `vault_prompt` stream event (metadata only); the answer arrives on
+        # POST /api/vault/prompt/respond and is returned to the tool without ever
+        # being journalled, streamed or logged.
+        _vault_prompts_uninstall = None
+        try:
+            from api.vault_prompt import install_callbacks as _install_vault_prompts
+
+            _vault_prompts_uninstall = _install_vault_prompts(session_id, put, cancel_event)
+        except ImportError:
+            logger.debug("Vault prompt module unavailable")
+
         def _clarify_ask_one(question, choices, sid, cancel_evt):
             """Show one clarify card and wait for it.
 
@@ -18096,6 +18114,13 @@ def _run_agent_streaming(
                     _unreg_clarify_notify(session_id)
                 except Exception:
                     logger.debug("Failed to unregister clarify callback")
+            if _vault_prompts_uninstall is not None:
+                # Drops any secret request still parked on this turn and restores the
+                # empty callback slots, so a later turn cannot inherit them.
+                try:
+                    _vault_prompts_uninstall()
+                except Exception:
+                    logger.debug("Failed to uninstall vault prompt callbacks")
             with _ENV_LOCK:
                 for _key, _old_value in old_profile_env.items():
                     if _old_value is None: os.environ.pop(_key, None)

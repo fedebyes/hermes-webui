@@ -2129,6 +2129,25 @@
   .clarify-card.collapsed .clarify-inner{max-height:48px;overflow:hidden;padding:10px 14px;}
   .clarify-card.collapsed .clarify-header{margin-bottom:0;}
   .clarify-card.collapsed .clarify-question,.clarify-card.collapsed .clarify-choices,.clarify-card.collapsed .clarify-response,.clarify-card.collapsed .clarify-hint{display:none;}
+  /* Vault secret prompts: masked card in the same dock as the clarify card. It is
+     independent (no collapse, no choice chips) and never echoes the value. */
+  .vault-card{position:absolute;left:0;right:0;bottom:-24px;max-width:var(--msg-max);margin:0 auto;padding:0 20px;box-sizing:border-box;width:100%;overflow:hidden;pointer-events:none;}
+  .vault-card .vault-inner{transform:translateY(100%);opacity:0;pointer-events:none;transition:transform .4s cubic-bezier(.32,.72,.16,1),opacity .25s ease;background:var(--surface);backdrop-filter:blur(8px);border:1px solid var(--accent-bg-strong);border-radius:12px;padding:12px 14px 16px;box-shadow:0 1px 0 rgba(255,255,255,.02) inset;}
+  .vault-card.visible .vault-inner{transform:translateY(0);opacity:1;pointer-events:auto;}
+  .vault-header{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:var(--text);}
+  .vault-countdown{margin-left:auto;font-size:11px;font-weight:600;color:var(--muted);font-variant-numeric:tabular-nums;}
+  .vault-countdown.urgent{color:var(--danger);}
+  .vault-detail{margin-top:6px;font-size:12px;line-height:1.5;color:var(--text);opacity:.85;word-break:break-word;}
+  .vault-fields{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;}
+  .vault-input{flex:1;min-width:180px;padding:10px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--input-bg);color:var(--text);font:inherit;outline:none;transition:all .15s;}
+  .vault-input:focus{border-color:var(--accent-bg);box-shadow:0 0 0 3px var(--accent-bg);background:var(--hover-bg);}
+  .vault-actions{display:flex;gap:8px;margin-top:10px;}
+  .vault-submit{display:inline-flex;align-items:center;justify-content:center;min-width:92px;padding:10px 14px;border-radius:8px;border:1px solid var(--accent-bg-strong);background:var(--accent-bg);color:var(--accent-text);font-size:12px;font-weight:700;cursor:pointer;transition:all .15s;white-space:nowrap;}
+  .vault-submit:hover{background:var(--accent-bg-strong);transform:translateY(-1px);}
+  .vault-submit:disabled{opacity:.6;cursor:not-allowed;transform:none;}
+  .vault-cancel{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:8px;border:1px solid var(--border2);background:transparent;color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;}
+  .vault-cancel:hover{background:var(--hover-bg);color:var(--text);}
+  .vault-hint{margin-top:8px;font-size:11px;line-height:1.45;color:var(--muted);}
   /* Left rail (desktop primary navigation) */
   .rail{display:none;width:48px;flex-shrink:0;flex-direction:column;align-items:center;gap:4px;padding:8px 0;background:var(--sidebar);border-right:1px solid var(--border);}
   .rail-btn{width:36px;height:36px;border-radius:8px;border:none;background:none;color:var(--muted);cursor:pointer;display:flex;align-items:center;justify-content:center;position:relative;transition:color .15s,background .15s;flex-shrink:0;padding:0;}

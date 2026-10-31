@@ -197,7 +197,7 @@ gate rather than inventing values without source support.
 ## Authoritative emitted events (`/api/chat/stream`)
 
 These are the **real wire `event:` names** emitted by `api/streaming.py` today
-(24 names). Clients and docs must use this table — not the semantic draft above —
+(25 names). Clients and docs must use this table — not the semantic draft above —
 when integrating with the live chat SSE relay.
 
 | Wire name | Role |
@@ -209,6 +209,7 @@ when integrating with the live chat SSE relay.
 | `interim_assistant` | Mid-turn assistant prose (pre-final) |
 | `approval` | Destructive-command approval prompt |
 | `clarify` | Structured clarification prompt |
+| `vault_prompt` | Masked vault secret prompt (password-manager unlock, save-login, one-time code). Payload is metadata only — the answer travels back over `POST /api/vault/prompt/respond` and is never journal-replayed with the value |
 | `compressing` | Context compression started |
 | `compressed` | Context compression finished |
 | `title` | Session title update (often after `done`) |
