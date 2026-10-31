@@ -10309,8 +10309,10 @@ function renderSessionListFromCache(){
     // It is a point-in-time fact, never cached into the session row itself —
     // the map is refreshed on its own cadence and a stale row would otherwise
     // keep a dead count on screen. Inlined for the same slice-extraction reason
-    // as the done badge above.
-    if(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0){
+    // as the done badge above. Only when the lineage rows are not in this
+    // render (a filtered or archived child list): otherwise the child pill
+    // below carries the same number and the row would paint "1 live" twice.
+    if(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0&&childCount===0){
       const liveEl=document.createElement('span');
       liveEl.className='session-live-subagents-badge';
       const liveLabel=t('session_live_subagents', s._live_subagent_count);
@@ -10319,11 +10321,22 @@ function renderSessionListFromCache(){
       titleRow.appendChild(liveEl);
     }
     if(childCount>0){
+      // One pill, and its number is LIVE. `_live_subagent_count` is the count
+      // the runner still has open for this conversation (GET /api/subagents/live
+      // — state.db `source='subagent' AND ended_at IS NULL`, bounded by the
+      // movement grace window), re-applied on every render. The historical
+      // `childCount` never reaches the pill: a session whose three subagents
+      // finished days ago must not read "3" as if work were running. It
+      // survives in the tooltip, which costs nothing, and the pill keeps its
+      // expander job. With nothing live the pill carries no number at all —
+      // a bare expander, never "0".
+      const liveKids=(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0)?s._live_subagent_count:0;
       const childCountEl=document.createElement('span');
-      childCountEl.className='session-child-count';
+      childCountEl.className=liveKids>0?'session-child-count is-live':'session-child-count';
       const childLabel=t('session_meta_children', childCount);
-      childCountEl.textContent=childLabel;
-      childCountEl.title=_sessionChildBadgeTooltip(childLabel);
+      const childHint=_sessionChildBadgeTooltip(childLabel);
+      childCountEl.textContent=liveKids>0?t('session_live_subagents', liveKids):'›';
+      childCountEl.title=liveKids>0?(t('session_live_subagents_tooltip')+' · '+childHint):childHint;
       ['pointerdown','pointerup','click'].forEach(ev=>childCountEl.addEventListener(ev,e=>e.stopPropagation()));
       childCountEl.onclick=(e)=>{
         e.stopPropagation();
@@ -10359,7 +10372,12 @@ function renderSessionListFromCache(){
         ? t('session_meta_messages', _visibleCount)
         : `${_visibleCount} msg${_visibleCount===1?'':'s'}`;
       metaBits.push(msgLabel);
-      if(childCount>0) metaBits.push(t('session_meta_children', childCount));
+      // Same rule as the pill: the meta line's number is live, never the
+      // historical child total (an idle row would otherwise read "3 children"
+      // while nothing runs).
+      if(typeof s._live_subagent_count==='number'&&s._live_subagent_count>0){
+        metaBits.push(t('session_live_subagents', s._live_subagent_count));
+      }
       const modelMeta=_formatSessionModelWithGateway(s);
       if(modelMeta) metaBits.push(modelMeta);
       const sourceLabel=_getChannelLabel(s);

@@ -20,8 +20,10 @@ import io
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -34,7 +36,9 @@ I18N_JS = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
 pytestmark = pytest.mark.skipif(not shutil.which("node"), reason="node required")
 
 
-LIVE_PREDICATE = "typeof s._live_subagent_count==='number'&&s._live_subagent_count>0"
+LIVE_PREDICATE = (
+    "typeof s._live_subagent_count==='number'&&s._live_subagent_count>0&&childCount===0"
+)
 
 
 def _live_badge_block() -> str:
@@ -43,6 +47,77 @@ def _live_badge_block() -> str:
     m = re.search(pattern, SESSIONS_JS, re.S | re.M)
     assert m, "live subagent badge block not found in static/sessions.js"
     return m.group(0)
+
+
+def _child_pill_block() -> str:
+    """The row's child pill, live-number included, from `const childCount=` on."""
+    start = SESSIONS_JS.index("const childCount=typeof s._child_session_count")
+    end = SESSIONS_JS.index("titleRow.appendChild(childCountEl);", start) + len(
+        "titleRow.appendChild(childCountEl);\n    }"
+    )
+    block = SESSIONS_JS[start:end]
+    assert "session-child-count" in block
+    return block
+
+
+# The pill reads `t()`, the tooltip helper and the toggle plumbing; only the
+# last three are stubbed — the class, the label and the tooltip under test are
+# the real lines.
+CHILD_PILL_STUBS = """
+const _expandedChildSessionKeys = new Set();
+function _retireProjectPickerForExplicitRepaint(){}
+function _sidebarLineageKeyForRow(s){ return s.session_id; }
+function renderSessionListFromCache(){}
+function _sessionChildBadgeTooltip(label){ return label + ' — click to show nested sessions'; }
+function _formatRelativeSessionTime(){ return 'now'; }
+function _isMessagingSession(){ return false; }
+function _getChannelLabel(){ return null; }
+function _sourceKeyForSession(){ return null; }
+"""
+
+
+_PRELUDE_JS = """
+const fs = require('fs');
+const vm = require('vm');
+const i18nSrc = fs.readFileSync(__I18N_PATH__, 'utf8');
+const sandbox = {
+  navigator: { language: 'en' },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  document: { documentElement: {}, addEventListener() {} },
+};
+sandbox.window = sandbox;
+const ctx = vm.createContext(sandbox);
+vm.runInContext(i18nSrc + ';globalThis.__LOCALES = LOCALES;', ctx);
+const LOCALES = sandbox.__LOCALES;
+const t = (key, ...args) => {
+  const val = LOCALES.en[key];
+  if (val === undefined) return key;
+  if (typeof val === 'function') return val(...args);
+  if (args.length) return String(val).replace(/\\{(\\d+)\\}/g, (m, i) => (i === '0' ? String(args[0]) : m));
+  return val;
+};
+
+class FakeEl {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.className = '';
+    this.textContent = '';
+    this.title = '';
+    this.children = [];
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  addEventListener() {}
+}
+const document = { createElement: (tag) => new FakeEl(tag) };
+""".replace("__I18N_PATH__", json.dumps(str(REPO_ROOT / "static" / "i18n.js")))
+
+_COLLECT_JS = """
+  out.push(titleRow.children.map(c => ({
+    className: c.className,
+    textContent: c.textContent,
+    title: c.title,
+  })));
+"""
 
 
 def _run_render(rows):
@@ -55,49 +130,35 @@ def _run_render(rows):
     harness asserts what production actually renders.
     """
     block = _live_badge_block()
-    harness = f"""
-const fs = require('fs');
-const vm = require('vm');
-const i18nSrc = fs.readFileSync({json.dumps(str(REPO_ROOT / "static" / "i18n.js"))}, 'utf8');
-const sandbox = {{
-  navigator: {{ language: 'en' }},
-  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
-  document: {{ documentElement: {{}}, addEventListener() {{}} }},
-}};
-sandbox.window = sandbox;
-const ctx = vm.createContext(sandbox);
-vm.runInContext(i18nSrc + ';globalThis.__LOCALES = LOCALES;', ctx);
-const LOCALES = sandbox.__LOCALES;
-const t = (key, ...args) => {{
-  const val = LOCALES.en[key];
-  if (val === undefined) return key;
-  if (typeof val === 'function') return val(...args);
-  if (args.length) return String(val).replace(/\\{{(\\d+)\\}}/g, (m, i) => (i === '0' ? String(args[0]) : m));
-  return val;
-}};
+    harness = _PRELUDE_JS + f"""
+const out = [];
+for (const s of {json.dumps(rows)}) {{
+  const titleRow = new FakeEl('span');
+  const childCount=typeof s._child_session_count==='number'?s._child_session_count:(Array.isArray(s._child_sessions)?s._child_sessions.length:0);
+  {block}
+{_COLLECT_JS}}}
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
 
-class FakeEl {{
-  constructor(tag) {{
-    this.tagName = tag.toUpperCase();
-    this.className = '';
-    this.textContent = '';
-    this.title = '';
-    this.children = [];
-  }}
-  appendChild(child) {{ this.children.push(child); return child; }}
-}}
-const document = {{ createElement: (tag) => new FakeEl(tag) }};
 
+def _run_child_pill(rows):
+    """Execute the REAL child-pill fragment (live number included).
+
+    This is the surface the card is about: the number the sidebar paints must
+    be the children running now, not the historical total.
+    """
+    block = _child_pill_block()
+    harness = _PRELUDE_JS + CHILD_PILL_STUBS + f"""
 const out = [];
 for (const s of {json.dumps(rows)}) {{
   const titleRow = new FakeEl('span');
   {block}
-  out.push(titleRow.children.map(c => ({{
-    className: c.className,
-    textContent: c.textContent,
-    title: c.title,
-  }})));
-}}
+{_COLLECT_JS}}}
 console.log(JSON.stringify(out));
 """
     proc = subprocess.run(
@@ -159,6 +220,96 @@ def test_predicate_rejects_non_numeric_counts():
         ]
     )
     assert out == [[], []], out
+
+
+# ── child pill: the visible number is live ──────────────────────────────────
+
+
+def _three_children(**extra):
+    row = {
+        "session_id": "p",
+        "_child_session_count": 3,
+        "_child_sessions": [
+            {"session_id": "k1"},
+            {"session_id": "k2"},
+            {"session_id": "k3"},
+        ],
+    }
+    row.update(extra)
+    return row
+
+
+def test_three_finished_children_paint_no_number():
+    """The card's case: subagents that finished days ago must not read "3".
+
+    The pill survives as the expander for the nested children — it just carries
+    no number, so the row never claims work that is not running. The historical
+    total is only in the tooltip.
+    """
+    out = _run_child_pill([_three_children()])
+    assert len(out[0]) == 1, out
+    pill = out[0][0]
+    assert pill["className"] == "session-child-count", pill
+    assert "is-live" not in pill["className"], pill
+    assert not any(ch.isdigit() for ch in pill["textContent"]), pill
+    assert "3" not in pill["textContent"], pill
+    assert pill["textContent"] == "›", pill
+    # The count is not lost — it moved to the tooltip, which costs nothing.
+    assert "3" in pill["title"], pill
+
+
+def test_two_finished_one_running_reads_one_live():
+    out = _run_child_pill([_three_children(_live_subagent_count=1)])
+    assert len(out[0]) == 1, out
+    pill = out[0][0]
+    assert pill["className"] == "session-child-count is-live", pill
+    assert pill["textContent"] == "1 live", pill
+    # Historical total stays available but must not be the painted number.
+    assert "3" not in pill["textContent"], pill
+    assert "3" in pill["title"], pill
+    assert "Subagents running now" in pill["title"], pill
+
+
+def test_pill_never_paints_zero():
+    """No live child means no badge at all — never "0 live"."""
+    for extra in ({"_live_subagent_count": 0}, {}):
+        out = _run_child_pill([_three_children(**extra)])
+        assert "0" not in out[0][0]["textContent"], (extra, out)
+        assert "live" not in out[0][0]["textContent"], (extra, out)
+
+
+def test_pill_number_follows_the_live_map_between_renders():
+    """A child that goes idle past the threshold drops out of the number.
+
+    `_applyLiveSubagentCounts` replaces the count wholesale, so the same row
+    reads "2 live" while the map holds it and loses the number once the child
+    stops being live — no page reload, no stale count.
+    """
+    row = _three_children()
+    live = _run_apply([dict(row)], {"p": 2})[0]
+    assert live["_live_subagent_count"] == 2
+    assert _run_child_pill([live])[0][0]["textContent"] == "2 live"
+
+    idle = _run_apply([dict(live)], {})[0]
+    assert "_live_subagent_count" not in idle
+    pill = _run_child_pill([idle])[0][0]
+    assert pill["textContent"] == "›", pill
+    assert "is-live" not in pill["className"], pill
+
+
+def test_standalone_live_badge_is_not_doubled_on_a_child_row():
+    """Both markers carry the same number; a row must paint it once."""
+    out = _run_child_pill([_three_children(_live_subagent_count=2)])
+    live_markers = [
+        c for c in out[0]
+        if "session-live-subagents-badge" in c["className"]
+        or "is-live" in c["className"]
+    ]
+    assert len(live_markers) == 1, out
+
+
+def test_pill_is_not_drawn_when_there_are_no_children():
+    assert _run_child_pill([{"session_id": "solo"}]) == [[]]
 
 
 # ── decoration loop ─────────────────────────────────────────────────────────
@@ -468,3 +619,68 @@ def test_liveness_predicate_is_the_runner_lifecycle():
     assert "s.source = 'subagent'" in body
     assert "s.ended_at IS NULL" in body
     assert "s.parent_session_id" in body
+
+
+# ── the movement clock behind the number ────────────────────────────────────
+
+_STATE_DB_SCHEMA = """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0
+);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT,
+    content TEXT,
+    timestamp REAL NOT NULL
+);
+"""
+
+
+def test_a_child_idle_past_the_threshold_leaves_the_count(tmp_path, monkeypatch):
+    """Liveness is movement, not the row's existence.
+
+    A subagent row the runner never closed (`ended_at IS NULL`, a crash) must
+    stop reading "live" once it has been silent past the grace window, and must
+    come back if it moves again — that is the motion the badge mirrors.
+    """
+    routes = _routes_module()
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_STATE_DB_SCHEMA)
+    now = time.time()
+    con.execute(
+        "INSERT INTO sessions (id, source, parent_session_id, started_at, ended_at)"
+        " VALUES (?,?,?,?,?)",
+        ("child-1", "subagent", "parent-q", now - 90 * 60, None),
+    )
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+        ("child-1", "assistant", "step", now - 5 * 60),
+    )
+    con.commit()
+    assert routes._live_subagent_counts(now, db) == {"parent-q": 1}
+
+    # Silent for longer than the window: no longer live.
+    stale = now - (routes._LIVE_SUBAGENTS_GRACE_SECONDS + 60)
+    con.execute("UPDATE messages SET timestamp=? WHERE session_id='child-1'", (stale,))
+    con.commit()
+    con.close()
+    assert routes._live_subagent_counts(now, db) == {}
+
+
+def test_the_badge_clock_covers_a_real_model_call():
+    """The window must clear a long tool call, not just a fast one.
+
+    A 2.5-minute movement clock (the HUD chip's) paints a running child as idle
+    during one slow model call; this badge is the sidebar's own long-run tail,
+    so its window stays in minutes-to-half-hour territory.
+    """
+    routes = _routes_module()
+    assert routes._LIVE_SUBAGENTS_GRACE_SECONDS >= 20 * 60

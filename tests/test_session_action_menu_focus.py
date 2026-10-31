@@ -970,7 +970,6 @@ def _explicit_child_count_script() -> str:
                   pickerTeardownCleared: _projectPickerTeardown === null,
                   flagCleared: _sessionListRepaintDeferredByPicker === false,
                   expanded: _expandedChildSessionKeys.has('lineage-parent'),
-                  controlLabel: document.querySelector('.session-child-count').textContent,
                 },
               };
             };
@@ -1007,7 +1006,6 @@ def test_child_count_toggle_retires_picker_and_expands_in_browser(width, height)
             "pickerTeardownCleared": True,
             "flagCleared": True,
             "expanded": True,
-            "controlLabel": "session_meta_children:20",
         },
     }
 
