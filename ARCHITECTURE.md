@@ -2181,3 +2181,30 @@ an existing workspace. Strict: path must be under home, in the saved workspace l
 
 The distinction matters because add uses permissive validation to avoid the circular
 dependency: you cannot get a path into the saved list if you need the saved list to add it.
+
+### Recovering a session whose workspace was deleted
+
+A session sidecar can outlive the directory it names (a pruned worktree, a removed
+checkout). `resolve_implicit_workspace_with_recovery(candidate, get_last_workspace)`
+recovers only a *genuinely missing local* path, by falling back to `last_workspace`
+(or the profile default) and re-resolving it through `resolve_trusted_workspace`.
+Untrusted, remote-backend and non-directory candidates keep their original
+validation error, so recovery never widens the trust boundary.
+
+Two entry points use it, and both repair the sidecar with
+`persist_recovered_workspace_binding` (compare-and-replace, never resurrects a
+deleted session):
+
+- the **implicit** workspace (no `workspace` in the request) — `/api/chat/start`,
+  `start_session_turn`, `/api/list`;
+- the **echoed** workspace: the browser posts `workspace: S.session.workspace` on
+  every send, so an explicit value that names the same directory as the session's
+  stored binding is the sidecar echoed back, not a fresh choice, and is recovered
+  the same way. An explicit value that differs from the stored binding stays
+  strict — picking a non-existent directory for this turn is a real error (400).
+
+A recovery is never silent: `/api/chat/start` answers `workspace` (the new
+binding), `workspace_recovered: true` and `workspace_recovered_from` (the value
+that was replaced), the same field shape `/api/list` returns for the Files pane.
+The browser adopts the new root and shows the `workspace_recovered_notice` toast;
+without that it would re-post the deleted path on the next send.
