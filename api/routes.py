@@ -29903,6 +29903,7 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, str(e), 500)
         except ValueError as e:
             return bad(handler, str(e))
+        workspace_recovered_from = getattr(workspace, "recovered_from", None)
         requested_model = body.get("model") or s.model
         requested_provider = (
             body.get("model_provider")
@@ -30077,6 +30078,16 @@ def _handle_chat_start(handler, body, diag=None):
             restore_err = _restore_cleared_recovery()
             if restore_err is not None:
                 return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
+        if workspace_recovered_from is not None and status < 400:
+            # A recovered workspace is never silent. The browser holds
+            # ``S.session.workspace`` in memory and posts it on the next send,
+            # so it has to learn the new binding here or its next message would
+            # look like an explicit pick of the deleted path. Same field shape
+            # ``/api/list`` uses for the Files pane (``workspace_recovered`` +
+            # ``workspace``); ``workspace_recovered_from`` names what was lost.
+            response["workspace"] = str(workspace)
+            response["workspace_recovered"] = True
+            response["workspace_recovered_from"] = workspace_recovered_from
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
     finally:
@@ -30086,34 +30097,115 @@ def _handle_chat_start(handler, body, diag=None):
 
 
 def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
-    """Recover stale implicit session workspaces without hiding explicit errors."""
+    """Recover stale session workspaces without hiding untrusted-path errors.
+
+    Returns the workspace, carrying ``recovered_from`` when the stored binding
+    had to be replaced (see :func:`_resolve_chat_workspace_with_fallback`).
+    """
+    workspace, recovered_from = _resolve_chat_workspace_with_fallback(
+        s, requested_workspace
+    )
+    if recovered_from is None:
+        return workspace
+    recovered = _RecoveredWorkspace(workspace)
+    recovered.recovered_from = recovered_from
+    return recovered
+
+
+class _RecoveredWorkspace(str):
+    """A resolved workspace that remembers the value it replaced.
+
+    A ``str`` subclass so every existing caller — and every test double that
+    returns the workspace as a plain string — keeps working; ``recovered_from``
+    is only read to report the recovery to the client.
+    """
+
+    recovered_from: str
+
+
+def _same_workspace_binding(left, right) -> bool:
+    """Return True when two workspace values name the same directory.
+
+    Used to tell the browser echoing the session's own stored workspace apart
+    from a workspace the user picked for this turn. Raw string equality is not
+    enough: the browser round-trips whatever the sidecar held (``~`` unexpanded,
+    duplicate separators, a different symlink spelling).
+    """
+    if left in (None, "") or right in (None, ""):
+        return False
+    if str(left) == str(right):
+        return True
+    try:
+        return os.path.realpath(os.path.expanduser(str(left))) == os.path.realpath(
+            os.path.expanduser(str(right))
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _resolve_strict_workspace(requested_workspace, profile):
+    """Resolve an explicitly requested workspace through the trust gate."""
+    try:
+        return str(resolve_trusted_workspace(requested_workspace, profile=profile))
+    except TypeError:
+        return str(resolve_trusted_workspace(requested_workspace))
+
+
+def _resolve_chat_workspace_with_fallback(s, requested_workspace):
+    """Resolve the chat workspace, returning ``(workspace, recovered_from)``.
+
+    *recovered_from* is ``None`` when nothing was recovered, otherwise the value
+    the new binding replaced.
+
+    The browser posts ``workspace: S.session.workspace`` on every send, so an
+    explicit value that equals the session's own stored binding is not a fresh
+    choice — it is the sidecar echoed back. When that path was deleted (a pruned
+    worktree, a removed checkout) the session used to be unresumable: the
+    resolver raised and ``/api/chat/start`` answered 400 forever. Such an echo
+    now recovers through the same last-workspace/default path the implicit
+    branch has always used, and the new binding is persisted so the repair
+    survives a reload.
+
+    A value that differs from the stored binding stays strict: a user picking a
+    non-existent directory for this turn is a real error, not a stale sidecar.
+    Untrusted, remote and non-directory paths stay strict in both branches —
+    ``resolve_implicit_workspace_with_recovery`` only recovers a genuinely
+    missing local path, so recovery cannot widen the trust boundary.
+
+    An echoed value is resolved strictly *first*: recovery is the fallback for a
+    rejected binding, never a second gate in front of the normal resolver, so a
+    still-usable workspace takes the unchanged path (and callers that stub that
+    resolver keep seeing it called).
+    """
     _session_profile = getattr(s, "profile", None)
+    stored_workspace = getattr(s, "workspace", None)
     explicit = requested_workspace not in (None, "")
     if explicit:
         try:
-            return str(resolve_trusted_workspace(requested_workspace, profile=_session_profile))
-        except TypeError:
-            return str(resolve_trusted_workspace(requested_workspace))
-    stored_workspace = getattr(s, "workspace", None)
+            return _resolve_strict_workspace(requested_workspace, _session_profile), None
+        except ValueError:
+            if not _same_workspace_binding(requested_workspace, stored_workspace):
+                raise
+    candidate = requested_workspace if explicit else stored_workspace
     try:
         workspace, recovered = resolve_implicit_workspace_with_recovery(
-            stored_workspace,
+            candidate,
             get_last_workspace,
             profile=_session_profile,
         )
     except TypeError:
         workspace, recovered = resolve_implicit_workspace_with_recovery(
-            stored_workspace,
+            candidate,
             get_last_workspace,
         )
     if not recovered:
-        return str(workspace)
+        return str(workspace), None
     persisted = persist_recovered_workspace_binding(
         s,
         workspace,
         expected_workspace=stored_workspace,
     )
-    return str(persisted.workspace)
+    return str(persisted.workspace), str(candidate)
 
 
 def _resolve_chat_workspace_for_regeneration(s, requested_workspace) -> str:
