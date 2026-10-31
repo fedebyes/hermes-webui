@@ -10140,7 +10140,6 @@ function _scopedSidebarReferenceRows(isCli, projectIdFor){
   });
 }
 
- HEAD
 function _applyLiveSubagentCounts(rows){
   // Live subagent counts are a point-in-time map, not row state: they come
   // from GET /api/subagents/live and are re-applied on every render so a count
