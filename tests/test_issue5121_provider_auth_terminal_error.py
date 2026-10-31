@@ -762,7 +762,17 @@ def test_stale_partial_with_unfinished_tool_call_still_reports_no_response(tmp_p
     assert saved.messages[-1]["_error"] is True
 
 
-def test_stale_partial_repeated_prompt_replay_still_reports_no_response(tmp_path, monkeypatch):
+def test_stale_partial_repeated_prompt_replay_settles_delivered_text(tmp_path, monkeypatch):
+    """#14070: delivered text IS the answer, even on a repeated prompt.
+
+    The old expectation here was a ``no_response`` card. That card claims the
+    provider returned nothing, which is false once the stream delivered text:
+    the user read it, and the only real defect is the result payload losing the
+    final row. The guarantee this test still owes is that the *prior* turn's
+    answer for the same prompt is never presented as this turn's reply — the
+    settled row must be the streamed text, not ``Old answer``.
+    """
+
     session = _prepare_session(
         "repeated_prompt_replay_stale_partial",
         "stream_repeated_prompt_replay_stale_partial",
@@ -797,10 +807,12 @@ def test_stale_partial_repeated_prompt_replay_still_reports_no_response(tmp_path
 
     events = _queue_events(fake_queue)
     apperrors = [data for event, data in events if event == "apperror"]
-    assert apperrors, "expected apperror for repeated-prompt stale replay"
-    assert apperrors[-1]["type"] == "no_response"
-    assert not any(event == "done" for event, _ in events)
-    assert saved.messages[-1]["_error"] is True
+    assert not apperrors, "delivered text must not report a provider failure"
+    assert any(event == "done" for event, _ in events)
+    assert not any(msg.get("_error") for msg in saved.messages)
+    assistant_rows = [msg for msg in saved.messages if msg.get("role") == "assistant"]
+    assert assistant_rows[-1]["content"] == "Partial text before stale replay"
+    assert any(msg.get("content") == "Old answer" for msg in assistant_rows)
 
 
 def test_hard_failure_with_completed_answer_still_reports_no_response(tmp_path, monkeypatch):
