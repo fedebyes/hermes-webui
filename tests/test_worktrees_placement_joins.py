@@ -203,6 +203,19 @@ def test_refused_move_reports_the_move_error_not_the_classifier_token(tmp_path):
 # ── unknown lock state never authorises an unlock ───────────────────────────
 
 
+def _unlock_or_move_attempts(log: Path) -> list[str]:
+    """The git invocations that could have moved or unlocked the tree.
+
+    Empty is the point: on an uninspectable lock the module refuses *before*
+    touching the tree, so the lock it could not read is never at risk.
+    """
+    return [
+        line
+        for line in wt.git_argv_since(log, 0)
+        if line.startswith("worktree unlock ") or line.startswith("worktree move ")
+    ]
+
+
 def test_unknown_admin_dir_query_refuses_the_move_before_unlocking(tmp_path, monkeypatch):
     """An inspection failure is not "no lock": "there is no lock" and "I could
     not read the lock" are different facts, and only the first one authorises
@@ -217,7 +230,7 @@ def test_unknown_admin_dir_query_refuses_the_move_before_unlocking(tmp_path, mon
     created = wt.linked_worktree(primary, tmp_path / "created", branch="hermes-unknown")
     wt.git(primary, "worktree", "lock", "--reason", wt.LOCK_REASON, str(created))
 
-    wt.git_argv_log(tmp_path, monkeypatch, fail_on=("--git-dir",))
+    log = wt.git_argv_log(tmp_path, monkeypatch, fail_on=("--git-dir",))
 
     destination, reason = relocate_worktree(created, primary)
 
@@ -227,28 +240,44 @@ def test_unknown_admin_dir_query_refuses_the_move_before_unlocking(tmp_path, mon
     assert created.is_dir()
     assert not (primary / ".worktrees" / "created").exists()
     assert _lock_reason(primary, created) == wt.LOCK_REASON
+    # ...and git was never even asked to unlock or move the tree.
+    assert _unlock_or_move_attempts(log) == []
 
 
-def test_unreadable_lock_file_refuses_the_move_before_unlocking(tmp_path):
+@pytest.mark.skipif(
+    os.geteuid() == 0 or os.name == "nt",
+    reason="needs a non-root POSIX user: root reads straight through a 000 mode",
+)
+def test_unreadable_lock_file_refuses_the_move_before_unlocking(tmp_path, monkeypatch):
     """A lock file that exists but cannot be read is ``unknown``, not
-    ``unlocked``: the tree keeps its place and its admin dir keeps the lock it
-    still has, instead of being unlocked on the strength of a failed read."""
+    ``unlocked``: read permission is not permission to unlink, so the tree keeps
+    its place and its lock instead of being unlocked on a failed read.
+
+    Only the lock-file *read* is faulted (mode 000); git itself stays fully
+    functional, so the refusal is the module's own decision — and the argv log
+    proves git was never asked to unlock or move the tree.
+    """
     primary = wt.init_repo(tmp_path / "primary")
     created = wt.linked_worktree(primary, tmp_path / "created", branch="hermes-unreadable")
     admin = Path(
         wt.git(created, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
     )
     wt.git(primary, "worktree", "lock", "--reason", wt.LOCK_REASON, str(created))
-    (admin / "locked").unlink()
-    (admin / "locked").mkdir()  # a read of a directory is an OSError, not ENOENT
-
-    destination, reason = relocate_worktree(created, primary)
+    locked = admin / "locked"
+    locked.chmod(0o000)
+    log = wt.git_argv_log(tmp_path, monkeypatch)
+    try:
+        destination, reason = relocate_worktree(created, primary)
+    finally:
+        locked.chmod(0o644)
 
     assert destination is None
     assert reason and "lock state could not be inspected" in reason
     assert created.is_dir()
     assert not (primary / ".worktrees" / "created").exists()
-    assert (admin / "locked").is_dir()
+    # The admin dir still holds the owner's reason, byte for byte.
+    assert locked.read_text(encoding="utf-8").strip() == wt.LOCK_REASON
+    assert _unlock_or_move_attempts(log) == []
 
 
 def test_genuinely_unlocked_tree_moves_and_stays_unlocked(tmp_path):
