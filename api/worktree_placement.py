@@ -232,37 +232,67 @@ def _git_error(result: subprocess.CompletedProcess) -> str:
     return f"git exited {result.returncode}"
 
 
-def _lock_reason(path: Path, cwd: Path) -> str | None:
-    """The tree's own lock reason, verbatim; ``None`` when it carries none.
+#: A tree's lock as read before the move. ``locked`` means a lock file exists
+#: (its reason may be empty), ``unlocked`` that the admin dir was read and
+#: carries no lock file, ``unknown`` that neither fact could be established.
+LOCK_LOCKED = "locked"
+LOCK_UNLOCKED = "unlocked"
+LOCK_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class LockState:
+    """What the tree's lock looked like *before* the move.
+
+    ``unknown`` is a third outcome on purpose: "there is no lock" and "I could
+    not tell whether there is a lock" are different facts, and only the first
+    one authorises ``git worktree unlock``. Unlocking a tree whose native
+    ``hermes pid=<pid>`` lock merely could not be read would silently drop the
+    owner's protection for a later maintenance sweep.
+    """
+
+    state: str
+    reason: str | None = None
+
+
+def _lock_state(path: Path, cwd: Path) -> LockState:
+    """The tree's own lock, verbatim; ``unknown`` when it cannot be inspected.
 
     The Agent locks every tree it creates with ``hermes pid=<pid>`` (or
     ``hermes session=<id> db=<state.db>``), and only that shape is recognised by
     its stale-owner classifier — any other text under a ``hermes`` prefix is
     kept as live forever. So the reason is read *before* the move and re-applied
     byte for byte afterwards: a relocated tree must stay exactly as ownable as
-    the tree the Agent produced.  Read from the admin dir git reports inside the
-    tree, so a bare lock (empty reason) and an unreadable admin dir (``None``,
-    no lock re-applied) both stay fail-soft.
+    the tree the Agent produced. Read from the admin dir git reports inside the
+    tree, so a bare lock is re-applied as a bare lock.
+
+    A failed admin-dir query, a missing admin dir, a timeout or an unreadable
+    lock file is ``unknown`` — never ``unlocked``: read permission is not
+    permission to unlink, and the caller refuses to unlock on ``unknown``.
     """
     try:
         result = _run_git(["rev-parse", "--path-format=absolute", "--git-dir"], path)
         if result.returncode != 0:
             result = _run_git(["rev-parse", "--git-dir"], path)
             raw = (result.stdout or "").strip() if result.returncode == 0 else ""
-            if not raw:
-                return None
-            admin = Path(raw)
-            if not admin.is_absolute():
-                admin = path / admin
         else:
             raw = (result.stdout or "").strip()
-            if not raw:
-                return None
-            admin = Path(raw)
-        locked = admin / "locked"
-        return locked.read_text(encoding="utf-8", errors="replace").strip(" \t\n\r\v\f")
+        if not raw:
+            return LockState(LOCK_UNKNOWN)
+        admin = Path(raw)
+        if not admin.is_absolute():
+            admin = path / admin
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+        return LockState(LOCK_UNKNOWN)
+    if not admin.is_dir():
+        return LockState(LOCK_UNKNOWN)
+    try:
+        content = (admin / "locked").read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return LockState(LOCK_UNLOCKED)
+    except (OSError, ValueError):
+        return LockState(LOCK_UNKNOWN)
+    return LockState(LOCK_LOCKED, content.strip(" \t\n\r\v\f"))
 
 
 def _relock(path: Path, cwd: Path, reason: str | None) -> None:
@@ -307,7 +337,13 @@ def relocate_worktree(created: Path, primary: Path) -> tuple[Path | None, str | 
     # The ownership reason travels with the tree: the Agent's classifier only
     # accepts ``hermes pid=<pid>`` / ``hermes session=<id>``, so anything this
     # module writes instead would make the tree permanently un-reapable.
-    reason = _lock_reason(created, primary)
+    lock = _lock_state(created, primary)
+    if lock.state == LOCK_UNKNOWN:
+        # Neither "locked" nor "unlocked" was established. Unlocking could drop
+        # a live owner's lock, so the tree is left exactly where the Agent
+        # created it, lock intact, and the refusal is reported as a move error.
+        return None, f"lock state could not be inspected for {created}"
+    reason = lock.reason if lock.state == LOCK_LOCKED else None
     try:
         _run_git(["worktree", "unlock", str(created)], primary)
         result = _run_git(

@@ -18,6 +18,7 @@ no Agent is installed).
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from api.worktree_placement import (
     PLACEMENT_MAIN,
     PLACEMENT_MOVE_FAILED,
     primary_worktree,
+    relocate_worktree,
 )
 from api.worktrees import create_worktree_for_workspace
 from tests import _worktree_git as wt
@@ -196,3 +198,94 @@ def test_refused_move_reports_the_move_error_not_the_classifier_token(tmp_path):
     assert info["placement"] == PLACEMENT_MOVE_FAILED
     assert re.search(r"destination exists", info["placement_reason"])
     assert info["placement_reason"] != "registry"
+
+
+# ── unknown lock state never authorises an unlock ───────────────────────────
+
+
+def test_unknown_admin_dir_query_refuses_the_move_before_unlocking(tmp_path, monkeypatch):
+    """An inspection failure is not "no lock": "there is no lock" and "I could
+    not read the lock" are different facts, and only the first one authorises
+    ``git worktree unlock``. A live ``hermes pid=<pid>`` lock must survive a
+    relocation that could not be inspected.
+
+    The fault is injected in the git shim for the admin-dir query only; unlock,
+    move and lock stay real, so the refusal is the module's own decision and not
+    an artefact of a dead git.
+    """
+    primary = wt.init_repo(tmp_path / "primary")
+    created = wt.linked_worktree(primary, tmp_path / "created", branch="hermes-unknown")
+    wt.git(primary, "worktree", "lock", "--reason", wt.LOCK_REASON, str(created))
+
+    wt.git_argv_log(tmp_path, monkeypatch, fail_on=("--git-dir",))
+
+    destination, reason = relocate_worktree(created, primary)
+
+    assert destination is None
+    assert reason and "lock state could not be inspected" in reason
+    # Nothing moved, nothing unlocked: the Agent's ownership lock is intact.
+    assert created.is_dir()
+    assert not (primary / ".worktrees" / "created").exists()
+    assert _lock_reason(primary, created) == wt.LOCK_REASON
+
+
+def test_unreadable_lock_file_refuses_the_move_before_unlocking(tmp_path):
+    """A lock file that exists but cannot be read is ``unknown``, not
+    ``unlocked``: the tree keeps its place and its admin dir keeps the lock it
+    still has, instead of being unlocked on the strength of a failed read."""
+    primary = wt.init_repo(tmp_path / "primary")
+    created = wt.linked_worktree(primary, tmp_path / "created", branch="hermes-unreadable")
+    admin = Path(
+        wt.git(created, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
+    )
+    wt.git(primary, "worktree", "lock", "--reason", wt.LOCK_REASON, str(created))
+    (admin / "locked").unlink()
+    (admin / "locked").mkdir()  # a read of a directory is an OSError, not ENOENT
+
+    destination, reason = relocate_worktree(created, primary)
+
+    assert destination is None
+    assert reason and "lock state could not be inspected" in reason
+    assert created.is_dir()
+    assert not (primary / ".worktrees" / "created").exists()
+    assert (admin / "locked").is_dir()
+
+
+def test_genuinely_unlocked_tree_moves_and_stays_unlocked(tmp_path):
+    """The control: an inspected, genuinely unlocked tree is relocated and no
+    lock is invented — this module only relocates, it never becomes an owner."""
+    primary = wt.init_repo(tmp_path / "primary")
+    created = wt.linked_worktree(primary, tmp_path / "created", branch="hermes-unlocked")
+
+    destination, reason = relocate_worktree(created, primary)
+
+    assert reason is None
+    assert destination == primary.resolve() / ".worktrees" / "created"
+    assert destination.is_dir()
+    assert _lock_reason(primary, destination) is None
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0 or os.name == "nt",
+    reason="needs a non-root POSIX user: root and Windows ignore the destination permissions",
+)
+def test_failed_move_after_unlock_restores_the_lock(tmp_path):
+    """A real failed move *after* the unlock (unwritable landing parent, so git
+    itself fails) must re-apply the tree's own lock where it still stands —
+    otherwise the refused tree would sit unlocked and reapable."""
+    primary = wt.init_repo(tmp_path / "primary")
+    created = wt.linked_worktree(primary, tmp_path / "created", branch="hermes-refused")
+    wt.git(primary, "worktree", "lock", "--reason", wt.LOCK_REASON, str(created))
+    landing = primary / ".worktrees"
+    landing.mkdir()
+    landing.chmod(0o555)
+    try:
+        destination, reason = relocate_worktree(created, primary)
+    finally:
+        landing.chmod(0o755)
+
+    assert destination is None
+    assert reason and "git worktree move failed" in reason
+    assert created.is_dir()
+    assert _lock_reason(primary, created) == wt.LOCK_REASON
+
