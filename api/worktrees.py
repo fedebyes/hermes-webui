@@ -443,6 +443,25 @@ def _ensure_worktrees_ignored(root: Path) -> None:
         logger.debug("could not update %s", path, exc_info=True)
 
 
+def _record_landing_root(root: Path) -> None:
+    """Record *root* as a repo with Hermes-made worktrees (native registry, fail-soft).
+
+    The Agent registers the checkout it ran in; a tree moved under the primary is
+    only discoverable by the maintenance sweep if the *landing* root is registered
+    too — the named sweep enumerates ``<registered root>/.worktrees/``. Uses the
+    installed Agent's own registry contract so one profile's sweep sees the tree.
+    """
+    try:
+        from hermes_cli.worktree_registry import record_worktree_repo
+    except Exception:
+        logger.debug("worktree registry unavailable; landing root not recorded", exc_info=True)
+        return
+    try:
+        record_worktree_repo(str(root))
+    except Exception:
+        logger.debug("could not record landing root %s", root, exc_info=True)
+
+
 def create_worktree_for_workspace(
     workspace: str | Path,
     *,
@@ -488,6 +507,7 @@ def create_worktree_for_workspace(
         created = selected / created
     landing = created
     primary = placement.primary
+    placement_reason = placement.reason
     if primary is None:
         note = PLACEMENT_UNRECORDED
     elif primary == selected:
@@ -503,6 +523,9 @@ def create_worktree_for_workspace(
                 error,
             )
             note = PLACEMENT_MOVE_FAILED
+            # The move error is what actually decided the placement; the
+            # classifier's token would blame the wrong step.
+            placement_reason = error or PLACEMENT_MOVE_FAILED
         else:
             landing = moved
             note = PLACEMENT_MAIN
@@ -513,12 +536,13 @@ def create_worktree_for_workspace(
         else selected
     )
     _ensure_worktrees_ignored(root)
+    _record_landing_root(root)
     return {
         "path": str(_resolve_path(landing) or landing),
         "branch": str(branch),
         "repo_root": str(_resolve_path(root) or root),
         "placement": note,
-        "placement_reason": placement.reason,
+        "placement_reason": placement_reason,
         "created_at": time.time(),
     }
 
