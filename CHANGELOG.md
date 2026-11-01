@@ -77,6 +77,8 @@
 
 ### Fixed
 
+- **The #4856 mobile-transcript guards no longer break when unrelated CSS is added to the mobile stylesheet block.** Both guards looked for the mobile `.messages-inner` rule in a fixed number of characters after the start of the `@media(max-width:640px)` block (8,000 and 12,000). Adding about 1,200 characters of rules earlier in that block made the first one fail although the rule was unchanged. They now read the whole block with a shared scanner (`tests/_css_blocks.py`) that skips braces in comments, strings, escapes and unquoted `url()`, and they still fail if `overflow-x:hidden` returns, `overflow-y:auto` is added, or the rule leaves the mobile block. Test-only; no runtime change. (#8710)
+
 - **The Gateway Status card shows a single separator after "Last active".** Most translations of the label already end in a colon, and the card added another, so it read "Last active: : <date>". The card now keeps the colon the translation chose (a full-width "：" in Chinese, " : " in French) and adds ": " only to a label without one. (#8635, closes #8621, thanks @happy5318)
 
 - **The stable channel keeps v0.52.544's update target when a checkout has no stable release.** Since exp-v0.52.596, a checkout whose tags are all prereleases (for example `v0.22.5+canary.N`) had no release at all on the stable channel, so an Agent update could apply `origin/main` and a WebUI check could treat the branch tip as the target. The prerelease filter now applies only when the repository has at least one stable release tag, and each check or apply reads the tag list once and uses that one snapshot throughout. (#8686, fixes #8684)
