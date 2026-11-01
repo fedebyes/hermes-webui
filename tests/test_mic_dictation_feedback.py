@@ -116,8 +116,10 @@ def test_a_failed_or_stuck_request_can_never_stay_transcribing():
     assert transcribe.count("_micPaint('failed',0,_MIC_FAILED_MS)") == 2, (
         "both the browser-fallback and the hard-failure exits must settle the strip"
     )
-    # A frozen page (bfcache) cannot keep a capture alive either.
-    assert "addEventListener('pageshow'" in readout
+    # A frozen page (bfcache) cannot keep a capture alive either: the readout
+    # exposes a reset hook and the single boot-level pageshow handler calls it.
+    assert "window._micResetOnRestore=" in readout
+    assert "window._micResetOnRestore === 'function'" in BOOT_JS
 
 
 # --- the CSS carries the state, with theme tokens ---------------------------

@@ -1286,8 +1286,10 @@ function _micToastKeyForRecognitionError(error){
   const micTimerEl=status?status.querySelector('.mic-timer'):null;
   const micLevelEl=status?status.querySelector('.mic-level'):null;
   // A frozen page (bfcache) cannot keep a capture or a request alive, so a
-  // restored document must not show a readout that stopped ticking.
-  window.addEventListener('pageshow',e=>{ if(e&&e.persisted){ _micPaint(null); _micStopMeter(); } });
+  // restored document must not show a readout that stopped ticking. The
+  // boot-level pageshow handler (#822/#1045) owns the bfcache restore and calls
+  // this hook, so boot.js keeps exactly one pageshow listener.
+  window._micResetOnRestore=()=>{ try{ _micPaint(null); _micStopMeter(); }catch(_){} };
 
   let _micElapsedTimer=null;
   let _micStateTimer=null;
@@ -4949,6 +4951,10 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
 // chrome aren't left in the stale bfcache snapshot.
 window.addEventListener('pageshow', async (event) => {
   if (!event.persisted) return;  // fresh loads are handled by the IIFE above
+  // Drop a dictation readout that froze with the page. The mic setup lives in
+  // its own IIFE and exposes the reset, so this handler stays the only owner
+  // of the bfcache restore.
+  if (typeof window._micResetOnRestore === 'function') { try { window._micResetOnRestore(); } catch (_) {} }
   _syncKeyboardBottomInset();
   const _srch = document.getElementById('sessionSearch');
   if (_srch) _srch.value = '';
