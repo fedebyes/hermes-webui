@@ -64,7 +64,8 @@ globalThis.localStorage = {
 };
 const els = {};
 function mk(id){ if(!els[id]) els[id] = {id: id, checked: false, hidden: true}; return els[id]; }
-globalThis.$ = (id) => (id === 'settingsMicAutoStop' || id === 'settingsMicAutoStopNote') ? mk(id) : null;
+globalThis.$ = (id) => (id === 'settingsMicAutoStop' || id === 'settingsMicAutoStopNote'
+  || id === 'settingsMicAutoStopNoteSavedOn' || id === 'settingsMicAutoStopNoteSavedOff') ? mk(id) : null;
 let saves = 0;
 const changed = [];
 globalThis._speechBool = () => __SERVER_VALUE__;
@@ -75,6 +76,8 @@ globalThis._settingsSpeechUnappliedKeys = new Set();
 globalThis._schedulePreferencesAutosave = () => { saves += 1; };
 
 __MIC_PREDICATE__
+
+__MIC_NOTE__
 
 __MIC_BLOCK__
 
@@ -89,6 +92,9 @@ function snap(){
     checkbox: cb.checked,
     effective: _micAutoStopEnabled(),
     note: note.hidden === false,
+    // Which direction the note describes: exactly one wording at a time.
+    noteSavedOn: mk('settingsMicAutoStopNoteSavedOn').hidden === false,
+    noteSavedOff: mk('settingsMicAutoStopNoteSavedOff').hidden === false,
     saves: saves,
     stored: (KEY in store) ? store[KEY] : null,
     changed: changed.length,
@@ -106,6 +112,13 @@ failWrites = false;
 click(true);  out.onAgain = snap();
 failWrites = true;
 click(false); out.offRefusedTwice = snap();
+// ...and the mirror: the switch turned ON is refused too.
+failWrites = false;
+click(false); out.offWritableAgain = snap();
+const savesBeforeOnRefusal = saves;
+failWrites = true;
+click(true); out.onRefused = snap();
+out.savesBeforeOnRefusal = savesBeforeOnRefusal;
 console.log(JSON.stringify(out));
 """
 
@@ -118,6 +131,7 @@ def _run(fail_init=False, server_value=False, cache=None):
         .replace("__SEED_CACHE__", seed)
         .replace("__SERVER_VALUE__", "true" if server_value else "false")
         .replace("__MIC_PREDICATE__", _extract_function(BOOT_JS, "_micAutoStopEnabled"))
+        .replace("__MIC_NOTE__", _extract_function(PANELS_JS, "_setMicAutoStopStorageNote"))
         .replace("__MIC_BLOCK__", _extract_mic_autostop_block(PANELS_JS))
     )
     proc = subprocess.run(
@@ -149,6 +163,8 @@ def test_absent_preference_is_off_and_unsaved(runs):
         "checkbox": False,
         "effective": False,
         "note": False,
+        "noteSavedOn": False,
+        "noteSavedOff": False,
         "saves": 0,
         "stored": "false",
         "changed": 0,
@@ -225,6 +241,41 @@ def test_refused_hydration_is_visible_and_schedules_nothing():
         assert snap["changed"] == 0
 
 
+def test_each_storage_note_names_its_own_direction():
+    # "You turned it on, but this browser can't store the setting, so auto-stop
+    # stays off here" — the direction the user asked for AND the value in force,
+    # so the sentence is true for the direction that was detected instead of a
+    # generic "not changed". It must not claim a save: nothing is persisted.
+    saved_on = _run_init(fail_init=True, server_value=True, cache=None)
+    assert saved_on["note"] is True
+    assert (saved_on["noteSavedOn"], saved_on["noteSavedOff"]) == (True, False)
+
+    saved_off = _run_init(fail_init=True, server_value=False, cache="true")
+    assert saved_off["note"] is True
+    assert (saved_off["noteSavedOn"], saved_off["noteSavedOff"]) == (False, True)
+
+    # A refused toggle is the mirror case: wanted off, stays on.
+    refused = _run()["offRefused"]
+    assert refused["note"] is True
+    assert (refused["noteSavedOn"], refused["noteSavedOff"]) == (False, True)
+
+    # ... and wanted on, stays off: the handler returns before the autosave, so
+    # the note that used to read "Saved as on" described a write that never ran.
+    refused_on_run = _run()
+    refused_on = refused_on_run["onRefused"]
+    assert refused_on["note"] is True
+    assert (refused_on["noteSavedOn"], refused_on["noteSavedOff"]) == (True, False)
+    assert refused_on["checkbox"] is refused_on["effective"] is False
+    assert refused_on["saves"] == refused_on_run["savesBeforeOnRefusal"], (
+        "the refused write must not schedule a save"
+    )
+
+    # With storage working there is nothing to say.
+    writable = _run_init(server_value=True, cache=None)
+    assert writable["note"] is False
+    assert (writable["noteSavedOn"], writable["noteSavedOff"]) == (False, False)
+
+
 # ── refused hydration must not leak into an unrelated settings save ──────────
 #
 # The same refused seed leaves the checkbox showing the value the METER reads
@@ -251,12 +302,15 @@ globalThis.localStorage = {
 };
 const els = {};
 function mk(id){ if(!els[id]) els[id] = {id: id, checked: false, hidden: true}; return els[id]; }
-globalThis.$ = (id) => (id === 'settingsMicAutoStop' || id === 'settingsMicAutoStopNote') ? mk(id) : null;
+globalThis.$ = (id) => (id === 'settingsMicAutoStop' || id === 'settingsMicAutoStopNote'
+  || id === 'settingsMicAutoStopNoteSavedOn' || id === 'settingsMicAutoStopNoteSavedOff') ? mk(id) : null;
 let saves = 0;
 globalThis._schedulePreferencesAutosave = () => { saves += 1; };
 globalThis._speechBool = () => __SERVER_VALUE__;
 
 __MIC_PREDICATE__
+
+__MIC_NOTE__
 
 __SPEECH_RUNTIME__
 
@@ -307,6 +361,7 @@ def _run_unrelated_save(fail_init=False, server_value=False, cache=None, toggle=
         .replace("__TOGGLE__", "true" if toggle else "false")
         .replace("__MIC_PREDICATE__", _extract_function(BOOT_JS, "_micAutoStopEnabled"))
         .replace("__SPEECH_RUNTIME__", _extract_speech_payload_runtime(PANELS_JS))
+        .replace("__MIC_NOTE__", _extract_function(PANELS_JS, "_setMicAutoStopStorageNote"))
         .replace("__MIC_BLOCK__", _extract_mic_autostop_block(PANELS_JS))
     )
     proc = subprocess.run(

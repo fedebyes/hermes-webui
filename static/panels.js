@@ -9368,6 +9368,25 @@ function _setOwnedSpeechPayload(payload,settingKey,value){
   if(_speechPreferenceIsOwned(settingKey)) payload[settingKey]=value;
 }
 
+// The storage note has one wording per direction — "you turned it on, but it
+// cannot be stored here" and the mirror. A single "this preference was not
+// changed" line described neither case, and it was shown inside the panel
+// before the user had touched anything. `wantedOn` is the direction the user
+// asked for (the durable preference at hydration, the switch they flipped on a
+// refused toggle), `effectiveOn` the value the meter will actually honour; only
+// a disagreement is worth a note. Neither toggle nor hydration persists
+// anything in the blocked case, so the wording must not claim a save.
+function _setMicAutoStopStorageNote(wantedOn,effectiveOn){
+  const note=$('settingsMicAutoStopNote');
+  if(!note) return;
+  const blocked=!!wantedOn!==!!effectiveOn;
+  note.hidden=!blocked;
+  const wantedOnEl=$('settingsMicAutoStopNoteSavedOn');
+  const wantedOffEl=$('settingsMicAutoStopNoteSavedOff');
+  if(wantedOnEl) wantedOnEl.hidden=!(blocked&&wantedOn);
+  if(wantedOffEl) wantedOffEl.hidden=!(blocked&&!wantedOn);
+}
+
 function _preferencesPayloadFromUi(){
   const payload={};
   const sendKeySel=$('settingsSendKey');
@@ -10313,11 +10332,10 @@ async function loadSettingsPanel(){
       let micSeedApplied=true;
       try{_syncSpeechPreferenceCache('mic_auto_stop',micAutoStop?'true':'false');}
       catch(_){micSeedApplied=false;}
-      const micNote=$('settingsMicAutoStopNote');
       if(!micSeedApplied){
         // Hydration must not display a preference the meter will not honour: when
         // seeding the runtime cache is refused, the checkbox goes back to the
-        // cached value _micAutoStopEnabled() actually reads, and the rejection is
+        // cached value _micAutoStopEnabled() actually reads, and the note is
         // shown instead of waiting for the next toggle to reveal the mismatch.
         // The durable server value and the sparse ownership stay untouched.
         let micCached=null;
@@ -10328,7 +10346,8 @@ async function loadSettingsPanel(){
         // whole-settings save) until a deliberate mic edit lands.
         _settingsSpeechUnappliedKeys.add('mic_auto_stop');
       }
-      if(micNote) micNote.hidden=micSeedApplied;
+      // Say which direction this actually is: what was saved, and what will run.
+      _setMicAutoStopStorageNote(micAutoStop,micAutoStopCb.checked);
       micAutoStopCb.onchange=function(){
         // The runtime cache is the effective value: _micAutoStopEnabled() reads this
         // very key at capture time. A refused write (quota, private mode) must not
@@ -10338,16 +10357,15 @@ async function loadSettingsPanel(){
         let cached=true;
         try{localStorage.setItem('hermes-mic-auto-stop',desired?'true':'false');}
         catch(_){cached=false;}
-        const note=$('settingsMicAutoStopNote');
         if(!cached){
           // Explicit rejection instead of a silently forked control: the box goes
           // back to the value that is actually in force (and stays the one the
           // meter predicate will read).
           this.checked=!desired;
-          if(note) note.hidden=false;
+          _setMicAutoStopStorageNote(desired,this.checked);
           return;
         }
-        if(note) note.hidden=true;
+        _setMicAutoStopStorageNote(desired,desired);
         // A deliberate mic edit that really landed: the checkbox is once again
         // the durable intent, so the field may be serialized again.
         _settingsSpeechUnappliedKeys.delete('mic_auto_stop');

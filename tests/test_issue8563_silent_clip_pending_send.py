@@ -60,10 +60,11 @@ let SpeechRecognition = function () {};
 let recognition = null;
 let _forceMediaRecorder = false;
 let _micTranscribeSeq = 0;
-// `_transcribeBlob` also reads/writes the mic status sequence that the branch
-// added for the dictation feedback states; the driver must provide it.
-let _micStatusSeq = 0;
+// `_transcribeBlob` reads the hold times of the dictation strip outcomes; the
+// driver must provide every constant the shipped function references, or a
+// failure path dies with a ReferenceError that has nothing to do with the fix.
 const _MIC_EMPTY_MS = 2500;
+const _MIC_FAILED_MS = 4000;
 const paints = [];
 function _micPaint(state) { paints.push(state === undefined ? null : state); }
 const _micForceMediaRecorderKey = 'mic_force_mediarecorder';
