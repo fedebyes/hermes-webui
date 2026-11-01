@@ -60,15 +60,24 @@ def test_readout_is_rendered_by_the_strip_not_the_button():
 
 def test_only_the_label_is_announced():
     pill = _pill_markup()
-    assert 'aria-live="polite"' in pill, (
-        "the transcribing / outcome transitions must be announced"
+    # The live region is the LABEL, not the strip: an aria-live region on the
+    # pill re-fires atomically whenever any descendant mutates, and the
+    # aria-hidden timer inside it changes every second — VoiceOver/Safari could
+    # then announce "Listening…" once per second.
+    strip_tag = pill[:pill.index(">") + 1]
+    assert "aria-live" not in strip_tag, (
+        "the live region belongs to the label; the strip holds the ticking timer"
     )
-    assert 'aria-atomic="true"' in pill
+    assert "aria-atomic" not in strip_tag
     # Dot, spinner, timer and bar are decorative duplicates of the label; the
     # timer in particular ticks every second and must stay silent.
     assert pill.count('aria-hidden="true"') == 4
     label = pill[pill.index('class="mic-status-text"'):]
     label = label[:label.index(">")]
+    assert 'aria-live="polite"' in label, (
+        "the transcribing / outcome transitions must be announced"
+    )
+    assert 'aria-atomic="true"' in label
     assert "aria-hidden" not in label, "the label is the announced node"
     # Every painted state writes this node's text, so it must not carry a
     # [data-i18n] key: `applyLocaleToDOM()` re-stamps those nodes on every
@@ -133,6 +142,12 @@ def test_css_renders_all_three_states_on_the_strip():
     assert "@keyframes spin{to{transform:rotate(360deg);}}" in STYLE_CSS
     assert ".mic-status .mic-level-fill{" in STYLE_CSS
     assert "transform:scaleX(var(--mic-level,0))" in STYLE_CSS
+    # The track is ink, not a 25% tint of the state colour: that tint measured
+    # 1.28-1.58:1 against the composer across 21 palettes x light/dark, so a
+    # silent bar disappeared — and with it the "nothing reaches the mic" signal.
+    # 70% of --text measures 3.47:1 worst (catppuccin light) / 9.04:1 best.
+    assert ("background:color-mix(in srgb,var(--text) 70%,transparent)"
+            in STYLE_CSS)
 
 
 def test_state_colours_come_from_theme_tokens():
@@ -381,7 +396,7 @@ const sandbox = {
 sandbox.globalThis = sandbox;
 sandbox.window = sandbox;
 // Exactly the elements the shipped markup publishes for the strip.
-sandbox.status = mkEl({ id: 'micStatus', 'aria-live': 'polite', 'aria-atomic': 'true' });
+sandbox.status = mkEl({ id: 'micStatus' });
 sandbox.micTextEl = mkEl(labelAttrs);
 sandbox.micTimerEl = mkEl({ 'aria-hidden': 'true' });
 sandbox.micLevelEl = mkEl({ 'aria-hidden': 'true' });
@@ -654,7 +669,17 @@ def test_success_commits_and_empty_reports_no_speech(transcribe_runs):
     assert transcribe_runs["emptyCommits"] == ["hi there"], (
         "an empty transcript must not append anything to the composer"
     )
-    assert transcribe_runs["emptyToasts"] == ["mic_no_speech"]
+    # The strip says "No speech detected. Try again." on its own; a toast on
+    # top of it repeated the sentence and covered the header on a phone.
+    assert transcribe_runs["emptyToasts"] == [], (
+        "the empty path must not toast: the strip already carries the outcome"
+    )
+    assert transcribe_runs["http400Toasts"] == ["bad audio"], (
+        "a failure keeps its toast: it carries the server message"
+    )
+    assert transcribe_runs["rejectedToasts"] == ["network down"], (
+        "a rejected request keeps its toast too"
+    )
     assert transcribe_runs["emptyPaints"] == ["think", "empty"], (
         "a successful no-speech response must retire 'think' to the timed "
         "empty outcome, not leave the strip in flight forever"

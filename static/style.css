@@ -2961,13 +2961,18 @@
      4.5:1); the state colour is carried by the dot / spinner / bar. Warning
      and success are mixed 60% toward --text because the raw tokens miss the
      3:1 graphical minimum on the light themes (default light --warning is
-     2.40:1 and --success 3.86:1 against the composer). */
+     2.40:1 and --success 3.86:1 against the composer).
+     The bar's TRACK is ink, not a tint of the state: a 25% tint of --error
+     measured 1.28-1.58:1 against the composer, so the empty bar vanished and
+     with it the "nothing reaches the mic" signal. 70% of --text clears 3:1 in
+     every palette (3.47:1 worst, catppuccin light) and keeps the track
+     distinct from the state-coloured fill. */
   .mic-status{--mic-state:var(--text);font-size:11px;color:var(--text);padding:4px 12px;display:flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums;min-height:19px;}
   .mic-status .mic-dot{display:none;width:6px;height:6px;border-radius:50%;background:var(--mic-state);animation:mic-pulse 1.2s ease-in-out infinite;flex-shrink:0;}
   .mic-status .mic-spinner{display:none;width:9px;height:9px;border-radius:50%;border:1.5px solid var(--mic-state);border-top-color:transparent;animation:spin .8s linear infinite;flex-shrink:0;}
   .mic-status .mic-status-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .mic-status .mic-timer{display:none;margin-left:auto;color:var(--muted);}
-  .mic-status .mic-level{display:none;flex:0 0 auto;width:46px;height:4px;border-radius:2px;overflow:hidden;background:color-mix(in srgb,var(--mic-state) 25%,transparent);}
+  .mic-status .mic-level{display:none;flex:0 0 auto;width:46px;height:4px;border-radius:2px;overflow:hidden;background:color-mix(in srgb,var(--text) 70%,transparent);}
   .mic-status .mic-level-fill{display:block;height:100%;border-radius:2px;background:var(--mic-state);transform:scaleX(var(--mic-level,0));transform-origin:left center;transition:transform .06s linear;}
   .mic-status.is-rec{--mic-state:var(--error);}
   .mic-status.is-rec .mic-dot,.mic-status.is-rec .mic-timer,.mic-status.is-rec .mic-level{display:block;}

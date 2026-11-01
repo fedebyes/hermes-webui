@@ -1573,8 +1573,7 @@ function _micToastKeyForRecognitionError(error){
         // A Send click while recording is an unambiguous send intent (same rule
         // as the raw-audio path): honour it whenever the composer has anything
         // send() would accept (text, staged files or selected context), instead
-        // of dropping the queued send and leaving the draft behind. The
-        // "no speech" toast is only for the case where there is nothing to send.
+        // of dropping the queued send and leaving the draft behind.
         if(window._micPendingSend&&_composerHasContent()){
           _commitTranscript('', prefixSnapshot, ownsButton);
           return;
@@ -1583,9 +1582,10 @@ function _micToastKeyForRecognitionError(error){
         // A 200 with nothing heard is a settlement, not a request still in
         // flight: this exit has to retire 'think' exactly like
         // _commitTranscript's empty case does — the same timed outcome, gated on
-        // ownership so a newer capture keeps its readout.
+        // ownership so a newer capture keeps its readout. The strip's own
+        // "No speech detected. Try again." is the announcement; a toast on top
+        // of it repeated the sentence and covered the header on a phone.
         if(ownsButton()) _micPaint('empty',0,_MIC_EMPTY_MS);
-        showToast(t('mic_no_speech'));
         return;
       }
       _commitTranscript(transcript, prefixSnapshot, ownsButton);
