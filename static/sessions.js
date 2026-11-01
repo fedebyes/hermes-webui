@@ -6,6 +6,8 @@ const ICONS={
   folder:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 4.5h4l1.5 1.5H14v7H2z"/></svg>',
   archive:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1.5" y="2" width="13" height="3" rx="1"/><path d="M2.5 5v8h11V5"/><line x1="6" y1="8.5" x2="10" y2="8.5"/></svg>',
   unarchive:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1.5" y="2" width="13" height="3" rx="1"/><path d="M2.5 5v8h11V5"/><polyline points="6.5,7 8,5.5 9.5,7"/></svg>',
+  markdone:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><polyline points="5.2,8.4 7.1,10.2 10.8,6.2"/></svg>',
+  markundone:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><line x1="5.4" y1="8" x2="10.6" y2="8"/></svg>',
   dup:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="4.5" y="4.5" width="8.5" height="8.5" rx="1.5"/><path d="M3 11.5V3h8.5"/></svg>',
   trash:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M4.5 4.5v8.5h7v-8.5"/><line x1="7" y1="7" x2="7" y2="11"/><line x1="9" y1="7" x2="9" y2="11"/></svg>',
   more:'<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="8" cy="3" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="8" cy="13" r="1.25"/></svg>',
@@ -6837,6 +6839,29 @@ function _playSessionActionMenuEntrance(menu){
   menu.classList.add('open-animated');
 }
 
+// Done / not-done from the sidebar menu. `done_at` is workflow state written by
+// the same endpoint the close and checkmark scripts use, so a menu toggle and a
+// script close are the same fact, not two dialects of it. `archived` is left
+// alone: a done conversation stays in the list with its check.
+async function _setSessionDone(session, done=true){
+  if(_isReadOnlySession(session)){ if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000); return false; }
+  try{
+    const response=await api('/api/session/mark-done',{method:'POST',body:JSON.stringify({session_id:session.session_id,done:!!done})});
+    // Trust the server's stamp (it owns the clock and the sidecar) and fall
+    // back to now only if the payload came back without one.
+    const stamped=response&&response.session?response.session.done_at:null;
+    const doneAt=done?((stamped===null||stamped===undefined)?Date.now()/1000:stamped):null;
+    session.done_at=doneAt;
+    const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
+    if(cached) cached.done_at=doneAt;
+    if(S.session&&S.session.session_id===session.session_id) S.session.done_at=doneAt;
+    showToast(done?t('session_marked_done'):t('session_marked_undone'));
+    _repaintSidebarAfterSessionCompletion(session.session_id);
+    void renderSessionList();
+    return true;
+  }catch(err){showToast(t('session_mark_done_failed')+err.message);return false;}
+}
+
 async function _archiveSession(session, archived=true, beforeListRender=null){
   if(_isReadOnlySession(session)){ if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000); return false; }
   const reflowPositions=_captureSessionReflowPositions();
@@ -7052,6 +7077,22 @@ function _openSessionActionMenu(session, anchorEl){
       closeSessionActionMenu();
       await _archiveSession(session,!session.archived);
     }
+  ));
+  // Done is workflow state (`done_at`), not storage: the toggle sits right
+  // after Archive because the two are the pair a finished conversation takes —
+  // Archive hides the row, Done records that the work is over and leaves it in
+  // the list under the sidebar's check. Same field the close/checkmark scripts
+  // write through POST /api/session/mark-done, so the two paths agree.
+  const _isDone=session.done_at!==null&&session.done_at!==undefined&&session.done_at!=='';
+  menu.appendChild(_buildSessionAction(
+    _isDone?t('session_mark_undone'):t('session_mark_done'),
+    '',
+    _isDone?ICONS.markundone:ICONS.markdone,
+    async()=>{
+      closeSessionActionMenu();
+      await _setSessionDone(session,!_isDone);
+    },
+    _isDone?'is-active':''
   ));
   if(isExternalSession && !session.archived){
     menu.appendChild(_buildSessionAction(
@@ -11022,8 +11063,12 @@ function renderSessionListFromCache(){
     if(s.done_at!==null&&s.done_at!==undefined&&s.done_at!==''){
       const doneEl=document.createElement('span');
       doneEl.className='session-done-badge';
+      // A glyph, not the localised word: the pill spent horizontal room in the
+      // title row on a state that reads at a glance anyway. The label survives
+      // as aria-label and the timestamp as tooltip, so meaning is not lost.
       const doneLabel=t('session_done_badge');
-      doneEl.textContent=doneLabel;
+      doneEl.textContent='✓';
+      doneEl.setAttribute('aria-label',doneLabel);
       const doneMs=Number(s.done_at)*1000;
       doneEl.title=t('session_done_tooltip', _formatRelativeSessionTime(doneMs));
       titleRow.appendChild(doneEl);
