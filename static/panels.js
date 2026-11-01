@@ -10299,11 +10299,27 @@ async function loadSettingsPanel(){
     if(micAutoStopCb){
       const micAutoStop=_speechBool('mic_auto_stop','hermes-mic-auto-stop',false);
       micAutoStopCb.checked=micAutoStop;
-      _syncSpeechPreferenceCache('mic_auto_stop',micAutoStop?'true':'false');
+      try{_syncSpeechPreferenceCache('mic_auto_stop',micAutoStop?'true':'false');}catch(_){}
       micAutoStopCb.onchange=function(){
+        // The runtime cache is the effective value: _micAutoStopEnabled() reads this
+        // very key at capture time. A refused write (quota, private mode) must not
+        // leave the checkbox showing a preference that is not applied, and must not
+        // abort the handler on its way to the autosave below.
+        const desired=!!this.checked;
+        let cached=true;
+        try{localStorage.setItem('hermes-mic-auto-stop',desired?'true':'false');}
+        catch(_){cached=false;}
+        const note=$('settingsMicAutoStopNote');
+        if(!cached){
+          // Explicit rejection instead of a silently forked control: the box goes
+          // back to the value that is actually in force (and stays the one the
+          // meter predicate will read).
+          this.checked=!desired;
+          if(note) note.hidden=false;
+          return;
+        }
+        if(note) note.hidden=true;
         _markSpeechPreferenceChanged('mic_auto_stop');
-        try{localStorage.setItem('hermes-mic-auto-stop',this.checked?'true':'false');}catch(_){}
-        _syncSpeechPreferenceCache('mic_auto_stop',this.checked?'true':'false');
         _schedulePreferencesAutosave();
       };
     }

@@ -1506,6 +1506,12 @@ function _micToastKeyForRecognitionError(error){
     const ext=(blob.type&&blob.type.includes('ogg'))?'ogg':'webm';
     const form=new FormData();
     form.append('file',new File([blob],`voice-input.${ext}`,{type:blob.type||`audio/${ext}`}));
+    // #590: the spinner is painted as soon as the clip is handed over, before the
+    // ownership bookkeeping below, so the user sees it immediately on stop.
+    if(isCurrentCapture){
+      setComposerStatus('Transcribing…');
+      _micPaint('think','···');
+    }
     // Snapshot from onstop, before _setRecording(false) clears _prefix.
     //
     // `isCurrentCapture` is the recorder's own verdict from onstop: a superseded
@@ -1519,10 +1525,6 @@ function _micToastKeyForRecognitionError(error){
     // newer capture that never transcribes (raw audio, zero-byte clip, recorder
     // error) cannot clear it.
     const statusSeq=isCurrentCapture?++_micStatusSeq:_micStatusSeq;
-    if(isCurrentCapture){
-      setComposerStatus('Transcribing…');
-      _micPaint('think','···');
-    }
     try{
       const res=await fetch('api/transcribe',{method:'POST',body:form});
       const data=await res.json().catch(()=>({}));

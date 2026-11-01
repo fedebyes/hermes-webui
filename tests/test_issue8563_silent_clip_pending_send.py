@@ -60,6 +60,9 @@ let SpeechRecognition = function () {};
 let recognition = null;
 let _forceMediaRecorder = false;
 let _micTranscribeSeq = 0;
+// `_transcribeBlob` also reads/writes the mic status sequence that the branch
+// added for the dictation feedback states; the driver must provide it.
+let _micStatusSeq = 0;
 const _MIC_EMPTY_MS = 2500;
 const paints = [];
 function _micPaint(state) { paints.push(state === undefined ? null : state); }

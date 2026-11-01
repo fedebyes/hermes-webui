@@ -163,7 +163,7 @@ def test_590_transcribing_status_shown_before_fetch():
     """boot.js: setComposerStatus('Transcribing…') must fire before the fetch call."""
     transcribe_fn_start = BOOT_JS.find("async function _transcribeBlob(")
     assert transcribe_fn_start != -1, "_transcribeBlob not found in boot.js"
-    fn_body = BOOT_JS[transcribe_fn_start:transcribe_fn_start + 600]
+    fn_body = BOOT_JS[transcribe_fn_start:transcribe_fn_start + 2500]
     status_pos = fn_body.find("setComposerStatus('Transcribing")
     fetch_pos  = fn_body.find("await fetch(")
     assert status_pos != -1, (
