@@ -1584,8 +1584,12 @@ function _micToastKeyForRecognitionError(error){
         // _commitTranscript's empty case does — the same timed outcome, gated on
         // ownership so a newer capture keeps its readout. The strip's own
         // "No speech detected. Try again." is the announcement; a toast on top
-        // of it repeated the sentence and covered the header on a phone.
+        // of it repeated the sentence and covered the header on a phone. A
+        // superseded request is the exception: it must not paint over the newer
+        // capture's strip, and with no strip of its own nothing would tell the
+        // user its take came back empty, so the toast is all that case has.
         if(ownsButton()) _micPaint('empty',0,_MIC_EMPTY_MS);
+        else showToast(t('mic_no_speech'));
         return;
       }
       _commitTranscript(transcript, prefixSnapshot, ownsButton);

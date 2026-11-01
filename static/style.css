@@ -2972,8 +2972,8 @@
   .mic-status .mic-spinner{display:none;width:9px;height:9px;border-radius:50%;border:1.5px solid var(--mic-state);border-top-color:transparent;animation:spin .8s linear infinite;flex-shrink:0;}
   .mic-status .mic-status-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .mic-status .mic-timer{display:none;margin-left:auto;color:var(--muted);}
-  .mic-status .mic-level{display:none;flex:0 0 auto;width:46px;height:4px;border-radius:2px;overflow:hidden;background:color-mix(in srgb,var(--text) 70%,transparent);}
-  .mic-status .mic-level-fill{display:block;height:100%;border-radius:2px;background:var(--mic-state);transform:scaleX(var(--mic-level,0));transform-origin:left center;transition:transform .06s linear;}
+  .mic-status .mic-level{display:none;flex:0 0 auto;box-sizing:border-box;width:46px;height:6px;border-radius:3px;overflow:hidden;border:1px solid color-mix(in srgb,var(--text) 70%,transparent);background:transparent;}
+  .mic-status .mic-level-fill{display:block;height:100%;border-radius:1px;background:var(--mic-state);transform:scaleX(var(--mic-level,0));transform-origin:left center;transition:transform .06s linear;}
   .mic-status.is-rec{--mic-state:var(--error);}
   .mic-status.is-rec .mic-dot,.mic-status.is-rec .mic-timer,.mic-status.is-rec .mic-level{display:block;}
   .mic-status.is-think{--mic-state:color-mix(in srgb,var(--warning) 60%,var(--text));}

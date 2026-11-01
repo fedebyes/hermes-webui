@@ -142,12 +142,21 @@ def test_css_renders_all_three_states_on_the_strip():
     assert "@keyframes spin{to{transform:rotate(360deg);}}" in STYLE_CSS
     assert ".mic-status .mic-level-fill{" in STYLE_CSS
     assert "transform:scaleX(var(--mic-level,0))" in STYLE_CSS
-    # The track is ink, not a 25% tint of the state colour: that tint measured
-    # 1.28-1.58:1 against the composer across 21 palettes x light/dark, so a
-    # silent bar disappeared — and with it the "nothing reaches the mic" signal.
-    # 70% of --text measures 3.47:1 worst (catppuccin light) / 9.04:1 best.
-    assert ("background:color-mix(in srgb,var(--text) 70%,transparent)"
+    # The track is a ring, not a filled plate: an ink plate measured 1.00-1.89:1
+    # against the state fill in 38 palette blocks, so in silence the bar read as
+    # a full meter and the fill's edge vanished in greyscale. A 1 px border in
+    # the verified ink token leaves a transparent interior, so silence is an
+    # empty outline and speech a filled bar, readable without colour.
+    assert ("border:1px solid color-mix(in srgb,var(--text) 70%,transparent)"
             in STYLE_CSS)
+    track = STYLE_CSS.split(".mic-status .mic-level{", 1)[1].split("}", 1)[0]
+    assert "background:transparent" in track, "the ring's interior must stay empty"
+    assert "box-sizing:border-box" in track, (
+        "the 1 px ring must stay inside the 46 px slot, not grow it"
+    )
+    assert "height:6px" in track, (
+        "a 4 px box leaves a hairline interior once the 1 px ring is inset"
+    )
 
 
 def test_state_colours_come_from_theme_tokens():
@@ -631,6 +640,7 @@ function errResponse(status, body) {
   staleEmptyReq.resolve(okResponse({ transcript: '', no_speech: true }));
   await staleEmpty;
   out.staleNoSpeechPaints = paints.slice();
+  out.staleNoSpeechToasts = toasts.slice();
   pending.shift().resolve(okResponse({ transcript: 'newer still' }));
   await newerReq;
   out.staleNoSpeechFinalCommits = commits.slice(-1);
@@ -692,6 +702,10 @@ def test_stale_no_speech_does_not_paint_a_newer_capture(transcribe_runs):
         "successor owns"
     )
     assert transcribe_runs["staleNoSpeechFinalCommits"] == ["newer still"]
+    assert transcribe_runs["staleNoSpeechToasts"] == ["mic_no_speech"], (
+        "a superseded 200-with-no-speech has no strip to speak through, so it "
+        "must still toast: silence is the one thing it cannot say"
+    )
 
 
 def test_http_failure_settles_to_an_outcome(transcribe_runs):
