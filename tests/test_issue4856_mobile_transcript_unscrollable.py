@@ -31,11 +31,39 @@ from pathlib import Path
 CSS = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text(encoding="utf-8")
 
 
+def _block_at(css: str, open_brace: int) -> str:
+    """Return css[open_brace:] up to its matching close brace, skipping braces
+    inside comments and quoted strings. A fixed-size window broke as soon as
+    unrelated rules were added earlier in the mobile block."""
+    depth = 0
+    i = open_brace
+    while i < len(css):
+        c = css[i]
+        if css.startswith("/*", i):
+            end = css.find("*/", i + 2)
+            assert end != -1, "unterminated comment in style.css"
+            i = end + 2
+            continue
+        if c in "'\"":
+            end = css.find(c, i + 1)
+            assert end != -1, "unterminated string in style.css"
+            i = end + 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return css[open_brace:i + 1]
+        i += 1
+    raise AssertionError("unterminated block in style.css")
+
+
 def _mobile_messages_inner_rule() -> str:
     media = re.search(r"@media\(max-width:640px\)\{", CSS)
     assert media, "@media(max-width:640px) block not found"
-    window = CSS[media.start(): media.start() + 8000]
-    m = re.search(r"\.messages-inner\{([^}]*)\}", window)
+    block = _block_at(CSS, media.end() - 1)
+    m = re.search(r"\.messages-inner\{([^}]*)\}", block)
     assert m, ".messages-inner rule not found in mobile media block"
     return m.group(0)
 
