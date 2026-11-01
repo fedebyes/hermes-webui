@@ -26,6 +26,11 @@ import sys
 import uuid
 from pathlib import Path
 
+#: The reason the stand-in producer locks its tree with: the installed Agent's
+#: own shape (``hermes pid=<pid>``) and its own pid, so a test can check that the
+#: relocated tree is still classified as ownable.
+LOCK_REASON = f"hermes pid={os.getpid()}"
+
 GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "worktree-test",
@@ -261,7 +266,7 @@ def agent_producer(name: str | None = None, *, include: bool = True):
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, destination)
 
-        git(root_path, "worktree", "lock", "--reason", "hermes pid=test", str(target))
+        git(root_path, "worktree", "lock", "--reason", LOCK_REASON, str(target))
         return {
             "path": str(target),
             "branch": branch,
