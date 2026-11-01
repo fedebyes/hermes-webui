@@ -563,18 +563,139 @@ def test_attached_last_message_at_is_written_ahead_of_messages(session_store):
     session.save(touch_updated_at=False)
 
     path = session_store / f"{sid}.json"
-    raw = path.read_text(encoding="utf-8")
-    assert raw.index('"last_message_at"') < raw.index('"messages"'), (
+    keys = list(json.loads(path.read_text(encoding="utf-8")).keys())
+    assert "last_message_at" in keys
+    assert keys.index("last_message_at") < keys.index("messages"), (
         "the attached ordering value must sit in the metadata head, not after "
         "the transcript the head never parses"
     )
 
+    # The row must come from a real prefix: a full read would satisfy every
+    # value assertion below without proving anything about the cut.
+    assert DB._read_metadata_head(path) is not None
+    db = DB(session_store)
+    source = db._read_metadata_row_source(path)
+    assert isinstance(source, dict) and "messages" not in source
+
     full = DB._read_path(path)
     assert full["last_message_at"] == 100.0
-    row = DB(session_store).list_sessions()[0]
+    row = db.list_sessions()[0]
     assert row["last_message_at"] == 100.0, (
         "the head-derived row must agree with the full read on the ordering value"
     )
+    assert row == DB._metadata_row(sid, full)
+
+    # The public writer preserves the value too: it retires the layout marker
+    # (it keeps the caller's key order), so this row is the complete read, and
+    # the ordering value must survive there unchanged.
+    written = db.write_session(full)
+    assert written["last_message_at"] == 100.0
+    assert "_row_layout" not in written
+    assert DB(session_store).list_sessions()[0]["last_message_at"] == 100.0
+
+
+def test_attached_last_message_at_survives_the_budgeted_prefix(session_store, monkeypatch):
+    """The oversized metadata prefix must expose the attached ordering value.
+
+    Same re-gate fixture (``updated_at=200``, attached ``last_message_at=100``),
+    but with an 80,000-byte metadata prefix: past the 64 KiB head window and
+    inside the 1 MiB budgeted window, so the head declines on size and the
+    budgeted reader is the admission that serves the row. That path is gated on
+    ``_PROJECTED_FIELDS`` alone, so a key the writer emits must be listed there
+    or the budgeted row silently falls back to ``updated_at``.
+    """
+    sid = "attached-lma-fat"
+    session = models.Session(
+        session_id=sid,
+        title="Attached LMA Fat",
+        workspace=str(session_store.parent),
+        model="test-model",
+        messages=[{"role": "user", "content": "hi", "timestamp": 50.0}],
+        updated_at=200.0,
+        compression_anchor_summary="S" * 80_000,
+    )
+    session.last_message_at = 100.0
+    session.save(touch_updated_at=False)
+
+    path = session_store / f"{sid}.json"
+    assert DB._read_metadata_head(path) is None, (
+        "the fixture must overflow the head window, or the budgeted path is "
+        "never exercised"
+    )
+
+    # Prove the budgeted reader was really reached AND really admitted a prefix
+    # (no transcript in it), rather than the helper failing and the row coming
+    # from the complete document.
+    seen: list[str] = []
+    real_budgeted = models._read_metadata_json_prefix
+
+    def _spy(p, *args, **kwargs):
+        raw = real_budgeted(p, *args, **kwargs)
+        seen.append(raw or "")
+        return raw
+
+    monkeypatch.setattr(models, "_read_metadata_json_prefix", _spy)
+    source = DB._read_metadata_row_source(path)
+
+    assert len(seen) == 1
+    admitted = json.loads(seen[0])
+    assert "messages" not in admitted
+    assert admitted["last_message_at"] == 100.0, (
+        "the budgeted prefix must physically carry the ordering value"
+    )
+    assert isinstance(source, dict) and "messages" not in source
+
+    db = DB(session_store)
+    full = db._read_path(path)
+    assert full["last_message_at"] == 100.0
+    row = db.list_sessions()[0]
+    assert row["last_message_at"] == 100.0, (
+        "the budgeted row must agree with the full read on the ordering value"
+    )
+    assert row == DB._metadata_row(sid, full)
+
+
+def test_marked_prefix_without_last_message_at_takes_the_full_read(session_store):
+    """An older marked prefix that lacks the ordering value must not be served.
+
+    The writer emits the key now, but a sidecar marked by an older writer need
+    not carry it. Nothing in the prefix can distinguish "the writer omitted it"
+    from "the cut dropped it", so the marked-but-incomplete prefix must decline
+    and the row must come from the complete reader -- which lists the same
+    ``updated_at`` fallback, not a disagreeing value.
+    """
+    sid = "old-layout-no-lma"
+    payload = {
+        "session_id": sid,
+        "title": "Old Layout",
+        "profile": "work",
+        "archived": False,
+        "pinned": False,
+        "raw_source": "telegram",
+        "source_label": "Telegram",
+        "model": "test-model",
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "message_count": 1,
+        "_mc_v": models._MESSAGE_COUNT_MARKER,
+        "_row_layout": models._ROW_LAYOUT_VERSION,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    path = session_store / f"{sid}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    assert DB._read_metadata_head(path) is None, (
+        "a marked prefix without the projected ordering value must not be admitted"
+    )
+    db = DB(session_store)
+    source = db._read_metadata_row_source(path)
+    assert isinstance(source, dict) and "messages" in source, (
+        "the row must come from the complete reader"
+    )
+    full = db._read_path(path)
+    rows = db.list_sessions()
+    assert rows == [DB._metadata_row(sid, full)]
+    assert rows[0]["last_message_at"] == 200.0
 
 
 def test_oversized_reordered_prefix_takes_the_full_read(session_store, monkeypatch):
@@ -860,35 +981,84 @@ def test_head_derived_row_keeps_the_eager_checkpoint_fact(session_store):
     added to the payload without being added to that allowlist is silently
     dropped by every head/budgeted-prefix read - and the sidebar then discounts
     the hidden row a second time, which is exactly the undercount the field
-    exists to prevent. This pins the two halves together so the allowlist
-    cannot drift from the payload again.
+    exists to prevent.
+
+    The sidecar comes from the real writer: it emits the fact into the metadata
+    prefix next to ``_mc_v`` while it is valid (``models.py`` in ``save()``),
+    which is what makes the allowlist entry load-bearing. The earlier version of
+    this test wrote a handcrafted payload through ``write_session()``, which
+    retires ``_row_layout`` and therefore served the row from the complete read:
+    it passed without touching the head path at all.
     """
-    db = DB(session_store)
-    payload = {
-        "session_id": "wakeup",
-        "message_count": 2,
-        "messages": [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
-        "title": "Eager Checkpoint",
-        "pending_user_message": "Do the task.",
-        "pending_started_at": 1234.5,
-        "_pending_hidden_wakeup_at": 1234.5,
-    }
-    db.write_session(payload)
+    now = 1234.5
+    session = models.Session(
+        session_id="wakeup",
+        title="Eager Checkpoint",
+        workspace=str(session_store.parent),
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": "Do the task.",
+                "_source": "delegation_wakeup",
+                "timestamp": now,
+            },
+            {"role": "assistant", "content": "done", "timestamp": now + 1},
+        ],
+        pending_user_message="Do the task.",
+        pending_user_source="delegation_wakeup",
+        pending_started_at=now,
+        _pending_hidden_wakeup_at=now,
+    )
+    session.save()
     path = session_store / "wakeup.json"
+
+    keys = list(json.loads(path.read_text(encoding="utf-8")).keys())
+    assert "_pending_hidden_wakeup_at" in keys
+    assert keys.index("_pending_hidden_wakeup_at") < keys.index("messages"), (
+        "the writer must emit the fact inside the metadata prefix, or no prefix "
+        "read can carry it"
+    )
+
+    # A full read would satisfy every value assertion below without proving
+    # anything about the cut, so require a real prefix admission first.
+    assert DB._read_metadata_head(path) is not None
+    db = DB(session_store)
+    source = db._read_metadata_row_source(path)
+    assert isinstance(source, dict) and "messages" not in source
 
     full = db._read_path(path)
     assert isinstance(full, dict)
     full_row = db._metadata_row("wakeup", full)
-    assert full_row.get("_pending_hidden_wakeup_at") == 1234.5, (
+    assert full_row.get("_pending_hidden_wakeup_at") == now, (
         "the full read must expose the fact; without it this test proves nothing"
     )
 
-    source = db._read_metadata_row_source(path)
-    assert isinstance(source, dict)
     head_row = db._metadata_row("wakeup", source)
-    assert head_row is not None, "the payload must stay admissible through the head read"
-    assert head_row.get("_pending_hidden_wakeup_at") == 1234.5, (
+    assert head_row.get("_pending_hidden_wakeup_at") == now, (
         "the head read dropped the eager-checkpoint fact, which reinstates the "
         "double discount in the sidebar"
     )
     assert head_row == full_row, "the head row must equal the full row"
+    rows = {row["session_id"]: row for row in db.list_sessions()}
+    assert rows["wakeup"]["_pending_hidden_wakeup_at"] == now
+
+    # Control: the key is conditional, so the same writer must omit it when no
+    # checkpoint is pending. That makes the assertion above a real observation
+    # rather than a constant of the payload builder.
+    plain = models.Session(
+        session_id="plain",
+        title="Plain",
+        workspace=str(session_store.parent),
+        model="test-model",
+        messages=[{"role": "user", "content": "hi", "timestamp": 10.0}],
+    )
+    plain.save()
+    plain_path = session_store / "plain.json"
+    plain_head = DB._read_metadata_head(plain_path)
+    assert isinstance(plain_head, dict), "a plain sidecar must still be admissible"
+    assert "_pending_hidden_wakeup_at" not in plain_head
+    plain_source = db._read_metadata_row_source(plain_path)
+    assert isinstance(plain_source, dict) and "messages" not in plain_source
+    rows = {row["session_id"]: row for row in db.list_sessions()}
+    assert "_pending_hidden_wakeup_at" not in rows["plain"]

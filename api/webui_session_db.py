@@ -187,6 +187,13 @@ _METADATA_FIELDS = frozenset({
         # head-derived sidebar row that drops it reports the pending hidden
         # wakeup as not-yet-excluded and discounts it a second time, which is
         # the exact undercount that field exists to prevent.
+        #
+        # ``Session.save()`` emits it into the metadata prefix next to ``_mc_v``
+        # while the fact is valid, so no cut can separate it from the row. It is
+        # deliberately NOT in ``_PROJECTED_FIELDS``: the writer omits it whenever
+        # no checkpoint is pending, and that set is a *required* admission key --
+        # listing a conditional field there would decline the head read for every
+        # steady-state sidecar.
         "_pending_hidden_wakeup_at",
     }
 )
