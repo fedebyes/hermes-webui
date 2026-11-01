@@ -232,14 +232,54 @@ def _git_error(result: subprocess.CompletedProcess) -> str:
     return f"git exited {result.returncode}"
 
 
-def _relock(path: Path, cwd: Path) -> None:
-    """Re-apply the Agent's bookkeeping lock after a move (fail-soft)."""
+def _lock_reason(path: Path, cwd: Path) -> str | None:
+    """The tree's own lock reason, verbatim; ``None`` when it carries none.
+
+    The Agent locks every tree it creates with ``hermes pid=<pid>`` (or
+    ``hermes session=<id> db=<state.db>``), and only that shape is recognised by
+    its stale-owner classifier — any other text under a ``hermes`` prefix is
+    kept as live forever. So the reason is read *before* the move and re-applied
+    byte for byte afterwards: a relocated tree must stay exactly as ownable as
+    the tree the Agent produced.  Read from the admin dir git reports inside the
+    tree, so a bare lock (empty reason) and an unreadable admin dir (``None``,
+    no lock re-applied) both stay fail-soft.
+    """
     try:
-        _run_git(
-            ["worktree", "lock", "--reason", "hermes webui session", str(path)],
-            cwd,
-            timeout=10,
-        )
+        result = _run_git(["rev-parse", "--path-format=absolute", "--git-dir"], path)
+        if result.returncode != 0:
+            result = _run_git(["rev-parse", "--git-dir"], path)
+            raw = (result.stdout or "").strip() if result.returncode == 0 else ""
+            if not raw:
+                return None
+            admin = Path(raw)
+            if not admin.is_absolute():
+                admin = path / admin
+        else:
+            raw = (result.stdout or "").strip()
+            if not raw:
+                return None
+            admin = Path(raw)
+        locked = admin / "locked"
+        return locked.read_text(encoding="utf-8", errors="replace").strip(" \t\n\r\v\f")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _relock(path: Path, cwd: Path, reason: str | None) -> None:
+    """Re-apply *reason*, the lock the tree had before the move (fail-soft).
+
+    ``None`` means the tree was not locked, so nothing is re-applied — creating a
+    lock the Agent never set would make this module the owner of a tree it only
+    relocated.  A bare lock (``""``) is re-applied as a bare lock.
+    """
+    if reason is None:
+        return
+    args = ["worktree", "lock"]
+    if reason:
+        args += ["--reason", reason]
+    args.append(str(path))
+    try:
+        _run_git(args, cwd, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         pass
 
@@ -264,6 +304,10 @@ def relocate_worktree(created: Path, primary: Path) -> tuple[Path | None, str | 
     except OSError as exc:
         return None, f"could not create {destination.parent}: {exc}"
 
+    # The ownership reason travels with the tree: the Agent's classifier only
+    # accepts ``hermes pid=<pid>`` / ``hermes session=<id>``, so anything this
+    # module writes instead would make the tree permanently un-reapable.
+    reason = _lock_reason(created, primary)
     try:
         _run_git(["worktree", "unlock", str(created)], primary)
         result = _run_git(
@@ -272,10 +316,10 @@ def relocate_worktree(created: Path, primary: Path) -> tuple[Path | None, str | 
             timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        _relock(created, primary)
+        _relock(created, primary, reason)
         return None, f"git worktree move failed: {exc}"
     if result.returncode != 0:
-        _relock(created, primary)
+        _relock(created, primary, reason)
         return None, f"git worktree move failed: {_git_error(result)}"
-    _relock(destination, primary)
+    _relock(destination, primary, reason)
     return destination, None
