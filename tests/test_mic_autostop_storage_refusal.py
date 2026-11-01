@@ -55,7 +55,8 @@ _HARNESS = r"""
 const _MIC_AUTOSTOP_KEY = 'hermes-mic-auto-stop';
 const KEY = 'hermes-mic-auto-stop';
 const store = {};
-let failWrites = false;
+let failWrites = __FAIL_INIT__;
+__SEED_CACHE__
 globalThis.localStorage = {
   getItem: (k) => (k in store ? store[k] : null),
   setItem: (k, v) => { if (failWrites) throw Object.assign(new Error('QuotaExceededError'), {name: 'QuotaExceededError'}); store[k] = String(v); },
@@ -66,7 +67,7 @@ function mk(id){ if(!els[id]) els[id] = {id: id, checked: false, hidden: true}; 
 globalThis.$ = (id) => (id === 'settingsMicAutoStop' || id === 'settingsMicAutoStopNote') ? mk(id) : null;
 let saves = 0;
 const changed = [];
-globalThis._speechBool = () => false;
+globalThis._speechBool = () => __SERVER_VALUE__;
 globalThis._speechPreferenceIsOwned = () => true;
 globalThis._syncSpeechPreferenceCache = (k, v) => { localStorage.setItem(KEY, String(v)); };
 globalThis._markSpeechPreferenceChanged = (k) => { changed.push(k); };
@@ -108,9 +109,13 @@ console.log(JSON.stringify(out));
 """
 
 
-def _run():
+def _run(fail_init=False, server_value=False, cache=None):
+    seed = "" if cache is None else "store[KEY] = %s;" % json.dumps(cache)
     js = (
         _HARNESS
+        .replace("__FAIL_INIT__", "true" if fail_init else "false")
+        .replace("__SEED_CACHE__", seed)
+        .replace("__SERVER_VALUE__", "true" if server_value else "false")
         .replace("__MIC_PREDICATE__", _extract_function(BOOT_JS, "_micAutoStopEnabled"))
         .replace("__MIC_BLOCK__", _extract_mic_autostop_block(PANELS_JS))
     )
@@ -119,6 +124,14 @@ def _run():
     )
     assert proc.returncode == 0, "node harness failed:\n%s" % proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _run_init(fail_init=False, server_value=False, cache=None):
+    """Snap immediately after hydration, before any user interaction."""
+    if NODE is None:
+        pytest.skip("node not on PATH")
+    out = _run(fail_init=fail_init, server_value=server_value, cache=cache)
+    return out["defaultOff"]
 
 
 @pytest.fixture(scope="module")
@@ -175,3 +188,37 @@ def test_repeated_refusal_never_forks_the_control(runs):
     assert twice["checkbox"] is twice["effective"] is True
     assert twice["stored"] == "true"
     assert twice["note"] is True
+
+
+def test_writable_hydration_applies_the_owned_server_value():
+    on = _run_init(server_value=True, cache=None)
+    assert (on["checkbox"], on["effective"], on["stored"]) == (True, True, "true")
+    assert on["note"] is False
+    off = _run_init(server_value=False, cache="true")
+    assert (off["checkbox"], off["effective"], off["stored"]) == (False, False, "false")
+    assert off["note"] is False
+
+
+def test_refused_hydration_does_not_show_a_preference_the_meter_ignores():
+    # Owned server value OFF, stale cache ON, seed write refused: the box must
+    # follow the runtime predicate instead of claiming auto-stop is off while it
+    # is still armed.
+    off = _run_init(fail_init=True, server_value=False, cache="true")
+    assert off["checkbox"] is True
+    assert off["checkbox"] is off["effective"]
+    assert off["stored"] == "true"
+    # The opposite direction: server ON, no cached value, seed write refused.
+    on = _run_init(fail_init=True, server_value=True, cache=None)
+    assert on["checkbox"] is False
+    assert on["checkbox"] is on["effective"]
+    assert on["stored"] is None
+
+
+def test_refused_hydration_is_visible_and_schedules_nothing():
+    for snap in (
+        _run_init(fail_init=True, server_value=False, cache="true"),
+        _run_init(fail_init=True, server_value=True, cache=None),
+    ):
+        assert snap["note"] is True, "a refused seed write must be reported"
+        assert snap["saves"] == 0
+        assert snap["changed"] == 0

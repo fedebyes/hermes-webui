@@ -10299,7 +10299,21 @@ async function loadSettingsPanel(){
     if(micAutoStopCb){
       const micAutoStop=_speechBool('mic_auto_stop','hermes-mic-auto-stop',false);
       micAutoStopCb.checked=micAutoStop;
-      try{_syncSpeechPreferenceCache('mic_auto_stop',micAutoStop?'true':'false');}catch(_){}
+      let micSeedApplied=true;
+      try{_syncSpeechPreferenceCache('mic_auto_stop',micAutoStop?'true':'false');}
+      catch(_){micSeedApplied=false;}
+      const micNote=$('settingsMicAutoStopNote');
+      if(!micSeedApplied){
+        // Hydration must not display a preference the meter will not honour: when
+        // seeding the runtime cache is refused, the checkbox goes back to the
+        // cached value _micAutoStopEnabled() actually reads, and the rejection is
+        // shown instead of waiting for the next toggle to reveal the mismatch.
+        // The durable server value and the sparse ownership stay untouched.
+        let micCached=null;
+        try{micCached=localStorage.getItem('hermes-mic-auto-stop');}catch(_){}
+        micAutoStopCb.checked=micCached==='true';
+      }
+      if(micNote) micNote.hidden=micSeedApplied;
       micAutoStopCb.onchange=function(){
         // The runtime cache is the effective value: _micAutoStopEnabled() reads this
         // very key at capture time. A refused write (quota, private mode) must not
