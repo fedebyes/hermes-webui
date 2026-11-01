@@ -128,6 +128,7 @@ const _micForceMediaRecorderKey = 'mic_force_mediarecorder';
 const _micForceMediaRecorderExpiryKey = 'mic_force_mediarecorder_expires';
 const _MIC_FORCE_MR_TTL_MS = 24 * 60 * 60 * 1000;
 let _micTranscribeSeq = 0;
+let _micStatusSeq = 0;
 const _MIC_EMPTY_MS = 2500;
 const paints = [];
 let statuses = [];
@@ -357,6 +358,7 @@ const _micForceMediaRecorderKey = 'mic_force_mediarecorder';
 const _micForceMediaRecorderExpiryKey = 'mic_force_mediarecorder_expires';
 const _MIC_FORCE_MR_TTL_MS = 24 * 60 * 60 * 1000;
 let _micTranscribeSeq = 0;
+let _micStatusSeq = 0;
 let _micStartSeq = 0;
 let _isRecording = false;
 let _finalText = '';
@@ -379,7 +381,7 @@ let _micMeterRaf = 0;
 let _micSpokeAt = 0;
 const _MIC_READY_MS = 3000;
 const _MIC_EMPTY_MS = 2500;
-const _MIC_AUTOSTOP_KEY = 'mic_autostop';
+const _MIC_AUTOSTOP_KEY = 'hermes-mic-auto-stop';
 const paints = [];
 let statuses = [];
 const toasts = [];
@@ -556,6 +558,43 @@ const isTimer = (s) => /^\d+:\d{2}$/.test(s || '');
   out.ownerSuccess = snap();
   out.ownerSuccessComposer = ta.value;
 
+  // Finding 1: a newer capture that never transcribes (raw audio, zero-byte
+  // clip, recorder error) takes the button without ever settling the status
+  // line. The request that wrote 'Transcribing…' must retire it, or the user
+  // stares at it forever.
+  _setRecording(false);
+  _isRecording = false;
+  ta.value = 'draft';
+  reset();
+  const a5 = _transcribeBlob(blob, 'draft');
+  await new Promise((r) => setImmediate(r));
+  _rawAudioMode = true;
+  await _startMicCapture();
+  _rawAudioMode = false;
+  reset();
+  pending.shift().resolve(okResponse({ transcript: 'settled words' }));
+  await a5;
+  out.afterRawSupersede = snap();
+
+  // Finding 2: a superseded recorder's late `onstop` still settles its
+  // transcript, but it must not paint 'think', must not set the status, and
+  // must not take the newer capture's label or clock.
+  _setRecording(false);
+  _isRecording = false;
+  ta.value = 'draft';
+  await _startMicCapture();
+  reset();
+  const late = _transcribeBlob(blob, 'draft', false);
+  await new Promise((r) => setImmediate(r));
+  out.supersededInFlight = snap();
+  out.supersededPaints = paints.slice();
+  reset();
+  pending.shift().resolve(okResponse({ transcript: 'late words' }));
+  await late;
+  out.afterSuperseded = snap();
+  out.afterSupersededPaints = paints.slice();
+  out.afterSupersededComposer = ta.value;
+
   _micStopElapsed();
   console.log(JSON.stringify(out));
   process.exit(0);
@@ -613,8 +652,11 @@ def test_a_late_failure_cannot_settle_a_recorder_that_took_over(capture_runs):
     assert after["busy"] is True
     assert after["labelIsTimer"] is True, "the successor's timer label must survive"
     assert after["elapsedRunning"] is True, "the successor's clock must keep running"
-    assert after["statuses"] == [], (
-        "the stale request must not clear the composer status of a live capture"
+    assert after["statuses"] == [""], (
+        "the composer status is not the button: the request that wrote "
+        "'Transcribing…' retires it, because the capture that took the button "
+        "(raw audio, zero-byte clip, recorder error) never transcribes and "
+        "nothing else would ever clear it"
     )
     # The failure itself is still surfaced to the user; only the button is off-limits.
     assert after["toasts"] == ["late"]
@@ -665,4 +707,41 @@ def test_an_owning_success_still_paints_its_tick(capture_runs):
     assert owner["label"] == "✓ 2p"
     assert owner["elapsedRunning"] is False, "the owner's own clock stops on settle"
     assert capture_runs["ownerSuccessComposer"] == "two words"
+
+
+def test_a_capture_that_never_transcribes_still_retires_the_status(capture_runs):
+    after = capture_runs["afterRawSupersede"]
+    assert after["statuses"] == [""], (
+        "a raw-audio capture took the button while a transcription was pending; "
+        "its own request wrote 'Transcribing…' and nothing else will clear it"
+    )
+    assert after["recording"] is True, "the raw capture keeps the button"
+    assert after["labelIsTimer"] is True
+    assert after["elapsedRunning"] is True
+
+
+def test_a_superseded_recorder_never_takes_the_button(capture_runs):
+    in_flight = capture_runs["supersededInFlight"]
+    assert capture_runs["supersededPaints"] == [], (
+        "a superseded recorder must not paint 'think' over the live capture"
+    )
+    assert in_flight["statuses"] == [], (
+        "a superseded recorder must not write the composer status"
+    )
+    assert in_flight["recording"] is True
+    assert in_flight["labelIsTimer"] is True
+
+    after = capture_runs["afterSuperseded"]
+    assert capture_runs["afterSupersededPaints"] == [], (
+        "its settlement must not paint over the live capture either"
+    )
+    assert after["recording"] is True
+    assert after["labelIsTimer"] is True
+    assert after["elapsedRunning"] is True
+
+
+def test_a_superseded_recorder_still_commits_its_transcript(capture_runs):
+    assert capture_runs["afterSupersededComposer"] == "late words", (
+        "the user's words are committed even though the button belongs elsewhere"
+    )
 

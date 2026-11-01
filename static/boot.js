@@ -1292,6 +1292,11 @@ function _micToastKeyForRecognitionError(error){
   // it still owns the button: a newer capture (or a newer request) may have
   // repainted it already.
   let _micTranscribeSeq=0;
+  // Bumped only by transcription requests. The composer status is not the
+  // button: a capture that never transcribes (raw audio, zero-byte clip,
+  // recorder error) takes the button without ever settling the status, so only
+  // the newest transcription may clear what it wrote.
+  let _micStatusSeq=0;
 
   function _micStateClear(){
     if(_micStateTimer){clearTimeout(_micStateTimer);_micStateTimer=null;}
@@ -1497,16 +1502,27 @@ function _micToastKeyForRecognitionError(error){
     return !!(SpeechRecognition&&_getMicForceMediaRecorderStored()!=='1');
   }
 
-  async function _transcribeBlob(blob, prefixSnapshot){
+  async function _transcribeBlob(blob, prefixSnapshot, isCurrentCapture=true){
     const ext=(blob.type&&blob.type.includes('ogg'))?'ogg':'webm';
     const form=new FormData();
     form.append('file',new File([blob],`voice-input.${ext}`,{type:blob.type||`audio/${ext}`}));
     // Snapshot from onstop, before _setRecording(false) clears _prefix.
-    const seq=++_micTranscribeSeq;
+    //
+    // `isCurrentCapture` is the recorder's own verdict from onstop: a superseded
+    // recorder whose `stop` fires late must still commit its transcript (the
+    // words are the user's) but must not take the button or the status line from
+    // the capture that replaced it — the newer capture owns the label and clock.
+    const seq=isCurrentCapture?++_micTranscribeSeq:_micTranscribeSeq;
     // 'think' has no hold timeout: only the owning request settles it.
-    const ownsButton=()=>seq===_micTranscribeSeq;
-    setComposerStatus('Transcribing…');
-    _micPaint('think','···');
+    const ownsButton=isCurrentCapture?()=>seq===_micTranscribeSeq:()=>false;
+    // The status has its own token: it outlives button ownership, because a
+    // newer capture that never transcribes (raw audio, zero-byte clip, recorder
+    // error) cannot clear it.
+    const statusSeq=isCurrentCapture?++_micStatusSeq:_micStatusSeq;
+    if(isCurrentCapture){
+      setComposerStatus('Transcribing…');
+      _micPaint('think','···');
+    }
     try{
       const res=await fetch('api/transcribe',{method:'POST',body:form});
       const data=await res.json().catch(()=>({}));
@@ -1555,7 +1571,7 @@ function _micToastKeyForRecognitionError(error){
       if(ownsButton()) _micPaint(null);
       showToast(err.message||t('mic_network'));
     }finally{
-      if(ownsButton()) setComposerStatus('');
+      if(isCurrentCapture&&statusSeq===_micStatusSeq) setComposerStatus('');
     }
   }
 
@@ -1901,7 +1917,7 @@ function _micToastKeyForRecognitionError(error){
           if(captureMode==='media-raw'){
             await _sendRawAudio(blob);
           }else{
-            await _transcribeBlob(blob, prefixSnapshot);
+            await _transcribeBlob(blob, prefixSnapshot, isCurrentCapture);
           }
         }
         else if(window._micPendingSend){
