@@ -9329,11 +9329,19 @@ const _SETTINGS_SPEECH_STORAGE_KEYS={
 let _settingsSpeechPersistedKeys=new Set();
 let _settingsSpeechLocalStorageKeys=new Set();
 let _settingsSpeechChangedKeys=new Set();
+// Speech preferences whose hydration could NOT install the value on screen (a
+// refused runtime-cache write). The control then shows the value actually in
+// force, not the durable one, so serializing the control would push that
+// fallback into the stored preference on the next unrelated autosave. Until a
+// deliberate edit succeeds, the payload omits the field and the durable value
+// survives untouched. Ownership itself is never cleared here.
+let _settingsSpeechUnappliedKeys=new Set();
 
 function _captureSpeechPreferenceOwnership(settings){
   _settingsSpeechPersistedKeys=new Set(Array.isArray(settings&&settings.persisted_speech_keys)?settings.persisted_speech_keys:[]);
   _settingsSpeechLocalStorageKeys=new Set();
   _settingsSpeechChangedKeys=new Set();
+  _settingsSpeechUnappliedKeys=new Set();
   Object.entries(_SETTINGS_SPEECH_STORAGE_KEYS).forEach(([settingKey,storageKey])=>{
     try{if(localStorage.getItem(storageKey)!==null) _settingsSpeechLocalStorageKeys.add(settingKey);}catch(_){}
   });
@@ -9354,6 +9362,9 @@ function _syncSpeechPreferenceCache(settingKey,value){
 }
 
 function _setOwnedSpeechPayload(payload,settingKey,value){
+  // An unapplied hydration means the control no longer mirrors the durable
+  // value: omit the field rather than persist the fallback it displays.
+  if(_settingsSpeechUnappliedKeys.has(settingKey)) return;
   if(_speechPreferenceIsOwned(settingKey)) payload[settingKey]=value;
 }
 
@@ -10312,6 +10323,10 @@ async function loadSettingsPanel(){
         let micCached=null;
         try{micCached=localStorage.getItem('hermes-mic-auto-stop');}catch(_){}
         micAutoStopCb.checked=micCached==='true';
+        // The box now mirrors the runtime cache, not the durable preference:
+        // keep the field out of every settings payload (unrelated autosave,
+        // whole-settings save) until a deliberate mic edit lands.
+        _settingsSpeechUnappliedKeys.add('mic_auto_stop');
       }
       if(micNote) micNote.hidden=micSeedApplied;
       micAutoStopCb.onchange=function(){
@@ -10333,6 +10348,9 @@ async function loadSettingsPanel(){
           return;
         }
         if(note) note.hidden=true;
+        // A deliberate mic edit that really landed: the checkbox is once again
+        // the durable intent, so the field may be serialized again.
+        _settingsSpeechUnappliedKeys.delete('mic_auto_stop');
         _markSpeechPreferenceChanged('mic_auto_stop');
         _schedulePreferencesAutosave();
       };

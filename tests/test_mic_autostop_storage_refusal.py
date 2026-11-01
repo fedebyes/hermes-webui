@@ -71,6 +71,7 @@ globalThis._speechBool = () => __SERVER_VALUE__;
 globalThis._speechPreferenceIsOwned = () => true;
 globalThis._syncSpeechPreferenceCache = (k, v) => { localStorage.setItem(KEY, String(v)); };
 globalThis._markSpeechPreferenceChanged = (k) => { changed.push(k); };
+globalThis._settingsSpeechUnappliedKeys = new Set();
 globalThis._schedulePreferencesAutosave = () => { saves += 1; };
 
 __MIC_PREDICATE__
@@ -222,3 +223,132 @@ def test_refused_hydration_is_visible_and_schedules_nothing():
         assert snap["note"] is True, "a refused seed write must be reported"
         assert snap["saves"] == 0
         assert snap["changed"] == 0
+
+
+# ── refused hydration must not leak into an unrelated settings save ──────────
+#
+# The same refused seed leaves the checkbox showing the value the METER reads
+# rather than the durable one, and `mic_auto_stop` stays owned. Every settings
+# write builds its mic field from that checkbox (`_speechPreferencesPayloadFromUi`,
+# used by the autosave AND by the whole-settings save), so a save triggered by
+# an unrelated preference used to overwrite the durable mic intent with the
+# fallback on screen. These compose the shipped helpers with hydration, the real
+# runtime predicate and the real payload builder.
+
+_HARNESS_UNRELATED_SAVE = r"""
+const _MIC_AUTOSTOP_KEY = 'hermes-mic-auto-stop';
+const KEY = 'hermes-mic-auto-stop';
+const store = {};
+let failMicWrites = __FAIL_INIT__;
+__SEED_CACHE__
+globalThis.localStorage = {
+  getItem: (k) => (k in store ? store[k] : null),
+  setItem: (k, v) => {
+    if (failMicWrites && k === KEY) throw Object.assign(new Error('QuotaExceededError'), {name: 'QuotaExceededError'});
+    store[k] = String(v);
+  },
+  removeItem: (k) => { delete store[k]; },
+};
+const els = {};
+function mk(id){ if(!els[id]) els[id] = {id: id, checked: false, hidden: true}; return els[id]; }
+globalThis.$ = (id) => (id === 'settingsMicAutoStop' || id === 'settingsMicAutoStopNote') ? mk(id) : null;
+let saves = 0;
+globalThis._schedulePreferencesAutosave = () => { saves += 1; };
+globalThis._speechBool = () => __SERVER_VALUE__;
+
+__MIC_PREDICATE__
+
+__SPEECH_RUNTIME__
+
+_captureSpeechPreferenceOwnership({persisted_speech_keys: ['mic_auto_stop'], mic_auto_stop: __SERVER_VALUE__});
+
+__MIC_BLOCK__
+
+const cb = mk('settingsMicAutoStop');
+const note = mk('settingsMicAutoStopNote');
+function has(o, k){ return Object.prototype.hasOwnProperty.call(o, k); }
+const out = {};
+out.hydrated = _speechPreferencesPayloadFromUi();
+out.checkbox = cb.checked;
+out.effective = _micAutoStopEnabled();
+out.note = note.hidden === false;
+out.stored = (KEY in store) ? store[KEY] : null;
+// An unrelated preference change (send key, theme, ...) serializes exactly this
+// payload: `Object.assign(payload, _speechPreferencesPayloadFromUi())`.
+failMicWrites = false;
+cb.checked = __TOGGLE__;
+cb.onchange.call(cb);
+out.afterEdit = _speechPreferencesPayloadFromUi();
+out.editCheckbox = cb.checked;
+out.editEffective = _micAutoStopEnabled();
+out.saves = saves;
+console.log(JSON.stringify(out));
+"""
+
+
+def _extract_speech_payload_runtime(src):
+    """Ownership + cache helpers, then the payload builder, from panels.js."""
+    start = src.index("const _SETTINGS_SPEECH_STORAGE_KEYS={")
+    end = src.index("function _preferencesPayloadFromUi(){", start)
+    return (src[start:end].rstrip()
+            + "\n\n"
+            + _extract_function(src, "_speechPreferencesPayloadFromUi"))
+
+
+def _run_unrelated_save(fail_init=False, server_value=False, cache=None, toggle=False):
+    if NODE is None:
+        pytest.skip("node not on PATH")
+    seed = "" if cache is None else "store[KEY] = %s;" % json.dumps(cache)
+    js = (
+        _HARNESS_UNRELATED_SAVE
+        .replace("__FAIL_INIT__", "true" if fail_init else "false")
+        .replace("__SEED_CACHE__", seed)
+        .replace("__SERVER_VALUE__", "true" if server_value else "false")
+        .replace("__TOGGLE__", "true" if toggle else "false")
+        .replace("__MIC_PREDICATE__", _extract_function(BOOT_JS, "_micAutoStopEnabled"))
+        .replace("__SPEECH_RUNTIME__", _extract_speech_payload_runtime(PANELS_JS))
+        .replace("__MIC_BLOCK__", _extract_mic_autostop_block(PANELS_JS))
+    )
+    proc = subprocess.run(
+        [NODE, "-e", js], capture_output=True, text=True, cwd=ROOT, timeout=60
+    )
+    assert proc.returncode == 0, "node harness failed:\n%s" % proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize(
+    "server_value,cache",
+    [(False, "true"), (True, None)],
+    ids=["durable-off-stale-cache-on", "durable-on-no-cache"],
+)
+def test_refused_hydration_omits_the_mic_field_from_an_unrelated_save(server_value, cache):
+    out = _run_unrelated_save(fail_init=True, server_value=server_value, cache=cache)
+    # The control still tells the truth about the meter ...
+    assert out["checkbox"] is out["effective"]
+    assert out["note"] is True
+    # ... and an unrelated save leaves the durable mic preference alone instead
+    # of promoting the displayed fallback into it.
+    assert "mic_auto_stop" not in out["hydrated"], out["hydrated"]
+
+
+@pytest.mark.parametrize(
+    "server_value,cache,toggle",
+    [(False, "true", False), (True, None, False), (True, None, True)],
+    ids=["off-stale-on", "on-no-cache", "on-no-cache-toggle-on"],
+)
+def test_deliberate_edit_after_a_refused_hydration_serializes_again(server_value, cache, toggle):
+    out = _run_unrelated_save(
+        fail_init=True, server_value=server_value, cache=cache, toggle=toggle
+    )
+    assert out["afterEdit"].get("mic_auto_stop") is toggle
+    assert out["editCheckbox"] is out["editEffective"] is toggle
+    assert out["saves"] == 1
+
+
+def test_writable_hydration_keeps_serializing_the_mic_field():
+    # Control: when the seed lands, the checkbox IS the durable intent and the
+    # field must stay in the payload (sparse ownership untouched).
+    out = _run_unrelated_save(fail_init=False, server_value=False, cache="true")
+    assert out["hydrated"].get("mic_auto_stop") is False
+    assert out["checkbox"] is out["effective"] is False
+    assert out["note"] is False
