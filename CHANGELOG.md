@@ -77,6 +77,8 @@
 
 ### Fixed
 
+- **The Gateway Status card shows a single separator after "Last active".** Most translations of the label already end in a colon, and the card added another, so it read "Last active: : <date>". The card now keeps the colon the translation chose (a full-width "：" in Chinese, " : " in French) and adds ": " only to a label without one. (#8635, closes #8621, thanks @happy5318)
+
 - **The stable channel keeps v0.52.544's update target when a checkout has no stable release.** Since exp-v0.52.596, a checkout whose tags are all prereleases (for example `v0.22.5+canary.N`) had no release at all on the stable channel, so an Agent update could apply `origin/main` and a WebUI check could treat the branch tip as the target. The prerelease filter now applies only when the repository has at least one stable release tag, and each check or apply reads the tag list once and uses that one snapshot throughout. (#8686, fixes #8684)
 
 - **CI passes again on GitHub's Ubuntu 26.04 runners.** Two TLS health-probe tests failed on every `ubuntu-26.04` job (GitHub is moving `ubuntu-latest` there) and passed on 24.04. The tests' fake `/health` server sent its body without a `Content-Length`, so the body ended when the connection closed. Python closes TLS connections without a `close_notify`, and the newer curl on 26.04 rejects a body that ends that way. The fake server now frames its body the way the real `/health` does. The launcher's probe and the real server were never affected. Test-only change. (#8702)
