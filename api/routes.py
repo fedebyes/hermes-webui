@@ -12617,6 +12617,19 @@ _LINEAGE_DISPLAY_CACHE_MAX = 16
 _lineage_display_cache: "OrderedDict[str, dict]" = OrderedDict()
 _lineage_display_cache_lock = threading.Lock()
 
+# perf: memoized GET /api/session payloads. public_session_projection()
+# deep-copies and credential-masks the whole transcript — 0.7 s for a
+# 500-message session — and the GIL serialises every concurrent repeat, so a
+# client that reopens (or retries) the same session turned those 0.7 s into
+# 5-19 s spans in the journal. Validity = the sidecar's exact stat signature,
+# so any write invalidates naturally; sessions that are streaming are never
+# cached (see _display_merge_session_is_active). The two fields derive from
+# live agent state rather than the sidecar and are refreshed on every hit.
+_SESSION_PROJECTION_CACHE_MAX = 8
+_SESSION_PROJECTION_VOLATILE_KEYS = ("memory_status", "regeneration_revision")
+_session_projection_cache: "OrderedDict[tuple, dict]" = OrderedDict()
+_session_projection_cache_lock = threading.Lock()
+
 
 def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20, owner_positions=None) -> list:
     """Return WebUI sidecar messages stitched across compression snapshots.
@@ -17416,7 +17429,44 @@ def _handle_session_get(handler, parsed) -> bool:
             )
             if revision:
                 raw["regeneration_revision"] = revision
-        redact = public_session_projection(raw)
+        # perf: see _session_projection_cache — an unchanged session re-served
+        # after a reopen/retry reuses the projected payload instead of redoing
+        # the full deep-copy + credential-masking pass.
+        _proj_key = None
+        _proj_cached = None
+        try:
+            if load_messages and not _display_merge_session_is_active(s):
+                from api.models import _sidecar_stat_signature
+                _proj_sig = _sidecar_stat_signature(SESSION_DIR / f"{sid}.json")
+                if _proj_sig is not None:
+                    _proj_key = (
+                        sid, _proj_sig, msg_limit, msg_before, expand_renderable,
+                        resolve_model, effective_model, effective_provider,
+                        str(getattr(s, "active_stream_id", "") or ""),
+                        str(getattr(s, "pending_started_at", "") or ""),
+                    )
+                    with _session_projection_cache_lock:
+                        _proj_cached = _session_projection_cache.get(_proj_key)
+                        if _proj_cached is not None:
+                            _session_projection_cache.move_to_end(_proj_key, last=True)
+        except Exception:
+            _proj_key = None
+            _proj_cached = None
+        if _proj_cached is not None:
+            redact = dict(_proj_cached)
+            for _volatile_key in _SESSION_PROJECTION_VOLATILE_KEYS:
+                if _volatile_key in raw:
+                    redact[_volatile_key] = raw[_volatile_key]
+                else:
+                    redact.pop(_volatile_key, None)
+        else:
+            redact = public_session_projection(raw)
+            if _proj_key is not None:
+                with _session_projection_cache_lock:
+                    _session_projection_cache[_proj_key] = dict(redact)
+                    _session_projection_cache.move_to_end(_proj_key, last=True)
+                    while len(_session_projection_cache) > _SESSION_PROJECTION_CACHE_MAX:
+                        _session_projection_cache.popitem(last=False)
         _t5 = _time.monotonic()
         if _diag: _diag.stage("t5_after_redact")
         resp = j(handler, {"session": redact})
