@@ -189,10 +189,7 @@
   :root[data-skin="graphite"] .session-item.active{position:relative;padding:10px 12px 10px 18px;background:var(--surface-subtle-hover)!important;border:1px solid var(--border)!important;color:var(--text)!important;gap:8px;}
   :root[data-skin="graphite"] .session-item.active.streaming,
   :root[data-skin="graphite"] .session-item.active.unread,
-  :root[data-skin="graphite"] .session-item.active.needs-attention,
-  :root[data-skin="graphite"] .session-item.active:has(:focus-visible),
-  :root[data-skin="graphite"] .session-item.active.menu-open{padding-right:40px;}
-  @media (hover:hover){:root[data-skin="graphite"] .session-item.active:hover{padding-right:40px;}}
+  :root[data-skin="graphite"] .session-item.active.needs-attention{padding-right:40px;}
   :root[data-skin="graphite"] .session-item.active::before{content:"";position:absolute;left:7px;top:12px;bottom:12px;width:2px;border-radius:999px;background:color-mix(in srgb,var(--accent) 70%,var(--border2));opacity:.55;}
   :root[data-skin="graphite"] .session-item.active .session-title-row{gap:6px;}
   :root[data-skin="graphite"] .session-item.active .session-text{min-width:0;width:100%;}
@@ -315,10 +312,7 @@
   :root[data-skin="codex"] .session-item.active{position:relative;padding:10px 12px 10px 18px;background:var(--surface-subtle-hover)!important;border:1px solid var(--border)!important;color:var(--text)!important;gap:8px;}
   :root[data-skin="codex"] .session-item.active.streaming,
   :root[data-skin="codex"] .session-item.active.unread,
-  :root[data-skin="codex"] .session-item.active.needs-attention,
-  :root[data-skin="codex"] .session-item.active:has(:focus-visible),
-  :root[data-skin="codex"] .session-item.active.menu-open{padding-right:40px;}
-  @media (hover:hover){:root[data-skin="codex"] .session-item.active:hover{padding-right:40px;}}
+  :root[data-skin="codex"] .session-item.active.needs-attention{padding-right:40px;}
   :root[data-skin="codex"] .session-item.active::before{content:"";position:absolute;left:7px;top:12px;bottom:12px;width:2px;border-radius:999px;background:color-mix(in srgb,var(--accent) 70%,var(--border2));opacity:.55;}
   :root[data-skin="codex"] .session-item.active .session-title-row{gap:6px;}
   :root[data-skin="codex"] .session-item.active .session-text{min-width:0;width:100%;}
@@ -441,10 +435,7 @@
   :root[data-skin="terracotta"] .session-item.active{position:relative;padding:10px 12px 10px 18px;background:var(--surface-subtle-hover)!important;border:1px solid var(--border)!important;color:var(--text)!important;gap:8px;}
   :root[data-skin="terracotta"] .session-item.active.streaming,
   :root[data-skin="terracotta"] .session-item.active.unread,
-  :root[data-skin="terracotta"] .session-item.active.needs-attention,
-  :root[data-skin="terracotta"] .session-item.active:has(:focus-visible),
-  :root[data-skin="terracotta"] .session-item.active.menu-open{padding-right:40px;}
-  @media (hover:hover){:root[data-skin="terracotta"] .session-item.active:hover{padding-right:40px;}}
+  :root[data-skin="terracotta"] .session-item.active.needs-attention{padding-right:40px;}
   :root[data-skin="terracotta"] .session-item.active::before{content:"";position:absolute;left:7px;top:12px;bottom:12px;width:2px;border-radius:999px;background:color-mix(in srgb,var(--accent) 70%,var(--border2));opacity:.55;}
   :root[data-skin="terracotta"] .session-item.active .session-title-row{gap:6px;}
   :root[data-skin="terracotta"] .session-item.active .session-text{min-width:0;width:100%;}
@@ -567,10 +558,7 @@
   :root[data-skin="github"] .session-item.active{position:relative;padding:10px 12px 10px 18px;background:var(--surface-subtle-hover)!important;border:1px solid var(--border)!important;color:var(--text)!important;gap:8px;}
   :root[data-skin="github"] .session-item.active.streaming,
   :root[data-skin="github"] .session-item.active.unread,
-  :root[data-skin="github"] .session-item.active.needs-attention,
-  :root[data-skin="github"] .session-item.active:has(:focus-visible),
-  :root[data-skin="github"] .session-item.active.menu-open{padding-right:40px;}
-  @media (hover:hover){:root[data-skin="github"] .session-item.active:hover{padding-right:40px;}}
+  :root[data-skin="github"] .session-item.active.needs-attention{padding-right:40px;}
   :root[data-skin="github"] .session-item.active::before{content:"";position:absolute;left:7px;top:12px;bottom:12px;width:2px;border-radius:999px;background:color-mix(in srgb,var(--accent) 70%,var(--border2));opacity:.55;}
   :root[data-skin="github"] .session-item.active .session-title-row{gap:6px;}
   :root[data-skin="github"] .session-item.active .session-text{min-width:0;width:100%;}
@@ -1605,7 +1593,14 @@
      when they're visible — covered by the hover / streaming / unread /
      menu-open / keyboard-focus rule below. */
   .session-item{padding:8px 8px;margin-bottom:2px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--muted);transition:background .15s,color .15s,transform .5s cubic-bezier(.22,.61,.36,1),box-shadow .15s ease;display:flex;align-items:flex-start;gap:8px;min-width:0;position:relative;touch-action:pan-y;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;transform:translate3d(var(--session-swipe-offset,0),var(--session-reflow-offset,0),0);}
-  .session-item.streaming,.session-item.unread,.session-item.needs-attention,.session-item:has(:focus-visible),.session-item.menu-open{padding-right:40px;}
+  /* Reserve the action-button lane only for rows that own it structurally:
+     a state indicator replaces the timestamp (JS marks that row is-hidden),
+     so those rows need the 40px. Hover/focus/menu-open used to add it too,
+     which reflowed the row (chips + done marker jumped 32px) every time the
+     pointer crossed it. The button now overlays the timestamp's own box,
+     which stays in place because hover only hides it (visibility), not
+     removes it. */
+  .session-item.streaming,.session-item.unread,.session-item.needs-attention{padding-right:40px;}
   .session-item.needs-attention{box-shadow:inset 3px 0 0 var(--warning);background:color-mix(in srgb,var(--warning) 8%,transparent);}
   .session-item.attention-approval{box-shadow:inset 3px 0 0 var(--error);background:color-mix(in srgb,var(--error) 9%,transparent);}
   .session-item.attention-clarify{box-shadow:inset 3px 0 0 var(--warning);background:color-mix(in srgb,var(--warning) 8%,transparent);}
@@ -1651,7 +1646,7 @@
      Touch/iPad (hover:none) must NOT expand padding-right on :hover —
      the expansion causes a layout-reflow mid-tap that moves session-actions
      under the finger, triggering stopPropagation and swallowing navigation. */
-  @media (hover:hover){:root:not(.dark) .session-item:hover{background:var(--hover-bg);color:var(--text);}.session-item:hover{padding-right:40px;}}
+  @media (hover:hover){:root:not(.dark) .session-item:hover{background:var(--hover-bg);color:var(--text);}}
   .session-item.active{background:var(--accent-bg);color:var(--accent);}
   .session-item.active.swiping-right{background:color-mix(in srgb,var(--warning) 20%,var(--accent-bg));}
   .session-item.active.swiping-left{background:color-mix(in srgb,var(--error) 18%,var(--accent-bg));}
@@ -1745,9 +1740,12 @@
     flex-shrink:0;
   }
   .session-time.is-hidden{display:none;}
-  .session-item:has(:focus-visible) .session-time,.session-item.menu-open .session-time{display:none;}
+  /* Hidden, not removed: the timestamp's box keeps the action button's lane
+     reserved, so revealing the kebab on hover/focus cannot reflow the row.
+     The skins below already did this for .active; this is the general case. */
+  .session-item:has(:focus-visible) .session-time,.session-item.menu-open .session-time{visibility:hidden;}
   @media (hover:hover){
-    .session-item:hover .session-time{display:none;}
+    .session-item:hover .session-time{visibility:hidden;}
   }
   /* ── Session action trigger + dropdown ── */
   .session-actions{position:absolute;right:6px;top:50%;transform:translateY(-50%);display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .15s ease;}
@@ -6087,6 +6085,26 @@ main.main > #mainPlugin{display:none;}
 /* ── Archived sessions ── */
 .session-item.archived{opacity:.5;}
 .session-item.archived .session-title{font-style:italic;}
+
+/* ── Done sessions (structural `done_at`, not a title prefix) ── */
+/* The row-level `done` class carries one job the badge cannot: a finished
+   conversation's title loses emphasis, so the sidebar reads "settled" at a
+   glance without relying on the marker alone. Deliberately NOT dimmed like
+   `.archived` (storage): a finished row is still normal working history. */
+.session-item.done .session-title{font-weight:400;}
+/* A bare check, not a pill: the word cost ~34px of every title row for a state
+   that reads at a glance. Fixed box so a long title never shifts it, and the
+   localised word lives in aria-label/title instead of the visible row. */
+.session-done-badge{display:inline-flex;align-items:center;justify-content:center;height:16px;width:14px;font-size:12px;line-height:1;font-weight:700;color:var(--success,#22c55e);margin-left:5px;flex-shrink:0;user-select:none;cursor:default;}
+.session-item.active .session-done-badge{color:color-mix(in srgb,var(--success,#22c55e) 82%,#fff);}
+/* Live delegate children: same 16px row geometry as the done check (they share
+   the title row), but a pill on the info accent so "3 running" is never
+   mistaken for "done". A subtle pulse is the only motion in the sidebar row, so
+   it reads as activity rather than as decoration. */
+.session-live-subagents-badge{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:color-mix(in srgb,var(--accent,#63b3ed) 16%,transparent);color:var(--accent,#63b3ed);margin-left:6px;flex-shrink:0;user-select:none;cursor:default;letter-spacing:.02em;animation:session-live-pulse 2s ease-in-out infinite;}
+.session-item.active .session-live-subagents-badge{background:color-mix(in srgb,var(--accent,#63b3ed) 26%,transparent);}
+@keyframes session-live-pulse{0%,100%{opacity:1;}50%{opacity:.62;}}
+@media (prefers-reduced-motion:reduce){.session-live-subagents-badge{animation:none;}}
 
 /* ── Subagent session tree (#494) ── */
 .session-lineage-count{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:rgba(148,163,184,.14);color:var(--muted);margin-left:6px;flex-shrink:0;user-select:none;cursor:default;}

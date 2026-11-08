@@ -14,6 +14,7 @@ import gzip
 import json
 from api.sse_chunked import end_sse_headers
 import logging
+import math
 import mimetypes
 import os
 import queue
@@ -16521,6 +16522,124 @@ def _handle_plugins(handler, parsed) -> bool:
         )
 
 
+_LIVE_SUBAGENTS_CACHE_TTL_SECONDS = 3.0
+# A subagent child still counts as live while it is silent for less than this.
+# `ended_at IS NULL` is the authoritative signal; this window only bounds rows a
+# crashed run left open (a run that dies without `agent_close` keeps NULL
+# forever). Two failure modes pull in opposite directions:
+#   - too tight  → a child in one long tool call loses its badge while it works.
+#     The measured tail is ~15 minutes end to end (44 of ~790 runs), so the
+#     window must stay comfortably above it.
+#   - too wide   → a wedged row keeps counting as live. Measured: a child whose
+#     last message was 73 minutes old (runner died, `ended_at` never stamped)
+#     still reported "1 live" under the previous 2h window.
+# 30 minutes sits between the two. Note that the duration tail bounds TOTAL run
+# length, while the predicate measures message silence — they are different
+# quantities, and a child genuinely quieter than the window is the accepted
+# degradation (a badge missing during a quiet stretch, never a stuck one).
+_LIVE_SUBAGENTS_GRACE_SECONDS = 1800.0
+# Keyed by state.db path: the path is per-request (active profile), so a single
+# slot would serve profile A's counts to a profile B request inside the TTL.
+_live_subagents_cache: dict = {}
+_live_subagents_lock = threading.Lock()
+
+
+def _live_subagent_counts(now: float | None = None, db_path=None) -> dict:
+    """Return ``{parent_session_id: live_child_count}`` from the agent state.db.
+
+    "Live" is the delegate runner's own run/lifecycle: a child session is
+    created with ``source='subagent'`` and ``ended_at IS NULL``, and the runner
+    stamps ``ended_at``/``end_reason='agent_close'`` when the run finishes
+    (verified end-to-end against a real fan-out — the children carry NULL for
+    the whole run and close on exit). The recency bound only keeps a crashed
+    row (NULL forever, never closed) from inflating the badge.
+
+    Read-only, single aggregate query on the ``source`` index. Any failure
+    degrades to an empty map: the sidebar badge is decoration and must never
+    be able to break the session list.
+    """
+    now = time.time() if now is None else now
+    try:
+        from api.agent_sessions import open_state_db_readonly
+
+        db_path = db_path if db_path is not None else _active_state_db_path()
+        if not db_path.exists():
+            return {}
+        window_start = now - _LIVE_SUBAGENTS_GRACE_SECONDS
+        with closing(open_state_db_readonly(db_path)) as conn:
+            rows = conn.execute(
+                """
+                SELECT s.parent_session_id AS parent_id, COUNT(*) AS live_count
+                FROM sessions s
+                WHERE s.source = 'subagent'
+                  AND s.parent_session_id IS NOT NULL
+                  AND s.ended_at IS NULL
+                  AND (
+                        s.started_at >= ?
+                     OR COALESCE((
+                            SELECT MAX(m.timestamp) FROM messages m
+                            WHERE m.session_id = s.id
+                        ), 0) >= ?
+                  )
+                GROUP BY s.parent_session_id
+                """,
+                (window_start, window_start),
+            ).fetchall()
+    except Exception as exc:
+        logger.debug("live subagent probe failed: %s", exc)
+        return {}
+    return {
+        str(row[0]): int(row[1])
+        for row in rows
+        if row[0] and row[1]
+    }
+
+
+def _handle_live_subagents(handler, parsed) -> bool:
+    """GET /api/subagents/live — cheap map of parent session → live child count.
+
+    The selector repaints often, so the aggregate is cached briefly per state.db
+    (the path follows the active profile, so the key must too). The response
+    carries ``generated_at`` so a client can tell how old the number it renders
+    is, and the payload is built outside the lock: holding it during the socket
+    write would serialize every badge request behind one response.
+    """
+    now = time.time()
+    try:
+        db_path = _active_state_db_path()
+        cache_key = str(db_path)
+    except Exception:
+        # Shared "" slot only ever serves requests whose path resolution failed;
+        # the probe re-resolves and returns {} for them, so nothing leaks across
+        # profiles.
+        db_path, cache_key = None, ""
+    with _live_subagents_lock:
+        entry = _live_subagents_cache.get(cache_key)
+        hit = entry["payload"] if entry and (now - float(entry.get("at") or 0)) < _LIVE_SUBAGENTS_CACHE_TTL_SECONDS else None
+    if hit is not None:
+        # Serialize outside the lock: holding it through the socket write would
+        # make one slow client stall every other badge request.
+        return j(handler, hit)
+    try:
+        counts = _live_subagent_counts(now, db_path)
+    except Exception as exc:
+        logger.debug("live subagent handler degraded: %s", exc)
+        counts = {}
+    payload = {
+        "counts": counts,
+        "total": sum(counts.values()),
+        "generated_at": now,
+        # How long a child may be silent before the badge stops counting it.
+        "grace_seconds": _LIVE_SUBAGENTS_GRACE_SECONDS,
+        "cached_for_seconds": _LIVE_SUBAGENTS_CACHE_TTL_SECONDS,
+        "read_only": True,
+    }
+    with _live_subagents_lock:
+        # Bounded: one entry per profile the server has served this process.
+        _live_subagents_cache[cache_key] = {"at": now, "payload": payload}
+    return j(handler, payload)
+
+
 _SHELL_ERROR_HTML = """<!doctype html>
 <html lang=\"en\">
 <head>
@@ -17929,6 +18048,9 @@ def handle_get(handler, parsed) -> bool:
         from api.profiles import profile_env_for_active_request_readonly
         with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
+
+    if parsed.path == "/api/subagents/live":
+        return _handle_live_subagents(handler, parsed)
 
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
     if parsed.path == "/api/plugins":
@@ -20205,6 +20327,81 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/session/anchor-scene":
         return _handle_session_anchor_scene(handler, body)
+
+    if parsed.path == "/api/session/mark-done":
+        # Workflow state, not storage: `done_at` says the conversation is
+        # finished (set/cleared here), while `archived` stays a storage flag.
+        # Sibling of /api/session/rename and subject to the same contracts:
+        # 404 for an unknown id, 403 for a read-only imported session, and the
+        # write goes through the server's session object — never a raw sidecar
+        # write (the file has a single writer).
+        try:
+            require(body, "session_id")
+        except ValueError as e:
+            return bad(handler, str(e))
+        sid = body["session_id"]
+        if not isinstance(sid, str) or not sid:
+            return bad(handler, "session_id must be a non-empty string")
+        raw_done = body.get("done", True)
+        if not isinstance(raw_done, bool):
+            return bad(handler, "done must be a boolean")
+        explicit_ts = body.get("done_at")
+        if explicit_ts is not None:
+            try:
+                explicit_ts = float(explicit_ts)
+            except (TypeError, ValueError):
+                return bad(handler, "done_at must be a unix timestamp")
+            # `float()` happily accepts nan/inf and 1e400 → inf. `Session.save()`
+            # writes with a default json.dumps, so a non-finite value becomes a
+            # bare `NaN`/`Infinity` token in the sidecar: `JSON.parse` rejects it
+            # and the sidebar fetch breaks for every client, permanently (Python
+            # reloads it fine, so it survives restarts). Reject at the door.
+            if not math.isfinite(explicit_ts) or explicit_ts < 0:
+                return bad(handler, "done_at must be a finite, non-negative unix timestamp")
+        try:
+            _get_or_materialize_session(sid)
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        except PermissionError:
+            return bad(handler, "Read-only imported sessions cannot be marked done from WebUI", 403)
+        # #7776 Finding 2, same guard as the rename handler: capture the CLI
+        # source identity BEFORE the lock, because the lock-held Session.load(sid)
+        # reload materializes a WebUI session without the pre-lock CLI metadata,
+        # and the save below would then persist stripped provenance.
+        _done_cli_meta = _lookup_cli_session_metadata(sid) or {}
+        with _get_session_agent_lock(sid):
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            s = _ensure_full_session_before_mutation(sid, latest)
+            if getattr(s, "read_only", False):
+                return bad(handler, "Read-only imported sessions cannot be marked done from WebUI", 403)
+            if _done_cli_meta:
+                _apply_cli_source_meta_to_session(s, _done_cli_meta)
+            s.done_at = (explicit_ts if explicit_ts is not None else time.time()) if raw_done else None
+            # `touch_updated_at=False`: marking done is not new activity. Letting
+            # save() bump `updated_at` would re-sort the sidebar and reset every
+            # touched row's displayed last-activity — catastrophic on a backfill
+            # of hundreds of rows.
+            s.save(touch_updated_at=False)
+            with LOCK:
+                SESSIONS[sid] = s
+                SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()
+        publish_session_list_changed(
+            "session_done",
+            profile=getattr(s, "profile", None),
+            session_id=getattr(s, "session_id", sid),
+        )
+        return j(handler, {"session": s.compact()})
 
     if parsed.path == "/api/session/rename":
         try:
