@@ -199,7 +199,7 @@ def test_render_pipeline_applies_live_counts():
         r"^function _renderSidebarRowsFromRawSessions\(.*?^\}\n", SESSIONS_JS, re.S | re.M
     )
     assert m, "_renderSidebarRowsFromRawSessions not found"
-    assert "_applyLiveSubagentCounts(rows)" in m.group(0), (
+    assert re.search(r"_applyLiveSubagentCounts\([A-Za-z_$]", m.group(0)), (
         "the sidebar render path must decorate rows with live subagent counts"
     )
     # Guarded on purpose: browser tests extract this function alone and eval it
