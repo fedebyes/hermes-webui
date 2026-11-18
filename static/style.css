@@ -2832,18 +2832,26 @@
   .attach-chip--audio,.attach-chip--video{max-width:260px;}
   /* Voice attachment: a Telegram-style waveform you can tap to listen before
      sending — the peaks come from the clip's own bytes, the played part fills in
-     as it runs. */
-  .attach-chip--audio{padding:3px 6px 3px 3px;}
-  .attach-voice{display:flex;align-items:center;gap:8px;}
+     as it runs. Same component in the composer tray and in a sent message. */
+  .attach-chip--audio{padding:2px 4px 2px 2px;}
+  .attach-voice{display:flex;align-items:center;gap:7px;}
   .attach-voice audio{display:none;}
-  .attach-chip--audio .attach-voice-play{width:28px;height:28px;border-radius:50%;border:none;background:var(--accent);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;line-height:1;cursor:pointer;flex-shrink:0;-webkit-tap-highlight-color:transparent;}
-  .attach-chip--audio .attach-voice-play:hover{filter:brightness(1.08);}
-  .attach-voice-wave{display:inline-flex;align-items:center;gap:2px;height:22px;cursor:pointer;padding:0 2px;}
+  .attach-chip--audio .attach-voice-play,.voice-player .attach-voice-play{width:24px;height:24px;border-radius:50%;border:none;background:var(--accent);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:9px;line-height:1;cursor:pointer;flex-shrink:0;-webkit-tap-highlight-color:transparent;padding:0;}
+  .attach-chip--audio .attach-voice-play:hover,.voice-player .attach-voice-play:hover{filter:brightness(1.08);}
+  .attach-voice-wave{display:inline-flex;align-items:center;gap:2px;height:18px;cursor:pointer;padding:0 1px;}
   .attach-voice-wave i{width:2px;border-radius:1px;background:var(--accent-text);opacity:.35;transition:opacity .12s ease;}
   .attach-voice-wave i.on{opacity:1;}
-  .attach-voice-dur{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;flex-shrink:0;}
-  .attach-chip--audio .attach-voice-remove{background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;}
+  .attach-voice-dur{font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums;flex-shrink:0;}
+  .attach-chip--audio .attach-voice-remove{background:none;border:none;color:var(--muted);cursor:pointer;font-size:12px;line-height:1;padding:0 2px;}
   .attach-chip--audio .attach-voice-remove:hover{color:var(--accent);}
+  /* A sent-message audio player: the waveform row replaces the native control
+     once the clip decodes (is-ready); if it cannot be decoded the native player
+     comes back instead of an empty bar row (is-failed). */
+  .voice-player{display:flex;align-items:center;gap:7px;min-height:26px;}
+  .voice-player .msg-media-audio{display:none;}
+  .voice-player.is-failed .msg-media-audio{display:block;width:100%;height:34px;}
+  .voice-player.is-failed .attach-voice-play,.voice-player.is-failed .attach-voice-wave,.voice-player.is-failed .attach-voice-dur{display:none;}
+  .msg-media-editor--audio .attach-voice-wave i{background:var(--accent);}
   .attach-media-icon{display:inline-flex;align-items:center;color:var(--accent-text);}
   .attach-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .attach-thumb{width:56px;height:56px;object-fit:cover;border-radius:4px;display:block;cursor:zoom-in;transition:filter .12s ease, transform .12s ease;}

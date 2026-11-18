@@ -4164,9 +4164,22 @@ function _mediaSpeedControlsHtml(kind, label){
 function _mediaPlayerHtml(kind, src, name, extra=''){
   const safeName=esc(name||'media');
   const safeSrc=esc(src);
-  const tag=kind==='video'
-    ? `<video class="msg-media-player msg-media-video" src="${safeSrc}" controls preload="metadata" playsinline title="${safeName}"></video>`
-    : `<audio class="msg-media-player msg-media-audio" src="${safeSrc}" controls preload="metadata" title="${safeName}"></audio>`;
+  if(kind==='audio'){
+    // Same waveform component the composer tray uses: the native control is
+    // kept in the DOM (hidden, it still owns the media state and the speed
+    // controls drive it) and the visible row is the play button + bars + length.
+    // Bars are filled by _hydrateVoicePlayers() once the clip decodes.
+    return `<div class="msg-media-editor msg-media-editor--audio" data-media-kind="audio">`
+      +`<span class="attach-voice voice-player" data-voice-src="${safeSrc}">`
+      +`<button class="attach-voice-play" type="button" aria-label="Play">\u25b6</button>`
+      +`<span class="attach-voice-wave" role="button" tabindex="0" aria-label="Play ${safeName}"></span>`
+      +`<span class="attach-voice-dur">--:--</span>`
+      +`<audio class="msg-media-player msg-media-audio" src="${safeSrc}" controls preload="metadata" title="${safeName}"></audio>`
+      +`</span>`
+      +`<div class="msg-media-meta"><span class="msg-media-name">${safeName}</span>${extra}</div>`
+      +`${_mediaSpeedControlsHtml(kind,safeName)}</div>`;
+  }
+  const tag=`<video class="msg-media-player msg-media-video" src="${safeSrc}" controls preload="metadata" playsinline title="${safeName}"></video>`;
   return `<div class="msg-media-editor msg-media-editor--${kind}" data-media-kind="${kind}">${tag}<div class="msg-media-meta"><span class="msg-media-name">${safeName}</span>${extra}</div>${_mediaSpeedControlsHtml(kind,safeName)}</div>`;
 }
 // Shared MEDIA: token renderer used by both the full-pipeline renderMd() and
@@ -4509,6 +4522,9 @@ function _initMediaPlaybackObserver(){
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_initMediaPlaybackObserver);
 else _initMediaPlaybackObserver();
 setTimeout(_initMediaPlaybackObserver,0);
+// The waveform rows in sent messages need the same deferred start: the consts
+// they close over are declared further down the file.
+setTimeout(_initVoicePlayerObserver,0);
 
 // ── Ambient provider quota indicator (#1766) ────────────────────────────────
 // A provider switch can complete before an older account-quota request returns.
@@ -27692,7 +27708,7 @@ function _voiceDurText(sec){
   return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
 }
 function _voiceBarsHtml(peaks){
-  return peaks.map(p=>`<i style="height:${3+Math.round(p*16)}px"></i>`).join('');
+  return peaks.map(p=>`<i style="height:${3+Math.round(p*13)}px"></i>`).join('');
 }
 function _requestVoiceWave(file){
   if(!file||file._wave||_voiceWaveJobs.has(file))return;
@@ -27717,7 +27733,7 @@ function _requestVoiceWave(file){
   })();
 }
 function _pauseOtherVoiceChips(keep){
-  document.querySelectorAll('#attachTray .attach-chip--audio audio').forEach(a=>{
+  document.querySelectorAll('.attach-voice audio, .voice-player audio').forEach(a=>{
     if(!keep||!keep.contains(a))a.pause();
   });
 }
@@ -27760,6 +27776,75 @@ function _revokeTrayBlobUrls(tray){
   tray.querySelectorAll('[data-blob-url]').forEach(el=>{
     try{URL.revokeObjectURL(el.dataset.blobUrl);}catch(_){}
   });
+}
+// Sent-message players carry only a URL: fetch the clip once, decode it, and
+// fill the same bar row the composer chip uses. Cached per URL (bounded) so a
+// re-render or a scroll does not re-download the audio.
+const _voicePeaksCache=new Map();
+const VOICE_PEAKS_CACHE_MAX=80;
+async function _decodeVoicePeaks(data){
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC) throw new Error('no AudioContext');
+  const ctx=new AC();
+  try{
+    const buf=await ctx.decodeAudioData(data);
+    return {peaks:_wavePeaksFromChannelData(buf.getChannelData(0),VOICE_WAVE_BARS),duration:buf.duration};
+  }finally{
+    try{ void ctx.close(); }catch(_){}
+  }
+}
+function _fetchVoicePeaks(src){
+  const key=String(src||'');
+  if(_voicePeaksCache.has(key))return _voicePeaksCache.get(key);
+  const job=fetch(key,{credentials:'same-origin'})
+    .then(r=>r.arrayBuffer())
+    .then(_decodeVoicePeaks)
+    .catch(()=>({peaks:[],duration:0}));
+  _voicePeaksCache.set(key,job);
+  if(_voicePeaksCache.size>VOICE_PEAKS_CACHE_MAX){
+    const oldest=_voicePeaksCache.keys().next().value;
+    _voicePeaksCache.delete(oldest);
+  }
+  return job;
+}
+function _hydrateVoicePlayer(el){
+  const src=el.dataset&&el.dataset.voiceSrc;
+  if(!el||!src||el.dataset.wave==='1')return;
+  el.dataset.wave='1';
+  _fetchVoicePeaks(src).then(w=>{
+    if(!w||!w.peaks||!w.peaks.length){
+      // Undecodable here: fall back to the native control rather than an empty row.
+      el.classList.add('is-failed');
+      return;
+    }
+    const wave=el.querySelector('.attach-voice-wave');
+    const dur=el.querySelector('.attach-voice-dur');
+    if(wave)wave.innerHTML=_voiceBarsHtml(w.peaks);
+    if(dur)dur.textContent=_voiceDurText(w.duration);
+    el.classList.add('is-ready');
+    _wireVoiceChip(el);
+  });
+}
+function _hydrateVoicePlayers(root){
+  const scope=(root&&root.querySelectorAll)?root:document;
+  if(!scope||!scope.querySelectorAll)return;
+  scope.querySelectorAll('.voice-player[data-voice-src]').forEach(_hydrateVoicePlayer);
+}
+function _initVoicePlayerObserver(){
+  if(!document.body)return;
+  if(!window._voicePlayerObserver){
+    window._voicePlayerObserver=new MutationObserver(recs=>{
+      for(const rec of recs){
+        for(const node of rec.addedNodes||[]){
+          if(!node||node.nodeType!==1)continue;
+          if(node.matches&&node.matches('.voice-player[data-voice-src]'))_hydrateVoicePlayer(node);
+          if(node.querySelectorAll)_hydrateVoicePlayers(node);
+        }
+      }
+    });
+    window._voicePlayerObserver.observe(document.body,{childList:true,subtree:true});
+  }
+  _hydrateVoicePlayers(document);
 }
 function _voiceChipHtml(f, blobUrl){
   _requestVoiceWave(f);
