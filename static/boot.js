@@ -1205,6 +1205,63 @@ function _micToastKeyForRecognitionError(error){
   const status=$('micStatus');
   const ta=$('msg');
   const statusText=status?status.querySelector('.status-text'):null;
+  const micWaveEl=$('micWave');
+  const MIC_WAVE_BARS=5;
+  let _waveCtx=null, _waveRaf=0, _waveAnalyser=null, _waveData=null;
+
+  // The meter reads the SAME stream the recorder already owns — a second
+  // getUserMedia would prompt twice and fight for the device on Android.
+  function _buildMicWave(){
+    if(!micWaveEl) return;
+    while(micWaveEl.childElementCount<MIC_WAVE_BARS){
+      micWaveEl.appendChild(document.createElement('i'));
+    }
+  }
+
+  function _stopMicWave(){
+    if(_waveRaf){ cancelAnimationFrame(_waveRaf); _waveRaf=0; }
+    const ctx=_waveCtx;
+    _waveCtx=null; _waveAnalyser=null; _waveData=null;
+    if(ctx){ try{ void ctx.close(); }catch(_){} }
+    if(!micWaveEl) return;
+    micWaveEl.classList.remove('idle');
+    for(const bar of micWaveEl.children) bar.style.height='';
+  }
+
+  function _startMicWave(stream){
+    _buildMicWave();
+    _stopMicWave();
+    if(!micWaveEl) return;
+    const AudioCtx=window.AudioContext||window.webkitAudioContext;
+    if(!stream||!AudioCtx){ micWaveEl.classList.add('idle'); return; }
+    try{
+      const ctx=new AudioCtx();
+      const analyser=ctx.createAnalyser();
+      analyser.fftSize=256;
+      analyser.smoothingTimeConstant=0.65;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      _waveCtx=ctx; _waveAnalyser=analyser;
+      _waveData=new Uint8Array(analyser.frequencyBinCount);
+      const bars=Array.from(micWaveEl.children);
+      const band=Math.max(bars.length,Math.floor(_waveData.length*0.25));
+      const slice=Math.max(1,Math.floor(band/bars.length));
+      const tick=()=>{
+        if(!_waveAnalyser){ return; }
+        _waveAnalyser.getByteFrequencyData(_waveData);
+        for(let i=0;i<bars.length;i++){
+          let sum=0;
+          for(let j=0;j<slice;j++) sum+=_waveData[i*slice+j]||0;
+          const level=(sum/slice)/255;
+          bars[i].style.height=(3+Math.round(level*11))+'px';
+        }
+        _waveRaf=requestAnimationFrame(tick);
+      };
+      _waveRaf=requestAnimationFrame(tick);
+    }catch(_){
+      micWaveEl.classList.add('idle');
+    }
+  }
+
   btn.style.display=''; // Show button — browser supports speech recognition or recording fallback
 
   let recognition=null;
@@ -1250,6 +1307,14 @@ function _micToastKeyForRecognitionError(error){
     _setButtonTooltipAndKey(btn, on ? (_rawAudioMode ? 'voice_recording_active' : 'voice_dictate_active') : (_rawAudioMode ? 'voice_send_raw' : 'voice_dictate'));
     status.style.display=on?'':'none';
     if(statusText) statusText.textContent=on?'Listening':'Listening';
+    if(on){
+      // MediaRecorder already handed the meter its stream; the SpeechRecognition
+      // path has none, so it falls back to the strip's idle pulse.
+      _buildMicWave();
+      if(!_waveAnalyser&&micWaveEl) micWaveEl.classList.add('idle');
+    }else{
+      _stopMicWave();
+    }
     if(!on){ _finalText=''; _prefix=''; }
   }
 
@@ -1709,6 +1774,7 @@ function _micToastKeyForRecognitionError(error){
         return;
       }
       mediaStream=captureStream;
+      _startMicWave(captureStream);
       const preferredTypes=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/ogg'];
       const mimeType=preferredTypes.find(type=>window.MediaRecorder.isTypeSupported?.(type))||'';
       const captureMode=_rawAudioMode?'media-raw':'media-transcribe';
