@@ -3941,6 +3941,19 @@ function _applyComposerControlOrder(order){
 }
 window._applyComposerControlOrder=_applyComposerControlOrder;
 
+function _placeMicBesideSend(){
+  // Telegram muscle memory: voice is a send-side action, so the mic sits
+  // immediately left of the send button. The footer keeps two clusters
+  // (.composer-left / .composer-right) and composer_control_order only reorders
+  // nodes WITHIN one parent, so this has to be a DOM move, not an order entry.
+  // Idempotent: once the mic shares the send button's parent this is a no-op.
+  const mic=$('btnMic'), send=$('btnSend');
+  if(!mic||!send||!send.parentNode) return;
+  if(mic.parentNode===send.parentNode) return;
+  send.parentNode.insertBefore(mic,send);
+}
+window._placeMicBesideSend=_placeMicBesideSend;
+
 function _composerControlVisibilityFromSettings(settings){
   const next={};
   for(const def of _allComposerControlToggleDefs()){
@@ -4159,6 +4172,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._composerControlVisibility=_composerControlVisibilityFromSettings(s);
     window._composerControlOrder=_sanitizeComposerControlOrder(s.composer_control_order);
     _applyComposerControlOrder(window._composerControlOrder);
+    _placeMicBesideSend();
     window._showTitlebarProfile=!!s.show_titlebar_profile;
     _applyTitlebarProfileVisibility();
     window._botName=s.bot_name||'Hermes';
@@ -4313,6 +4327,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._composerControlVisibility=_composerControlVisibilityFromSettings(null);
     window._composerControlOrder=[];
     _applyComposerControlOrder(window._composerControlOrder);
+    _placeMicBesideSend();
     window._botName='Hermes';
     _bootSettings={check_for_updates:false};
     if(typeof setLocale==='function'){
