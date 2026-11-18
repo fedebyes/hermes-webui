@@ -27661,8 +27661,118 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
   }catch(e){setStatus(t('folder_create_failed')+e.message);}
 }
 
+// ── Voice attachment waveform ────────────────────────────────────────────────
+// Telegram shows you the clip you just recorded before you commit to sending it.
+// The chip did carry a native <audio controls>; a decoded waveform says the same
+// thing faster — you see the shape and the length, tap once to hear it, tap again
+// to stop. Peaks are computed once per File from its own bytes (no server round
+// trip) and cached on the object, so a re-render is free.
+const _voiceWaveJobs=new WeakSet();
+const VOICE_WAVE_BARS=30;
+function _wavePeaksFromChannelData(data,buckets){
+  if(!data||!data.length||!buckets)return [];
+  const size=Math.max(1,Math.floor(data.length/buckets));
+  const raw=[];
+  let max=0;
+  for(let b=0;b<buckets;b++){
+    const start=b*size,end=Math.min(data.length,start+size);
+    let peak=0;
+    for(let i=start;i<end;i++){
+      const v=Math.abs(data[i]);
+      if(v>peak)peak=v;
+    }
+    raw.push(peak);
+    if(peak>max)max=peak;
+  }
+  if(max<=0)return raw.map(()=>0);
+  return raw.map(v=>Math.round((v/max)*100)/100);
+}
+function _voiceDurText(sec){
+  const s=Math.max(0,Math.round(Number(sec)||0));
+  return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+}
+function _voiceBarsHtml(peaks){
+  return peaks.map(p=>`<i style="height:${3+Math.round(p*16)}px"></i>`).join('');
+}
+function _requestVoiceWave(file){
+  if(!file||file._wave||_voiceWaveJobs.has(file))return;
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC||typeof file.arrayBuffer!=='function')return;
+  _voiceWaveJobs.add(file);
+  (async()=>{
+    let ctx=null;
+    try{
+      ctx=new AC();
+      const buf=await ctx.decodeAudioData(await file.arrayBuffer());
+      file._wave={peaks:_wavePeaksFromChannelData(buf.getChannelData(0),VOICE_WAVE_BARS),duration:buf.duration};
+    }catch(_){
+      // Not decodable here (codec the browser cannot read): keep the plain chip
+      // rather than an empty bar row. Cached so the render path never retries.
+      file._wave={peaks:[],duration:0};
+    }finally{
+      try{ if(ctx) void ctx.close(); }catch(_){}
+      _voiceWaveJobs.delete(file);
+      if(typeof renderTray==='function'&&S.pendingFiles&&S.pendingFiles.includes(file))renderTray();
+    }
+  })();
+}
+function _pauseOtherVoiceChips(keep){
+  document.querySelectorAll('#attachTray .attach-chip--audio audio').forEach(a=>{
+    if(!keep||!keep.contains(a))a.pause();
+  });
+}
+function _wireVoiceChip(chip){
+  const audio=chip.querySelector('audio');
+  const playBtn=chip.querySelector('.attach-voice-play');
+  const wave=chip.querySelector('.attach-voice-wave');
+  if(!audio||!playBtn||!wave)return;
+  const bars=Array.from(wave.children);
+  const paint=ratio=>{
+    const cut=Math.round(Math.max(0,Math.min(1,ratio||0))*bars.length);
+    bars.forEach((b,i)=>b.classList.toggle('on',i<cut));
+  };
+  const setIcon=playing=>{ playBtn.textContent=playing?'\u275a\u275a':'\u25b6'; };
+  const toggle=e=>{
+    if(e){e.preventDefault();e.stopPropagation();}
+    if(audio.paused){
+      _pauseOtherVoiceChips(chip);
+      const p=audio.play();
+      if(p&&p.catch)p.catch(()=>{});
+    }else{
+      audio.pause();
+    }
+  };
+  playBtn.onclick=toggle;
+  wave.onclick=toggle;
+  wave.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){toggle(e);}};
+  audio.onplay=()=>setIcon(true);
+  audio.onpause=()=>setIcon(false);
+  audio.onended=()=>{setIcon(false);paint(0);};
+  audio.ontimeupdate=()=>{if(audio.duration)paint(audio.currentTime/audio.duration);};
+  paint(0);
+}
+// Each render mints fresh blob URLs for the media chips; release the previous
+// set or every re-render leaks one URL per attachment. Kept OUT of renderTray:
+// structural tests slice that function body by literal strings, and a helper
+// keeps the sliceable window intact.
+function _revokeTrayBlobUrls(tray){
+  if(!tray||!tray.querySelectorAll)return;
+  tray.querySelectorAll('[data-blob-url]').forEach(el=>{
+    try{URL.revokeObjectURL(el.dataset.blobUrl);}catch(_){}
+  });
+}
+function _voiceChipHtml(f, blobUrl){
+  _requestVoiceWave(f);
+  const w=f._wave;
+  const body=(w&&w.peaks&&w.peaks.length)
+    ? `<button class="attach-voice-play" type="button" title="${esc(f.name)}" aria-label="Play">\u25b6</button>`
+      +`<span class="attach-voice-wave" role="button" tabindex="0" aria-label="Play ${esc(f.name)}">${_voiceBarsHtml(w.peaks)}</span>`
+      +`<span class="attach-voice-dur">${_voiceDurText(w.duration)}</span>`
+    : `<span class="attach-chip-media">\ud83c\udfb5 ${esc(f.name)}</span>`;
+  return `<span class="attach-voice">${body}<audio preload="metadata" src="${esc(blobUrl)}"></audio><button class="attach-voice-remove" title="${t('remove_title')}">${li('x',12)}</button></span>`;
+}
 function renderTray(){ // non-media files use paperclip chip
-  const tray=$('attachTray');tray.innerHTML='';
+  const tray=$('attachTray');_revokeTrayBlobUrls(tray);tray.innerHTML='';
   if(!S.pendingFiles.length){tray.classList.remove('has-files');updateSendBtn();return;}
   tray.classList.add('has-files');
   updateSendBtn();
@@ -27678,18 +27788,23 @@ function renderTray(){ // non-media files use paperclip chip
       } else if(_SVG_EXTS.test(f.name)){
         chip.innerHTML=`<img class="attach-thumb attach-thumb--svg" src="${esc(blobUrl)}" alt="${esc(f.name)}" title="${esc(f.name)}"><button title="${t('remove_title')}">${li('x',12)}</button>`;
       } else if(mediaKind==='audio'){
-        chip.innerHTML=`<span class="attach-chip-media">🎵 ${esc(f.name)}</span><audio controls preload="metadata" src="${esc(blobUrl)}"></audio><button title="${t('remove_title')}">${li('x',12)}</button>`;
+        chip.innerHTML=_voiceChipHtml(f,blobUrl);
       } else if(mediaKind==='video'){
         chip.innerHTML=`<span class="attach-chip-media">🎬 ${esc(f.name)}</span><video controls preload="metadata" src="${esc(blobUrl)}"></video><button title="${t('remove_title')}">${li('x',12)}</button>`;
       }
     } else {
       chip.innerHTML=`${li('paperclip',12)} ${esc(f.name)} <button title="${t('remove_title')}">${li('x',12)}</button>`;
     }
-    chip.querySelector('button').onclick=()=>{
-      // Revoke blob URL to avoid memory leak before removing
+    // The remove control is the LAST button in the chip: a voice clip also
+    // carries a play button, and the first match would have paused instead of
+    // detaching.
+    const buttons=chip.querySelectorAll('button');
+    const rmBtn=buttons.length?buttons[buttons.length-1]:null;
+    if(rmBtn)rmBtn.onclick=()=>{
       if(chip.dataset.blobUrl) URL.revokeObjectURL(chip.dataset.blobUrl);
       S.pendingFiles.splice(i,1);renderTray();
     };
+    if(mediaKind==='audio')_wireVoiceChip(chip);
     tray.appendChild(chip);
   });
 }
