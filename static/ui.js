@@ -4156,6 +4156,22 @@ function _mediaKindForName(name=''){
   if(_IMAGE_EXTS.test(clean)) return 'image';
   return '';
 }
+// A recorded voice note is audio/webm, but `.webm` is in BOTH the video and the
+// audio extension lists and video is tested first — so a clip the recorder
+// produced landed in the video branch (clapperboard icon, native player, no
+// waveform). The File's own MIME settles it; the name pattern covers the
+// sent-message path, where all the client gets back is a filename.
+function _isVoiceNoteName(name){
+  return /(^|\/)voice-input-\d+\.(webm|ogg|opus)$/i.test(String(name||''));
+}
+function _mediaKindForFile(file){
+  const type=String((file&&file.type)||'').toLowerCase();
+  if(type.startsWith('audio/'))return 'audio';
+  if(type.startsWith('video/'))return 'video';
+  const name=(file&&file.name)||'';
+  if(_isVoiceNoteName(name))return 'audio';
+  return _mediaKindForName(name);
+}
 function _mediaSpeedControlsHtml(kind, label){
   const safeLabel=esc(label||kind||'media');
   const current=_getStoredMediaPlaybackRate();
@@ -4459,7 +4475,9 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
   return `<a class="msg-media-link" href="${esc(apiUrl+'&download=1')}" download="${fname}">📎 ${fname}</a>`;
 }
 function _renderAttachmentHtml(fname, url){
-  const kind=_mediaKindForName(fname);
+  // A sent voice note comes back as a bare filename, and `.webm` classifies as
+  // video — check the voice-note name before falling through.
+  const kind=_isVoiceNoteName(fname)?'audio':_mediaKindForName(fname);
   if(kind==='image') return `<img class="msg-media-img" src="${esc(url)}" alt="${esc(fname)}" loading="lazy">`;
   if(kind==='audio'||kind==='video') return _mediaPlayerHtml(kind,url,fname);
   if(_HTML_EXTS.test(fname)){
@@ -27863,7 +27881,7 @@ function renderTray(){ // non-media files use paperclip chip
   updateSendBtn();
   S.pendingFiles.forEach((f,i)=>{
     const chip=document.createElement('div');chip.className='attach-chip';
-    const mediaKind=_mediaKindForName(f.name);
+    const mediaKind=_mediaKindForFile(f);
     if(_IMAGE_EXTS.test(f.name)||mediaKind==='audio'||mediaKind==='video'){
       const blobUrl=URL.createObjectURL(f);
       chip.className='attach-chip attach-chip--media attach-chip--'+mediaKind; // attach-chip--audio attach-chip--video
