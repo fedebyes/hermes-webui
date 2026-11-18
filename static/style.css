@@ -2852,6 +2852,10 @@
   .voice-player.is-failed .msg-media-audio{display:block;width:100%;height:34px;}
   .voice-player.is-failed .attach-voice-play,.voice-player.is-failed .attach-voice-wave,.voice-player.is-failed .attach-voice-dur{display:none;}
   .msg-media-editor--audio .attach-voice-wave i{background:var(--accent);}
+  /* A voice note is a voice note: the 0.5×–2× row belongs to a video or an
+     audio document, not to a 10-second clip. Hidden, not removed — the buttons
+     still exist if the playback-rate work wants them back. */
+  .msg-media-editor--audio .media-speed-controls{display:none;}
   .attach-media-icon{display:inline-flex;align-items:center;color:var(--accent-text);}
   .attach-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .attach-thumb{width:56px;height:56px;object-fit:cover;border-radius:4px;display:block;cursor:zoom-in;transition:filter .12s ease, transform .12s ease;}
