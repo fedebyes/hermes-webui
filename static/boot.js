@@ -1281,15 +1281,14 @@ function _micToastKeyForRecognitionError(error){
     const file=new File([blob],`voice-input-${Date.now()}.${ext}`,{type:blob.type||`audio/${ext}`});
     S.pendingFiles.push(file);
     renderTray();
-    // An explicit Send-button click while recording sets _micPendingSend — that
-    // is an unambiguous send intent, so honor it even when the composer already
-    // has text (mirrors the transcribe path). Otherwise (manual mic-stop): send
-    // immediately only if the composer is empty, else just attach + toast so the
-    // user can keep composing.
+    // Telegram-style: releasing the mic ATTACHES the clip, it never sends it.
+    // The user sees the clip in the tray and taps Send when he means it — the
+    // old auto-send on an empty composer turned "I stopped recording" into
+    // "I sent it", with no way to listen first or add a line of text.
+    // An explicit Send-button click while recording still sends (that intent
+    // is unambiguous and mirrors the transcribe path).
     if(window._micPendingSend){
       window._micPendingSend=false;
-      send();
-    }else if(!ta.value.trim()){
       send();
     }else{
       showToast(t('voice_raw_attached'));
